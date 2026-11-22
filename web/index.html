@@ -19,7 +19,7 @@
 				var link = document.createElement('link')
 				link.rel = 'manifest'
 				if (unlisted) link.href = '/c/' + unlisted[1] + '/manifest.webmanifest'
-				else if (pub && pub[1] !== 'owner') link.href = '/' + pub[1] + '/manifest.webmanifest'
+				else if (pub) link.href = '/' + pub[1] + '/manifest.webmanifest'
 				else link.href = '/manifest.webmanifest'
 				document.head.appendChild(link)
 			})()

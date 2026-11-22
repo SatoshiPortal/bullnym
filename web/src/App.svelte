@@ -1,7 +1,7 @@
 <script lang="ts">
 	// Terminal shell. A cashier link ("/<nym>" or "/c/<secret>") opens the
 	// terminal on any device, with no pairing; the app is hash-routed like
-	// bullnym's POS. "/owner" shows the owner's history.
+	// bullnym's POS.
 	import { ApiError } from '$lib/api'
 	import { router } from '$lib/router.svelte'
 	import { client, session } from '$lib/session.svelte'
@@ -13,23 +13,20 @@
 	import SettingsScreen from './screens/SettingsScreen.svelte'
 	import UnpairedScreen from './screens/UnpairedScreen.svelte'
 
-	const isOwner = /^\/owner\/?$/.test(location.pathname)
-
 	let loadError = $state<string | null>(null)
 
 	$effect(() => {
-		if (!session.link && !(isOwner && session.token)) return
+		if (!session.link) return
 		let current = true
 		loadError = null
-		const load = session.link ? client().checkout() : client().ownerStore().then((store) => ({ store, link: 'public' as const }))
-		load
+		client()
+			.checkout()
 			.then((c) => {
 				if (current) session.checkout = c
 			})
 			.catch((e) => {
 				if (!current) return
 				if (e instanceof ApiError && e.status === 404) loadError = 'This link does not work. Ask the owner for the current link.'
-				else if (e instanceof ApiError && e.isUnauthorized) loadError = 'The owner login expired. Open the history again from the wallet.'
 				else loadError = e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the store.'
 			})
 		return () => {
@@ -41,7 +38,7 @@
 	const receiptId = $derived(router.match('/receipt/:id')?.id)
 </script>
 
-{#if !session.link && !(isOwner && session.token)}
+{#if !session.link}
 	<UnpairedScreen />
 {:else if !session.checkout}
 	<main class="grid min-h-screen place-items-center bg-[#f5f0e8] px-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
@@ -64,7 +61,7 @@
 	{#key receiptId}
 		<ReceiptScreen id={receiptId} />
 	{/key}
-{:else if isOwner || router.path === '/history'}
+{:else if router.path === '/history'}
 	<HistoryScreen />
 {:else if router.path === '/settings'}
 	<SettingsScreen />

@@ -1,7 +1,7 @@
 // Typed client for the bullnym HTTP API. The contract is docs/api.md.
 //
-// A cashier link names the store: no device token. The sales history and
-// CSV need the owner's session token.
+// A cashier link names the store: no device token. The store's history and
+// CSV are on the owner API, which the owner's wallet calls.
 
 export type SaleState = 'open' | 'in-progress' | 'paid' | 'payment-issue' | 'expired' | 'canceled'
 export type PaidRail = 'lightning' | 'ark' | 'onchain'
@@ -70,10 +70,6 @@ export class ApiError extends Error {
 		this.name = 'ApiError'
 	}
 
-	/** The owner token is missing, not valid, or expired. */
-	get isUnauthorized(): boolean {
-		return this.status === 401
-	}
 }
 
 export type Fetch = typeof fetch
@@ -83,11 +79,7 @@ export interface ClientOptions {
 	baseUrl?: string
 	/** The cashier link of the store. */
 	link?: Link | null
-	/** The owner's session token, for the history and the CSV. */
-	token?: string | null
 	fetch?: Fetch
-	/** Called on every 401, before the error is thrown. */
-	onUnauthorized?: () => void
 }
 
 /** Long-poll requests wait up to 25 s on the server. */
@@ -104,16 +96,12 @@ export function linkPath(link: Link): string {
 export class PosClient {
 	private readonly baseUrl: string
 	private readonly link: Link | null
-	private readonly token: string | null
 	private readonly fetchFn: Fetch
-	private readonly onUnauthorized?: () => void
 
 	constructor(opts: ClientOptions = {}) {
 		this.baseUrl = opts.baseUrl ?? ''
 		this.link = opts.link ?? null
-		this.token = opts.token ?? null
 		this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init))
-		this.onUnauthorized = opts.onUnauthorized
 	}
 
 	private linkPath(): string {
@@ -123,11 +111,6 @@ export class PosClient {
 
 	checkout(): Promise<Checkout> {
 		return this.json('GET', this.linkPath())
-	}
-
-	/** The owner's store, with the owner token. */
-	ownerStore(): Promise<Store> {
-		return this.json('GET', '/api/v1/owner/store')
 	}
 
 	rate(): Promise<Rate> {
@@ -152,31 +135,11 @@ export class PosClient {
 		return this.json('POST', `/api/v1/sales/${encodeURIComponent(id)}/cancel`)
 	}
 
-	async sales(opts: { before?: string; limit?: number } = {}): Promise<Sale[]> {
-		const q = new URLSearchParams()
-		if (opts.before) q.set('before', opts.before)
-		if (opts.limit) q.set('limit', String(opts.limit))
-		const qs = q.toString()
-		const res = await this.json<{ sales: Sale[] }>('GET', `/api/v1/owner/sales${qs ? `?${qs}` : ''}`)
-		return res.sales
-	}
-
-	/**
-	 * CSV export for the local dates `from` to `to` (YYYY-MM-DD), both
-	 * included. The range is sent as times, so the store's own days count,
-	 * not UTC days.
-	 */
-	async salesCsv(from: string, to: string): Promise<Blob> {
-		const q = new URLSearchParams(localDayRange(from, to))
-		const res = await this.request('GET', `/api/v1/owner/sales.csv?${q}`)
-		return res.blob()
-	}
-
 	private async json<T>(
 		method: string,
 		path: string,
 		body?: unknown,
-		opts: { auth?: boolean; timeoutMs?: number; signal?: AbortSignal } = {},
+		opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 	): Promise<T> {
 		const res = await this.request(method, path, body, opts)
 		return (await res.json()) as T
@@ -186,11 +149,10 @@ export class PosClient {
 		method: string,
 		path: string,
 		body?: unknown,
-		opts: { auth?: boolean; timeoutMs?: number; signal?: AbortSignal } = {},
+		opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 	): Promise<Response> {
 		const headers: Record<string, string> = { Accept: 'application/json' }
 		if (body !== undefined) headers['Content-Type'] = 'application/json'
-		if (opts.auth !== false && this.token) headers.Authorization = `Bearer ${this.token}`
 
 		const timeout = new AbortController()
 		const timer = setTimeout(() => timeout.abort(), opts.timeoutMs ?? DEFAULT_TIMEOUT_MS)
@@ -213,10 +175,7 @@ export class PosClient {
 			opts.signal?.removeEventListener('abort', onAbort)
 		}
 
-		if (!res.ok) {
-			if (res.status === 401) this.onUnauthorized?.()
-			throw new ApiError(res.status, await errorMessage(res))
-		}
+		if (!res.ok) throw new ApiError(res.status, await errorMessage(res))
 		return res
 	}
 }
@@ -229,12 +188,4 @@ async function errorMessage(res: Response): Promise<string> {
 		/* not JSON */
 	}
 	return `Request failed (HTTP ${res.status})`
-}
-
-/** The start of the local day `from` and the start of the day after `to`. */
-export function localDayRange(from: string, to: string): { from: string; to: string } {
-	const start = new Date(`${from}T00:00:00`)
-	const end = new Date(`${to}T00:00:00`)
-	end.setDate(end.getDate() + 1)
-	return { from: start.toISOString(), to: end.toISOString() }
 }

@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from 'vitest'
-import { ApiError, PosClient, localDayRange, type Fetch } from './api'
+import { describe, expect, it } from 'vitest'
+import { ApiError, PosClient, type Fetch } from './api'
 
 type Call = { url: string; init: RequestInit }
 
@@ -51,35 +51,18 @@ describe('PosClient', () => {
 
 	it('long-polls with the known state', async () => {
 		const { fetch, calls } = fakeFetch([json({ id: 's1', state: 'paid' })])
-		const sale = await new PosClient({ fetch, token: 'tok' }).waitSale('s1', 'open')
+		const sale = await new PosClient({ fetch, link: PUBLIC }).waitSale('s1', 'open')
 		expect(sale.state).toBe('paid')
 		expect(calls[0]!.url).toBe('/api/v1/sales/s1?wait=open')
 	})
 
-	it('pages the owner history with before and limit', async () => {
-		const { fetch, calls } = fakeFetch([json({ sales: [] }), json({ sales: [{ id: 'a' }] })])
-		const client = new PosClient({ fetch, token: 'tok' })
-		await client.sales()
-		const page = await client.sales({ before: 'x', limit: 50 })
-		expect(calls[0]!.url).toBe('/api/v1/owner/sales')
-		expect(calls[1]!.url).toBe('/api/v1/owner/sales?before=x&limit=50')
-		expect(header(calls[0]!, 'Authorization')).toBe('Bearer tok')
-		expect(page).toEqual([{ id: 'a' }])
-	})
-
-	it('requests the owner CSV export for a date range', async () => {
-		const { fetch, calls } = fakeFetch([new Response('id\n', { status: 200 })])
-		const blob = await new PosClient({ fetch, token: 'tok' }).salesCsv('2026-11-01', '2026-11-20')
-		const range = localDayRange('2026-11-01', '2026-11-20')
-		expect(calls[0]!.url).toBe(`/api/v1/owner/sales.csv?${new URLSearchParams(range)}`)
-		expect(await blob.text()).toBe('id\n')
-	})
-
 	it('cancels a sale', async () => {
 		const { fetch, calls } = fakeFetch([json({ id: 's1', state: 'canceled' })])
-		await new PosClient({ fetch, token: 'tok' }).cancelSale('s1')
+		await new PosClient({ fetch, link: PUBLIC }).cancelSale('s1')
 		expect(calls[0]!.url).toBe('/api/v1/sales/s1/cancel')
 		expect(calls[0]!.init.method).toBe('POST')
+		// No device or owner token: the sale id is all a cashier needs.
+		expect(header(calls[0]!, 'Authorization')).toBeUndefined()
 	})
 
 	it('raises the server error message', async () => {
@@ -90,14 +73,6 @@ describe('PosClient', () => {
 		expect(err.message).toBe('sale is not open')
 	})
 
-	it('reports an expired owner token once and throws', async () => {
-		const onUnauthorized = vi.fn()
-		const { fetch } = fakeFetch([json({ error: 'expired' }, 401)])
-		const err = await new PosClient({ fetch, token: 'tok', onUnauthorized }).sales().catch((e) => e)
-		expect(onUnauthorized).toHaveBeenCalledOnce()
-		expect(err.isUnauthorized).toBe(true)
-	})
-
 	it('maps a network failure to status 0', async () => {
 		const fetch = (async () => {
 			throw new TypeError('Failed to fetch')
@@ -105,13 +80,5 @@ describe('PosClient', () => {
 		const err = await new PosClient({ fetch, link: PUBLIC }).rate().catch((e) => e)
 		expect(err).toBeInstanceOf(ApiError)
 		expect(err.status).toBe(0)
-	})
-})
-
-describe('localDayRange', () => {
-	it('covers whole local days, end included', () => {
-		const { from, to } = localDayRange('2026-11-20', '2026-11-20')
-		expect(new Date(to).getTime() - new Date(from).getTime()).toBe(24 * 3600 * 1000)
-		expect(new Date(from).getDate()).toBe(20)
 	})
 })
