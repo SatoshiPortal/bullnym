@@ -48,7 +48,10 @@ every setting.
   invoice does not name the store's Ark address in its hint, with a message
   saying the server must allow Ark address hints.
 - A private barkd on that server. It issues the forwarding invoices and
-  forwards the payments to the owners. It needs no funds.
+  forwards the payments to the owners. It needs no funds. Run it with
+  `daemon_sync_interval_secs = 5` in its `config.toml`: a sale paid over Ark
+  counts only once barkd settles the receive, and barkd checks on that
+  interval.
 - A bitcoind. The service creates a watch-only wallet on it.
 - A Postgres database.
 

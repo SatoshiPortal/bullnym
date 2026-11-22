@@ -403,6 +403,16 @@ if ! sudo test -f "$DATA/barkd/db.sqlite"; then
 			\"bitcoind_auth\": {\"user-pass\": {\"user\": \"scuttle\", \"pass\": \"$BITCOIND_RPC_PASS\"}}}}}" \
 		>/dev/null
 fi
+# barkd checks its receives every 5 seconds, so an Ark payment is settled,
+# and its sale paid, promptly: Bullnym counts it only once barkd settles it.
+# The key goes at the top of the file, outside any table.
+BARKD_CONFIG="$DATA/barkd/config.toml"
+if ! sudo grep -qx 'daemon_sync_interval_secs = 5' "$BARKD_CONFIG"; then
+	sudo sed -i '/^daemon_sync_interval_secs *=/d' "$BARKD_CONFIG"
+	sudo sed -i '1i daemon_sync_interval_secs = 5' "$BARKD_CONFIG"
+	sudo systemctl restart scuttle-barkd.service
+	for i in $(seq 1 30); do curl -sf http://127.0.0.1:3000/ping >/dev/null && break; sleep 1; done
+fi
 
 log "bullnym"
 # bullnym uses the Ark server's public API only: no database access.
