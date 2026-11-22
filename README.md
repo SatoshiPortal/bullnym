@@ -11,7 +11,7 @@ It started from posd, Lee Salminen's point-of-sale service for Scuttle. See
 |---|---|---|
 | Lightning | A barkd forwarding invoice, paying the registered Ark address | One barkd forwarding invoice that names the registered Ark address as its hint |
 | Ark | LUD-22 `SCUTTLE`: the registered Ark address | Through the invoice's hint |
-| Bitcoin | LUD-22 `SP`: the static Silent Payment address | An address per sale from the descriptor of the account the wallet chose |
+| Bitcoin | LUD-22 `SP`: the static Silent Payment address | On the merchant's request, an address per sale from the descriptor of the account the wallet chose |
 | Who starts a payment | Any payer, through LNURL | Anyone with the store's cashier link, which is also its public checkout |
 
 - **The nym** is permanent and is the Lightning Address: `<nym>@<domain>`.
@@ -23,12 +23,15 @@ It started from posd, Lee Salminen's point-of-sale service for Scuttle. See
   takes payments; the store's history and CSV are behind the owner login.
   The screen lists its own sales only after the service accepted the
   owner's cashier PIN.
-- **Bitcoin for the store** is an address per sale from the store's
-  descriptor, as in posd: never reused, not even by another store with the
-  same descriptor. The owner's wallet scans the store account up to the
-  store's next index, which the owner's store view shows.
-- **Paid** means: Lightning delivered by barkd; Ark delivered to the owner's
-  mailbox (S4); on-chain at 1 confirmation. Paid is final, as in posd. A
+- **Bitcoin for the store** is added to a sale only when the merchant asks,
+  after a warning that it can take up to 60 minutes to confirm. It is an
+  address per sale from the store's descriptor, as in posd: never reused,
+  not even by another store with the same descriptor. The owner's wallet
+  scans the store account up to the store's next index, which the owner's
+  store view shows. A QR never combines Lightning and Bitcoin.
+- **Paid** means: an invoice barkd reports settled, whether a Lightning
+  payment or an Ark transfer delivered to the owner's mailbox (S4); on-chain
+  at 1 confirmation. Paid is final, as in posd. A
   payment seen but not counted shows as in progress, not guaranteed, and
   never as paid.
 

@@ -150,8 +150,9 @@ nym:<nym>
   anything else. Two stores may register the same descriptor (see Sale).
 - A descriptor without an address form, such as a bare `pk(…)` or
   `multi(…)`, is accepted as in posd, but no address can be derived from it,
-  not even the first. Its sales then offer no on-chain payment and the
-  index stays free; posd refused such a sale.
+  not even the first. Adding Bitcoin to its sales then fails with `503`,
+  the sale keeps its invoice, and the index stays free; posd refused such a
+  sale.
 - The store's Lightning address is always `<nym>@<domain>`.
 
 ### Store
@@ -220,12 +221,30 @@ token and no login. The same page is the public checkout. Its API prefix is
 | `POST <prefix>/sales` | `{"fiat_amount": "12.50"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) | `Sale` |
 | `GET /api/v1/sales/<id>` | | `Sale` |
 | `GET /api/v1/sales/<id>?wait=<state>` | | `Sale`, when the state is not `<state>` or after 25 s |
+| `POST /api/v1/sales/<id>/onchain` | | `Sale` with a Bitcoin address; see below |
 | `POST /api/v1/sales/<id>/cancel` | | `Sale`; `409` unless the sale is open and no payment is arriving |
 | `POST <prefix>/pin` | `{"pin": "…"}` | `{"ok": true}` when it is the cashier PIN |
 
 The link cannot list the store's sales, export them or see other sales.
-Holding a sale's unguessable id is what lets a cashier follow and cancel it.
-Selling, following and canceling need no PIN.
+Holding a sale's unguessable id is what lets a cashier follow it, add
+Bitcoin to it and cancel it. Selling, following, adding Bitcoin and
+canceling need no PIN.
+
+### Bitcoin on request
+
+A sale is created with its Lightning invoice only: the service never gives
+a sale a Bitcoin address unless the merchant asks for it. The cashier
+screen asks first, with a warning that an on-chain payment can take up to
+60 minutes to confirm and is not complete until it is.
+`POST /api/v1/sales/<id>/onchain` then adds the address:
+
+- The sale must be open (`409` otherwise), at or above the store's
+  `onchain_min_sat` (`400`), and bitcoind healthy (`503`).
+- The address is the store's next one, as in posd: no address is handed out
+  twice, even to another store with the same descriptor.
+- A second call returns the same address: a sale never takes a second
+  index.
+- The invoice stays payable, and either rail pays the sale.
 
 ### Cashier PIN
 
@@ -262,7 +281,8 @@ can read the remembered sale ids, and a sale id alone opens its sale.
   "currency": "CRC",
   "btc_price": "62500000.00",
   "memo": "2 coffees",
-  "payment_request": "bitcoin:bc1p…?amount=0.0006&lightning=lnbc…",
+  "lightning_request": "lightning:lnbc…",
+  "onchain_request": "bitcoin:bc1p…?amount=0.0006",
   "lightning_invoice": "lnbc…",
   "onchain_address": "bc1p…",
   "paid_at": null,
@@ -276,12 +296,15 @@ can read the remembered sale ids, and a sale id alone opens its sale.
 }
 ```
 
-- `payment_request` is one BIP 321 URI. Its `lightning` invoice is a barkd
-  forwarding invoice that names the owner's registered Ark address as its
-  route hint (S1): a Lightning wallet pays it over Lightning, a Scuttle
-  wallet with address hints on pays it over Ark. The address and `amount`
-  are left out below the store's on-chain minimum: `bitcoin:?lightning=…`.
-  A rail whose backend is down is left out.
+- A sale has two QR texts, and no QR combines Lightning and Bitcoin:
+  - `lightning_request` is `lightning:<invoice>`. The invoice is a barkd
+    forwarding invoice that names the owner's registered Ark address as its
+    route hint (S1): a Lightning wallet pays it over Lightning, a Scuttle
+    wallet with address hints on pays it over Ark.
+  - `onchain_request` is `bitcoin:<address>?amount=<btc>`, and `null` until
+    Bitcoin is added.
+- Without an invoice, because barkd or the Ark server is down, the sale is
+  refused with the fixed `503`.
 - As in posd, each sale checks that its invoice names the store's Ark
   address as its hint. An invoice without it refuses the sale with `503`
   and `"the Ark server must allow Ark address hints: barkd returned the
@@ -295,15 +318,15 @@ can read the remembered sale ids, and a sale id alone opens its sale.
   - `open`: waiting for a payment.
   - `in-progress`: a payment is seen and does not count yet. `progress` is
     `onchain` (in the mempool: not guaranteed until 1 confirmation) or `ark`
-    (the Ark server settled the invoice and has not reported the coins
-    delivered to the owner, S4). It cannot be canceled, and it stays open
-    past `expires_at` until the payment confirms or explicitly goes away.
-    An Ark payment stays `in-progress` until the server reports it
-    delivered, with no deadline. The rail that paid an invoice is recorded
-    only on the Ark server's positive evidence: HTLCs granted (Lightning) or
-    its delivery report (Ark); until then the sale keeps its state.
-  - `paid`: Lightning delivered by barkd, Ark delivered (S4), or on-chain
-    with 1 confirmation. Paid is final, as in posd: the sale stays paid
+    (an Ark transfer settled the invoice, and barkd shows it awaiting
+    delivery, S4). It cannot be canceled, and it stays open past
+    `expires_at` until the payment confirms or explicitly goes away. An Ark
+    payment stays `in-progress` until barkd settles it, with no deadline.
+  - `paid`: an invoice barkd reports settled, or on-chain with 1
+    confirmation. barkd is the one source of truth for the invoice. The Ark
+    server only labels its rail afterwards: `lightning` if it granted HTLCs,
+    `ark` if not, and `paid_rail` stays `null` when the server cannot be
+    read. Paid is final, as in posd: the sale stays paid
     whatever its address shows later.
   - `expired` or `canceled`. A payment after that is a late payment
     (`late_payment`): it shows on this sale and never pays another one,

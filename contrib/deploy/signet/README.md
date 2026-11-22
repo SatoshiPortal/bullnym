@@ -110,11 +110,10 @@ sw sell 6250 "2 coffees"; sw pay customer; sw wait
 
 ## Known limits
 
-- **A Scuttle wallet cannot read a sale's QR code that carries a bitcoin
-  address on this chain.** The wallet's BIP 321 parser accepts only mainnet
-  addresses, so `bitcoin:tb1…?amount=…&lightning=…` is refused. A sale below
-  the store's on-chain minimum (`bitcoin:?lightning=…`) and the invoice alone
-  are read and paid.
+- **A Scuttle wallet cannot read a sale's Bitcoin QR on this chain.** The
+  wallet's BIP 321 parser accepts only mainnet addresses, so
+  `bitcoin:tb1…?amount=…` is refused. The Lightning QR (`lightning:…`) and
+  the invoice alone are read and paid.
 
 - **The Bull app as it ships cannot use this chain.** It runs upstream bark
   from pub.dev. Its Esplora setting can point here once it runs Scuttle.

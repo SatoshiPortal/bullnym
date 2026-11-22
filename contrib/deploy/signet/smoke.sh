@@ -104,6 +104,8 @@ api GET "/api/v1/sales/$id" | jq -c '{state, paid_rail, received_sat}'
 echo "== sale 3, paid on-chain: in progress, not guaranteed, then paid"
 sale=$(api POST "/api/v1/checkout/$NYM/sales" "" '{"amount_sat": 60000, "memo": "smoke onchain"}')
 id=$(echo "$sale" | jq -r .id)
+# Bitcoin only when the merchant asks for it.
+sale=$(api POST "/api/v1/sales/$id/onchain" "")
 cli -rpcwallet=miner sendtoaddress "$(echo "$sale" | jq -r .onchain_address)" 0.0006 >/dev/null
 wait_state "$id" in-progress
 api GET "/api/v1/sales/$id" | jq -c '{state, progress, warnings, received_sat, seen_sat}'

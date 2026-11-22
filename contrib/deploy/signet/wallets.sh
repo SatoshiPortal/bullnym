@@ -30,7 +30,10 @@
 #   wait [id] [state]                 wait until the sale leaves state
 #                                     (default: open)
 #   cancel [id]                       cancel an open sale
-#   qr [id]                           print the sale's QR (needs qrencode)
+#   bitcoin [id]                      add Bitcoin to an open sale, as the
+#                                     cashier screen does after its warning
+#   qr [id] [lightning|bitcoin]       print one of the sale's QRs (needs
+#                                     qrencode)
 #
 # Customer
 #   pay <wallet> [id] [invoice|onchain]
@@ -39,7 +42,8 @@
 #                                     has address hints on and the invoice
 #                                     has the hint, else over Lightning).
 #                                     onchain pays from the wallet's on-chain
-#                                     coins; mine 1 to confirm.
+#                                     coins, once Bitcoin was added; mine 1 to
+#                                     confirm.
 #   pay-uri <wallet> <uri|invoice>    pay a copied QR or invoice
 #   lnaddress <wallet> <nym> <sats>   pay a Lightning Address
 #
@@ -112,12 +116,7 @@ get_sale() { api GET "/api/v1/sales/$1"; }
 show_sale() {
 	jq '{id, state, progress, warnings, notice, amount_sat, fiat_amount, currency, memo,
 		received_sat, seen_sat, paid_rail, paid_at, late_payment, expires_at,
-		onchain_address, payment_request}'
-}
-
-# A query parameter of a BIP 321 URI.
-uri_param() { # uri name
-	tr '?&' '\n\n' <<<"$1" | sed -n "s/^$2=//p" | head -1
+		onchain_address, lightning_request, onchain_request}'
 }
 
 cmd="${1:-}"; shift || true
@@ -270,9 +269,15 @@ wait)
 cancel)
 	api POST "/api/v1/sales/$(sale_id "${1:-}")/cancel" | show_sale
 	;;
+bitcoin)
+	api POST "/api/v1/sales/$(sale_id "${1:-}")/onchain" | show_sale
+	;;
 qr)
 	command -v qrencode >/dev/null || die "install qrencode"
-	get_sale "$(sale_id "${1:-}")" | jq -r .payment_request | qrencode -t ansiutf8
+	field=lightning_request; [ "${2:-lightning}" = bitcoin ] && field=onchain_request
+	qr=$(get_sale "$(sale_id "${1:-}")" | jq -r ".$field // empty")
+	[ -n "$qr" ] || die "the sale has no $field; add Bitcoin first"
+	qrencode -t ansiutf8 <<<"$qr"
 	;;
 
 # Customer
@@ -289,7 +294,7 @@ pay)
 		;;
 	onchain)
 		addr=$(jq -r '.onchain_address // empty' <<<"$sale")
-		[ -n "$addr" ] || die "no on-chain address: the sale is below the store's on-chain minimum"
+		[ -n "$addr" ] || die "no on-chain address: add Bitcoin to the sale first (bitcoin [id])"
 		bark "$who" onchain send "$addr" "$(jq -r .amount_sat <<<"$sale") sats" | jq -c . \
 			|| die "on-chain payment failed: does the wallet have on-chain coins? (faucet)"
 		echo "sent; the sale is in progress until 'mine 1'"
@@ -300,10 +305,8 @@ pay)
 	;;
 pay-uri)
 	who="${1:?wallet}"; uri="${2:?uri or invoice}"
-	if [[ "$uri" == bitcoin:* ]]; then
-		inv=$(uri_param "$uri" lightning)
-		[ -n "$inv" ] || die "no invoice in the URI"
-		bark "$who" send "$inv" >/dev/null || die "payment failed"
+	if [[ "$uri" == lightning:* ]]; then
+		bark "$who" send "${uri#lightning:}" >/dev/null || die "payment failed"
 	else
 		bark "$who" send "$uri" >/dev/null || die "payment failed"
 	fi
