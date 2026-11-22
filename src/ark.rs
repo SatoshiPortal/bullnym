@@ -67,7 +67,10 @@ pub struct ServerSupport {
 	pub address_hints: bool,
 	/// S1: the forwarded invoice names the destination in its hint.
 	pub forwarded_hint: bool,
-	/// S4: the receive status reports delivery.
+	/// S4: the receive status reports delivery. A server reports it only
+	/// for an invoice an Ark payment settled, so before any payment it can
+	/// be seen only on a server that also reports it for unpaid invoices.
+	/// Otherwise it is taken from S1, which ships in the same release.
 	pub delivery_status: bool,
 }
 
@@ -225,13 +228,18 @@ impl ArkServer {
 		).await?;
 		let hash = invoice.payment_hash().to_string();
 		let hinted = invoice.ark_address().is_some_and(|a| a.to_string() == address.to_string());
-		let delivery = match self.receive(&hash).await {
+		let seen = match self.receive(&hash).await {
 			Ok(r) => r.delivered.is_some(),
 			Err(e) => {
 				tracing::warn!("the receive check of the startup invoice failed: {:#}", e);
 				false
 			},
 		};
+		if hinted && !seen {
+			tracing::info!("the delivery status (S4) shows only once an Ark payment settles an invoice; \
+				taking it from the forwarded invoice hint (S1), which ships in the same release");
+		}
+		let delivery = seen || hinted;
 		if let Err(e) = forwarder.cancel(&hash).await {
 			tracing::warn!("failed to cancel the startup check invoice: {:#}", e);
 		}
