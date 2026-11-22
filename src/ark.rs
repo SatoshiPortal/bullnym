@@ -58,6 +58,7 @@ pub struct ServerReceive {
 	pub has_htlcs: bool,
 	/// `Some` when the server reports delivery of an Ark payment (S4).
 	pub delivered: Option<bool>,
+	pub amount: Amount,
 }
 
 /// What the startup checks found.
@@ -153,6 +154,7 @@ impl ArkServer {
 		Ok(ServerReceive {
 			has_htlcs: !resp.htlc_vtxos.is_empty(),
 			delivered: resp.delivered,
+			amount: Amount::from_sat(resp.amount_sat),
 		})
 	}
 

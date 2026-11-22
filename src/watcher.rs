@@ -134,9 +134,18 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 			Ok(match app.watch.forwarder.status(hash).await? {
 				ForwardStatus::Unpaid | ForwardStatus::Arriving | ForwardStatus::Unknown => None,
 				// Settled by the Ark server, not yet in the owner's mailbox.
-				ForwardStatus::AwaitingDelivery if p.sale_state == SaleState::InProgress => None,
+				// barkd records the delivery on its own schedule; the Ark
+				// server's report of it (S4) is the same guarantee, so the
+				// service asks the server too.
 				ForwardStatus::AwaitingDelivery => {
-					Some(Observation::invoice(Amount::ZERO, false, true, true))
+					let delivered = match app.ark.receive(hash).await {
+						Ok(r) => r.delivered.filter(|d| *d).map(|_| r.amount),
+						Err(e) => {
+							tracing::debug!("delivery check of invoice {} failed: {:#}", hash, e);
+							None
+						},
+					};
+					awaiting_delivery(delivered, p.sale_state)
 				},
 				ForwardStatus::Delivered(amount) => {
 					// The Ark server granted HTLCs only to a Lightning payment.
@@ -154,6 +163,18 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 			})
 		},
 		Rail::Onchain => Ok(None),
+	}
+}
+
+/// What an invoice that barkd shows awaiting delivery means for its sale:
+/// paid once the Ark server reports the transfer delivered, in progress
+/// before. `delivered` is the delivered amount, when the server reports
+/// it.
+pub fn awaiting_delivery(delivered: Option<Amount>, state: SaleState) -> Option<Observation> {
+	match delivered {
+		Some(amount) => Some(Observation::invoice(amount, true, false, true)),
+		None if state == SaleState::InProgress => None,
+		None => Some(Observation::invoice(Amount::ZERO, false, true, true)),
 	}
 }
 
@@ -634,5 +655,18 @@ mod test {
 		assert_eq!(next_state(Canceled, 1000, &obs(1000, true)), None);
 		assert_eq!(next_state(Paid, 1000, &obs(1000, true)), None);
 		assert_eq!(next_state(PaymentIssue, 1000, &obs(1000, true)), None);
+	}
+
+	#[test]
+	fn ark_payment_awaiting_delivery() {
+		use SaleState::*;
+		// Not delivered yet: in progress, and nothing new once it is.
+		let o = awaiting_delivery(None, Open).unwrap();
+		assert_eq!(next_state(Open, 1000, &o), Some(InProgress));
+		assert_eq!(awaiting_delivery(None, InProgress), None);
+		// The Ark server reports it delivered: paid by Ark.
+		let o = awaiting_delivery(Some(Amount::from_sat(1000)), InProgress).unwrap();
+		assert_eq!(next_state(InProgress, 1000, &o), Some(Paid));
+		assert_eq!(o.paid_rail(Rail::Lightning), Rail::Ark);
 	}
 }
