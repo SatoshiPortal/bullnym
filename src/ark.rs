@@ -31,7 +31,7 @@ const RECEIVE_CLTV_MARGIN: u16 = 12 + 18 + 2;
 
 /// The amount of the invoices the startup checks create and cancel.
 const PROBE_AMOUNT: Amount = Amount::from_sat(1_000);
-const PROBE_EXPIRY: Duration = Duration::from_secs(120);
+const PROBE_EXPIRY: Duration = Duration::from_secs(60);
 
 /// `CheckLightningReceiveResponse` with the `delivered` field that S4 adds.
 /// The protocol types of the pinned Scuttle release do not have it, and a
@@ -208,8 +208,10 @@ impl ArkServer {
 			.context("the Ark server refused the invoice")?
 			.into_inner();
 		let cancel = protos::CancelLightningReceiveRequest { payment_hash: payment_hash.to_vec() };
+		// A server may refuse cancels from clients; the invoice then
+		// expires on its own. Nobody can pay it: it is never shown.
 		if let Err(e) = self.conn.client.clone().cancel_lightning_receive(cancel).await {
-			tracing::warn!("failed to cancel the startup check invoice: {}", e);
+			tracing::debug!("the startup check invoice stays until it expires: {}", e.message());
 		}
 		let invoice = Bolt11Invoice::from_str(&resp.bolt11)
 			.context("the Ark server returned an invalid invoice")?;

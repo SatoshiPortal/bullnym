@@ -85,7 +85,10 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 				continue;
 			},
 		};
-		changed |= record(app, &p, &obs).await?;
+		match record(app, &p, &obs).await {
+			Ok(c) => changed |= c,
+			Err(e) => tracing::warn!("recording sale {} failed: {:#}", p.sale_public_id, e),
+		}
 	}
 	if check_onchain {
 		match watch_onchain(app).await {
@@ -93,7 +96,10 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 			Err(e) => tracing::warn!("on-chain pass failed: {:#}", e),
 		}
 	}
-	changed |= expire_sales(app).await?;
+	match expire_sales(app).await {
+		Ok(c) => changed |= c,
+		Err(e) => tracing::warn!("expiry pass failed: {:#}", e),
+	}
 	if let Err(e) = watch_lnurl_invoices(app).await {
 		tracing::warn!("Lightning Address invoice pass failed: {:#}", e);
 	}
@@ -196,15 +202,16 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 		// A sale paid by its invoice is final at once. An Ark payment that
 		// is not delivered yet puts the sale in progress.
 		let paid = next == SaleState::Paid;
+		let progress = (next == SaleState::InProgress).then_some("ark");
 		tx.execute("
 			UPDATE sale SET state = $2,
 				paid_rail = CASE WHEN $3 THEN $4 ELSE paid_rail END,
 				paid_at = CASE WHEN $3 THEN NOW() ELSE paid_at END,
 				final_at = CASE WHEN $3 THEN NOW() ELSE final_at END,
-				progress = CASE WHEN $2 = 'in-progress' THEN 'ark' ELSE NULL END,
+				progress = $5,
 				notice = NULL
 			WHERE id = $1
-		", &[&p.sale_id, &next, &paid, &obs.paid_rail(p.rail)]).await?;
+		", &[&p.sale_id, &next, &paid, &obs.paid_rail(p.rail), &progress]).await?;
 	}
 	tx.commit().await?;
 
