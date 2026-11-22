@@ -3,8 +3,15 @@
 //!
 //! A sale is paid by the first rail that delivers its full amount. The
 //! watcher keeps checking the other rails until they expire, so a second
-//! payment is recorded as excess instead of being missed.
+//! payment is recorded as excess instead of being missed. A payment to a
+//! sale that ended unpaid is a late payment: the owner sees it on that
+//! sale, and it never pays another one.
+//!
+//! On-chain payments go through the stages of [crate::stages]: seen in the
+//! mempool (in progress, not guaranteed), paid at 1 confirmation, final at
+//! 3, and a payment issue if a reorg takes a counted payment away.
 
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -15,6 +22,7 @@ use tokio_postgres::GenericClient;
 use crate::App;
 use crate::database::{Rail, SaleState, WatchedPayment};
 use crate::rails::forward::ForwardStatus;
+use crate::stages::{self, FeePolicy, TxRecord, TxStatus};
 
 
 /// How long an invoice payment is watched after its sale or invoice
@@ -25,27 +33,22 @@ const DELIVERY_GRACE_SECS: f64 = 600.0;
 /// On-chain addresses are checked every this many ticks.
 const ONCHAIN_EVERY_TICKS: u64 = 5;
 
-/// What a check found for one payment rail.
+/// What a check found for a sale's invoice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Observation {
-	/// Delivered to the owner. For on-chain, confirmed.
+	/// Delivered to the owner.
 	pub received: Amount,
-	/// Seen but not delivered. Only on-chain reports this.
-	pub pending: Amount,
-	/// Whether the rail is done: delivered, or certain never to pay.
+	/// Whether the invoice is done: delivered, or certain never to pay.
 	pub settled: bool,
 	/// An Ark transfer paid the invoice and is not delivered yet.
 	pub awaiting_delivery: bool,
 	/// The invoice was paid by an Ark transfer rather than over Lightning.
 	pub via_ark: bool,
-	pub txids: Option<Vec<String>>,
 }
 
 impl Observation {
 	pub fn invoice(received: Amount, settled: bool, awaiting_delivery: bool, via_ark: bool) -> Observation {
-		Observation {
-			received, pending: Amount::ZERO, settled, awaiting_delivery, via_ark, txids: None,
-		}
+		Observation { received, settled, awaiting_delivery, via_ark }
 	}
 
 	/// The rail that paid, for a sale this observation pays.
@@ -74,9 +77,6 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 	let payments = watched_payments(app).await?;
 	let mut changed = false;
 	for p in payments {
-		if p.rail == Rail::Onchain && !check_onchain {
-			continue;
-		}
 		let obs = match observe(app, &p).await {
 			Ok(Some(obs)) => obs,
 			Ok(None) => continue,
@@ -86,6 +86,12 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 			},
 		};
 		changed |= record(app, &p, &obs).await?;
+	}
+	if check_onchain {
+		match watch_onchain(app).await {
+			Ok(c) => changed |= c,
+			Err(e) => tracing::warn!("on-chain pass failed: {:#}", e),
+		}
 	}
 	changed |= expire_sales(app).await?;
 	if let Err(e) = watch_lnurl_invoices(app).await {
@@ -97,22 +103,20 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 	Ok(())
 }
 
+/// The invoices of recent sales.
 async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> {
 	let conn = app.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, s.state, s.amount_sat,
-			s.expires_at, p.rail, p.payment_hash, p.onchain_address, p.received_sat,
-			p.pending_sat, p.settled_at
+			s.expires_at, p.rail, p.payment_hash, p.onchain_address, p.onchain_address_id,
+			p.received_sat, p.pending_sat, p.settled_at
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
-		WHERE p.settled_at IS NULL AND (
-			(p.rail <> 'onchain' AND s.state <> 'canceled' AND (
-				s.expires_at > NOW() - make_interval(secs => $1) OR s.state = 'in-progress'
-			))
-			OR (p.rail = 'onchain' AND s.created_at > NOW() - make_interval(secs => $2))
+		WHERE p.settled_at IS NULL AND p.rail <> 'onchain' AND s.state <> 'canceled' AND (
+			s.expires_at > NOW() - make_interval(secs => $1) OR s.state = 'in-progress'
 		)
 		ORDER BY p.id
-	", &[&DELIVERY_GRACE_SECS, &(app.cfg.sales.onchain_watch_secs as f64)]).await?;
+	", &[&DELIVERY_GRACE_SECS]).await?;
 	Ok(rows.iter().map(WatchedPayment::from_row).collect())
 }
 
@@ -143,61 +147,23 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 				ForwardStatus::Gone => Some(Observation::invoice(Amount::ZERO, true, false, false)),
 			})
 		},
-		Rail::Onchain => {
-			let address = p.onchain_address.as_deref().context("on-chain payment without address")?;
-			let address = Address::from_str(address)?.require_network(app.cfg.network)?;
-			let funds = app.chain.funds(&address).await?;
-			let obs = Observation {
-				received: funds.confirmed,
-				pending: funds.pending,
-				// An address stays watched for late or extra payments until
-				// its watch window ends.
-				settled: false,
-				awaiting_delivery: false,
-				via_ark: false,
-				txids: Some(funds.txids),
-			};
-			let unchanged = obs.received.to_sat() as i64 == p.received_sat
-				&& obs.pending.to_sat() as i64 == p.pending_sat;
-			Ok(if unchanged { None } else { Some(obs) })
-		},
+		Rail::Onchain => Ok(None),
 	}
 }
 
-/// The state a sale moves to after an observation, if it changes.
-pub fn next_state(
-	state: SaleState,
-	amount_sat: i64,
-	rail: Rail,
-	obs: &Observation,
-	expired: bool,
-) -> Option<SaleState> {
+/// The state a sale moves to after an observation of its invoice, if it
+/// changes. On-chain payments follow [stages::next_onchain_state].
+pub fn next_state(state: SaleState, amount_sat: i64, obs: &Observation) -> Option<SaleState> {
 	if !state.is_live() {
 		return None;
 	}
-	let received = obs.received.to_sat() as i64;
-	let pending = obs.pending.to_sat() as i64;
-	let delivered = match rail {
-		Rail::Onchain => received >= amount_sat,
-		Rail::Lightning | Rail::Ark => obs.settled && received >= amount_sat,
-	};
-	if delivered {
+	if obs.settled && obs.received.to_sat() as i64 >= amount_sat {
 		return Some(SaleState::Paid);
 	}
 	// An Ark payment the server settled but has not delivered: the payer
 	// cannot take it back, but it is not the owner's yet.
 	if obs.awaiting_delivery && state == SaleState::Open {
 		return Some(SaleState::InProgress);
-	}
-	if rail == Rail::Onchain {
-		if received + pending >= amount_sat {
-			if state == SaleState::Open {
-				return Some(SaleState::InProgress);
-			}
-		} else if state == SaleState::InProgress {
-			// The mempool payment went away.
-			return Some(if expired { SaleState::Expired } else { SaleState::Open });
-		}
 	}
 	None
 }
@@ -210,35 +176,33 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 
 	// Lock the sale, so two payments cannot both mark it paid.
 	let row = tx.query_one(
-		"SELECT state, amount_sat, expires_at < NOW() AS expired FROM sale WHERE id = $1 FOR UPDATE",
-		&[&p.sale_id],
+		"SELECT state, amount_sat FROM sale WHERE id = $1 FOR UPDATE", &[&p.sale_id],
 	).await?;
 	let state: SaleState = row.get("state");
 	let amount_sat: i64 = row.get("amount_sat");
-	let expired: bool = row.get("expired");
 
 	tx.execute("
-		UPDATE sale_payment SET received_sat = $2, pending_sat = $3,
-			settled_at = CASE WHEN $4 THEN NOW() END,
-			txids = coalesce($5, txids)
+		UPDATE sale_payment SET received_sat = $2, settled_at = CASE WHEN $3 THEN NOW() END
 		WHERE id = $1
-	", &[
-		&p.payment_id, &(obs.received.to_sat() as i64), &(obs.pending.to_sat() as i64),
-		&obs.settled, &obs.txids,
-	]).await?;
+	", &[&p.payment_id, &(obs.received.to_sat() as i64), &obs.settled]).await?;
 	tx.execute("
 		UPDATE sale SET received_sat = (
 			SELECT coalesce(sum(received_sat), 0) FROM sale_payment WHERE sale_id = $1
 		), updated_at = NOW() WHERE id = $1
 	", &[&p.sale_id]).await?;
 
-	let next = next_state(state, amount_sat, p.rail, obs, expired);
+	let next = next_state(state, amount_sat, obs);
 	if let Some(next) = next {
+		// A sale paid by its invoice is final at once. An Ark payment that
+		// is not delivered yet puts the sale in progress.
 		let paid = next == SaleState::Paid;
 		tx.execute("
 			UPDATE sale SET state = $2,
 				paid_rail = CASE WHEN $3 THEN $4 ELSE paid_rail END,
-				paid_at = CASE WHEN $3 THEN NOW() ELSE paid_at END
+				paid_at = CASE WHEN $3 THEN NOW() ELSE paid_at END,
+				final_at = CASE WHEN $3 THEN NOW() ELSE final_at END,
+				progress = CASE WHEN $2 = 'in-progress' THEN 'ark' ELSE NULL END,
+				notice = NULL
 			WHERE id = $1
 		", &[&p.sale_id, &next, &paid, &obs.paid_rail(p.rail)]).await?;
 	}
@@ -246,11 +210,216 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 
 	if next == Some(SaleState::Paid) {
 		tracing::info!("sale {} paid by {}", p.sale_public_id, obs.paid_rail(p.rail).as_str());
-		if p.rail == Rail::Onchain {
-			sale_ended(app, p.sale_id).await;
-		}
+		sale_ended(app, p.sale_id).await;
 	}
 	Ok(next.is_some())
+}
+
+/// An on-chain payment the watcher follows.
+struct WatchedAddress {
+	payment_id: i64,
+	sale_id: i64,
+	sale_public_id: String,
+	address: String,
+	address_id: Option<i64>,
+	received_sat: i64,
+	pending_sat: i64,
+	warnings: Vec<String>,
+}
+
+/// The on-chain payments to follow: addresses in their late-payment
+/// window, sales in progress or with a payment issue, and sales paid
+/// on-chain until they are final.
+async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
+	let conn = app.db.conn().await?;
+	let rows = conn.query("
+		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, p.onchain_address,
+			p.onchain_address_id, p.received_sat, p.pending_sat, p.warnings
+		FROM sale_payment p
+		JOIN sale s ON s.id = p.sale_id
+		WHERE p.rail = 'onchain' AND (
+			s.created_at > NOW() - make_interval(secs => $1)
+			OR s.state IN ('in-progress', 'payment-issue')
+			OR (s.state = 'paid' AND s.paid_rail = 'onchain' AND s.final_at IS NULL)
+		)
+		ORDER BY p.id
+	", &[&(app.cfg.sales.onchain_watch_secs as f64)]).await?;
+	Ok(rows.iter().map(|r| WatchedAddress {
+		payment_id: r.get("payment_id"),
+		sale_id: r.get("sale_id"),
+		sale_public_id: r.get("public_id"),
+		address: r.get("onchain_address"),
+		address_id: r.get("onchain_address_id"),
+		received_sat: r.get("received_sat"),
+		pending_sat: r.get("pending_sat"),
+		warnings: r.get("warnings"),
+	}).collect())
+}
+
+/// One pass over the on-chain payments. Without an answer from bitcoind
+/// nothing changes: a payment never counts as gone for lack of an answer.
+async fn watch_onchain(app: &App) -> anyhow::Result<bool> {
+	let watched = watched_addresses(app).await?;
+	if watched.is_empty() {
+		return Ok(false);
+	}
+	let received = app.chain.received_by_address().await?;
+	let fees = FeePolicy {
+		estimate_sat_vb: app.chain.fee_estimate(app.cfg.sales.fee_estimate_blocks).await,
+		ratio: app.cfg.sales.low_fee_ratio,
+		floor_sat_vb: app.cfg.sales.low_fee_floor_sat_vb,
+	};
+	let mut changed = false;
+	for w in watched {
+		let known = known_txs(app, w.payment_id).await?;
+		let mut txids = received.get(&w.address).cloned().unwrap_or_default().into_iter()
+			.collect::<BTreeSet<_>>();
+		txids.extend(known.keys().cloned());
+		if txids.is_empty() {
+			continue;
+		}
+		let address = Address::from_str(&w.address)?.require_network(app.cfg.network)?;
+		let all = txids.iter().cloned().collect::<Vec<_>>();
+		let mut records = Vec::with_capacity(all.len());
+		for txid in &all {
+			match app.chain.observe_tx(txid, &address, &all).await {
+				Ok(obs) => records.push(stages::classify(known.get(txid), &obs, &fees)),
+				Err(e) => {
+					tracing::warn!("check of transaction {} failed: {:#}", txid, e);
+					if let Some(k) = known.get(txid) {
+						records.push(k.clone());
+					}
+				},
+			}
+		}
+		match record_onchain(app, &w, &records).await {
+			Ok(c) => changed |= c,
+			Err(e) => tracing::warn!("recording sale {} failed: {:#}", w.sale_public_id, e),
+		}
+	}
+	Ok(changed)
+}
+
+async fn known_txs(app: &App, payment_id: i64) -> anyhow::Result<HashMap<String, TxRecord>> {
+	let conn = app.db.conn().await?;
+	let rows = conn.query("
+		SELECT txid, amount_sat, status, confirmations, low_fee, unconfirmed_parents, replaced,
+			absent_count
+		FROM onchain_tx WHERE sale_payment_id = $1
+	", &[&payment_id]).await?;
+	Ok(rows.iter().map(|r| {
+		let rec = TxRecord {
+			txid: r.get("txid"),
+			amount: Amount::from_sat(r.get::<_, i64>("amount_sat") as u64),
+			status: TxStatus::parse(r.get("status")),
+			confirmations: r.get("confirmations"),
+			low_fee: r.get("low_fee"),
+			unconfirmed_parents: r.get("unconfirmed_parents"),
+			replaced: r.get("replaced"),
+			absent_count: r.get("absent_count"),
+		};
+		(rec.txid.clone(), rec)
+	}).collect())
+}
+
+/// Stores what the watcher found for an address, and moves its sale on.
+/// Returns whether the sale changed.
+async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> anyhow::Result<bool> {
+	let summary = stages::summarize(records);
+	let warnings = summary.warnings.iter().map(|w| w.as_str().to_string()).collect::<Vec<_>>();
+
+	let mut conn = app.db.conn().await?;
+	let tx = conn.transaction().await?;
+	// Lock the sale, so its rails cannot both mark it paid.
+	let row = tx.query_one("
+		SELECT state, amount_sat, expires_at < NOW() AS expired, paid_rail, progress, final_at
+		FROM sale WHERE id = $1 FOR UPDATE
+	", &[&w.sale_id]).await?;
+	let state: SaleState = row.get("state");
+	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat") as u64);
+	let expired: bool = row.get("expired");
+	let paid_rail: Option<Rail> = row.get("paid_rail");
+	let progress: Option<String> = row.get("progress");
+	let has_final: bool = row.get::<_, Option<chrono::DateTime<chrono::Utc>>>("final_at").is_some();
+
+	for r in records {
+		tx.execute("
+			INSERT INTO onchain_tx (sale_payment_id, txid, amount_sat, status, confirmations, low_fee,
+				unconfirmed_parents, replaced, absent_count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (sale_payment_id, txid) DO UPDATE SET
+				amount_sat = $3, status = $4, confirmations = $5, low_fee = $6,
+				unconfirmed_parents = $7, replaced = $8, absent_count = $9, updated_at = NOW()
+		", &[
+			&w.payment_id, &r.txid, &(r.amount.to_sat() as i64), &r.status.as_str(),
+			&r.confirmations, &r.low_fee, &r.unconfirmed_parents, &r.replaced, &r.absent_count,
+		]).await?;
+	}
+	if summary.ever_received {
+		if let Some(id) = w.address_id {
+			tx.execute("UPDATE onchain_address SET ever_received = TRUE WHERE id = $1", &[&id]).await?;
+		}
+	}
+	let confirmed = summary.confirmed.to_sat() as i64;
+	let seen = summary.seen.to_sat() as i64;
+	let payment_changed = confirmed != w.received_sat || seen != w.pending_sat || warnings != w.warnings;
+	tx.execute("
+		UPDATE sale_payment SET received_sat = $2, pending_sat = $3, warnings = $4 WHERE id = $1
+	", &[&w.payment_id, &confirmed, &seen, &warnings]).await?;
+	tx.execute("
+		UPDATE sale SET received_sat = (
+			SELECT coalesce(sum(received_sat), 0) FROM sale_payment WHERE sale_id = $1
+		), updated_at = NOW() WHERE id = $1
+	", &[&w.sale_id]).await?;
+
+	let t = stages::next_onchain_state(
+		state, amount, paid_rail == Some(Rail::Onchain), progress.as_deref() == Some("onchain"),
+		expired, &summary, app.cfg.sales.final_confirmations as i64,
+	);
+	match t.state {
+		Some(SaleState::InProgress) => {
+			tx.execute("
+				UPDATE sale SET state = 'in-progress', progress = 'onchain', notice = NULL WHERE id = $1
+			", &[&w.sale_id]).await?;
+		},
+		Some(SaleState::Paid) if t.counts_as_paid => {
+			tx.execute("
+				UPDATE sale SET state = 'paid', paid_rail = 'onchain', paid_at = NOW(), progress = NULL,
+					notice = NULL
+				WHERE id = $1
+			", &[&w.sale_id]).await?;
+		},
+		Some(SaleState::Paid) => {
+			tx.execute("UPDATE sale SET state = 'paid' WHERE id = $1", &[&w.sale_id]).await?;
+		},
+		Some(SaleState::PaymentIssue) => {
+			tracing::warn!("sale {}: a counted on-chain payment went away", w.sale_public_id);
+			tx.execute("
+				UPDATE sale SET state = 'payment-issue', final_at = NULL WHERE id = $1
+			", &[&w.sale_id]).await?;
+		},
+		Some(back) => {
+			let notice = t.notice.map(|n| n.as_str());
+			tx.execute("
+				UPDATE sale SET state = $2, progress = NULL, notice = $3 WHERE id = $1
+			", &[&w.sale_id, &back, &notice]).await?;
+		},
+		None => {},
+	}
+	let became_final = t.is_final && !has_final;
+	if became_final {
+		tx.execute("UPDATE sale SET final_at = NOW() WHERE id = $1", &[&w.sale_id]).await?;
+	}
+	tx.commit().await?;
+
+	if t.counts_as_paid {
+		tracing::info!("sale {} paid on-chain", w.sale_public_id);
+		sale_ended(app, w.sale_id).await;
+	}
+	if matches!(t.state, Some(SaleState::Expired)) {
+		release_address(app, w.sale_id).await;
+	}
+	Ok(t.state.is_some() || became_final || payment_changed)
 }
 
 /// The payment hash of a sale's invoice, while it is not settled.
@@ -293,18 +462,35 @@ pub async fn cancel_invoice(app: &App, hash: &str) -> Result<(), CancelError> {
 	}
 }
 
-/// Ends the open invoice of a sale that another rail paid, or that was
-/// canceled or expired. It is best effort: a payment already in flight
-/// still completes and counts as excess.
+/// Ends what a sale holds once it is paid, canceled or expired: its open
+/// invoice is canceled, and its on-chain address is released, to be
+/// reused after the grace period if it never received anything. It is
+/// best effort: a payment already in flight still completes and counts as
+/// excess or late.
 pub async fn sale_ended(app: &App, sale_id: i64) {
 	match invoice_hash(app, sale_id).await {
 		Ok(Some(hash)) => {
 			if let Err(e) = cancel_invoice(app, &hash).await {
-				tracing::info!("invoice {} stays open: {}", hash, e);
+				tracing::debug!("invoice {} stays open: {}", hash, e);
 			}
 		},
 		Ok(None) => {},
 		Err(e) => tracing::warn!("failed to load the invoice of sale {}: {:#}", sale_id, e),
+	}
+	release_address(app, sale_id).await;
+}
+
+/// Releases the on-chain address of a sale that ended.
+async fn release_address(app: &App, sale_id: i64) {
+	let res = async {
+		let conn = app.db.conn().await?;
+		conn.execute("
+			UPDATE onchain_address SET sale_id = NULL, released_at = NOW() WHERE sale_id = $1
+		", &[&sale_id]).await?;
+		anyhow::Ok(())
+	}.await;
+	if let Err(e) = res {
+		tracing::warn!("failed to release the address of sale {}: {:#}", sale_id, e);
 	}
 }
 
@@ -336,8 +522,14 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 				Err(e) => tracing::info!("expiring sale {} with its invoice open: {}", sale_id, e),
 			}
 		}
-		let conn = app.db.conn().await?;
-		changed |= expire_sale(&*conn, sale_id).await? > 0;
+		let n = {
+			let conn = app.db.conn().await?;
+			expire_sale(&*conn, sale_id).await?
+		};
+		if n > 0 {
+			release_address(app, sale_id).await;
+			changed = true;
+		}
 	}
 	Ok(changed)
 }
@@ -409,46 +601,31 @@ async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 mod test {
 	use super::*;
 
-	fn obs(received: u64, pending: u64, settled: bool) -> Observation {
-		Observation {
-			received: Amount::from_sat(received),
-			pending: Amount::from_sat(pending),
-			settled,
-			awaiting_delivery: false,
-			via_ark: false,
-			txids: None,
-		}
+	fn obs(received: u64, settled: bool) -> Observation {
+		Observation::invoice(Amount::from_sat(received), settled, false, false)
 	}
 
 	#[test]
-	fn state_transitions() {
+	fn invoice_transitions() {
 		use SaleState::*;
 		// The invoice pays on delivery of the full amount.
-		assert_eq!(next_state(Open, 1000, Rail::Lightning, &obs(1000, 0, true), false), Some(Paid));
-		assert_eq!(next_state(Open, 1000, Rail::Lightning, &obs(1200, 0, true), false), Some(Paid));
-		assert_eq!(next_state(Open, 1000, Rail::Lightning, &obs(0, 0, true), false), None);
+		assert_eq!(next_state(Open, 1000, &obs(1000, true)), Some(Paid));
+		assert_eq!(next_state(Open, 1000, &obs(1200, true)), Some(Paid));
+		assert_eq!(next_state(Open, 1000, &obs(0, true)), None, "canceled unpaid");
 		// An Ark payment settled by the server but not delivered is in
-		// progress, never paid, and stays so past expiry.
+		// progress, never paid.
 		let awaiting = Observation::invoice(Amount::ZERO, false, true, true);
-		assert_eq!(next_state(Open, 1000, Rail::Lightning, &awaiting, false), Some(InProgress));
-		assert_eq!(next_state(InProgress, 1000, Rail::Lightning, &awaiting, true), None);
+		assert_eq!(next_state(Open, 1000, &awaiting), Some(InProgress));
+		assert_eq!(next_state(InProgress, 1000, &awaiting), None);
 		let delivered = Observation::invoice(Amount::from_sat(1000), true, false, true);
-		assert_eq!(next_state(InProgress, 1000, Rail::Lightning, &delivered, true), Some(Paid));
+		assert_eq!(next_state(InProgress, 1000, &delivered), Some(Paid));
 		assert_eq!(delivered.paid_rail(Rail::Lightning), Rail::Ark);
-		assert_eq!(obs(1000, 0, true).paid_rail(Rail::Lightning), Rail::Lightning);
-		// A payment after the sale ended does not change it: it counts as
-		// excess.
-		assert_eq!(next_state(Expired, 1000, Rail::Lightning, &obs(1000, 0, true), true), None);
-		assert_eq!(next_state(Paid, 1000, Rail::Lightning, &obs(1000, 0, true), false), None);
-
-		// On-chain: mempool, then 1 confirmation.
-		assert_eq!(next_state(Open, 1000, Rail::Onchain, &obs(0, 1000, false), false), Some(InProgress));
-		assert_eq!(next_state(InProgress, 1000, Rail::Onchain, &obs(0, 1000, false), true), None);
-		assert_eq!(next_state(InProgress, 1000, Rail::Onchain, &obs(1000, 0, false), true), Some(Paid));
-		// Underpaid on-chain stays open.
-		assert_eq!(next_state(Open, 1000, Rail::Onchain, &obs(0, 500, false), false), None);
-		// The mempool payment disappears.
-		assert_eq!(next_state(InProgress, 1000, Rail::Onchain, &obs(0, 0, false), false), Some(Open));
-		assert_eq!(next_state(InProgress, 1000, Rail::Onchain, &obs(0, 0, false), true), Some(Expired));
+		assert_eq!(obs(1000, true).paid_rail(Rail::Lightning), Rail::Lightning);
+		// A payment after the sale ended does not change it: it is a late
+		// payment.
+		assert_eq!(next_state(Expired, 1000, &obs(1000, true)), None);
+		assert_eq!(next_state(Canceled, 1000, &obs(1000, true)), None);
+		assert_eq!(next_state(Paid, 1000, &obs(1000, true)), None);
+		assert_eq!(next_state(PaymentIssue, 1000, &obs(1000, true)), None);
 	}
 }

@@ -20,6 +20,7 @@ pub mod rails;
 pub mod registration;
 pub mod sales;
 pub mod silent_payment;
+pub mod stages;
 pub mod token;
 pub mod watcher;
 

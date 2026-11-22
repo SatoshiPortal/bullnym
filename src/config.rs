@@ -83,15 +83,47 @@ pub struct Sales {
 	#[serde(default = "default_poll_interval_ms")]
 	pub poll_interval_ms: u64,
 	/// How long the watcher keeps checking an on-chain address after its
-	/// sale is final, to record late or extra payments.
+	/// sale was created, to record late or extra payments.
 	#[serde(default = "default_onchain_watch_secs")]
 	pub onchain_watch_secs: u64,
+	/// How long after its sale ended an address that never received
+	/// anything can be handed out again. It must be at least
+	/// `onchain_watch_secs`, so a late payment is never attributed to the
+	/// wrong sale.
+	#[serde(default = "default_onchain_reuse_grace_secs")]
+	pub onchain_reuse_grace_secs: u64,
+	/// The most addresses past the last one that received a payment. A
+	/// wallet that scans the store account with this gap limit sees every
+	/// payment. When the limit is reached and no address can be reused, new
+	/// sales offer no on-chain payment.
+	#[serde(default = "default_onchain_gap_limit")]
+	pub onchain_gap_limit: u32,
+	/// The confirmations that make an on-chain payment final.
+	#[serde(default = "default_final_confirmations")]
+	pub final_confirmations: u32,
+	/// A payment whose fee rate is below this share of bitcoind's estimate
+	/// gets the low-fee warning.
+	#[serde(default = "default_low_fee_ratio")]
+	pub low_fee_ratio: f64,
+	/// A payment below this fee rate, in sat/vB, gets the low-fee warning
+	/// whatever the estimate.
+	#[serde(default = "default_low_fee_floor_sat_vb")]
+	pub low_fee_floor_sat_vb: f64,
+	/// The confirmation target of the fee estimate, in blocks.
+	#[serde(default = "default_fee_estimate_blocks")]
+	pub fee_estimate_blocks: u16,
 }
 
 fn default_sale_expiry_secs() -> u64 { 600 }
 fn default_onchain_min_sat() -> u64 { 50_000 }
 fn default_poll_interval_ms() -> u64 { 2_000 }
 fn default_onchain_watch_secs() -> u64 { 7 * 24 * 3600 }
+fn default_onchain_reuse_grace_secs() -> u64 { 7 * 24 * 3600 + 3600 }
+fn default_onchain_gap_limit() -> u32 { 20 }
+fn default_final_confirmations() -> u32 { 3 }
+fn default_low_fee_ratio() -> f64 { 0.5 }
+fn default_low_fee_floor_sat_vb() -> f64 { 1.0 }
+fn default_fee_estimate_blocks() -> u16 { 3 }
 
 impl Default for Sales {
 	fn default() -> Self {
@@ -100,6 +132,12 @@ impl Default for Sales {
 			default_onchain_min_sat: default_onchain_min_sat(),
 			poll_interval_ms: default_poll_interval_ms(),
 			onchain_watch_secs: default_onchain_watch_secs(),
+			onchain_reuse_grace_secs: default_onchain_reuse_grace_secs(),
+			onchain_gap_limit: default_onchain_gap_limit(),
+			final_confirmations: default_final_confirmations(),
+			low_fee_ratio: default_low_fee_ratio(),
+			low_fee_floor_sat_vb: default_low_fee_floor_sat_vb(),
+			fee_estimate_blocks: default_fee_estimate_blocks(),
 		}
 	}
 }
@@ -186,8 +224,60 @@ impl Config {
 		if let Some(path) = path {
 			builder = builder.add_source(config::File::from(path));
 		}
-		builder.add_source(config::Environment::with_prefix("BULLNYM").separator("__"))
+		let cfg: Config = builder.add_source(config::Environment::with_prefix("BULLNYM").separator("__"))
 			.build().context("failed to read the config")?
-			.try_deserialize().context("the config is not valid")
+			.try_deserialize().context("the config is not valid")?;
+		cfg.validate()?;
+		Ok(cfg)
+	}
+
+	/// Checks the rules between settings.
+	pub fn validate(&self) -> anyhow::Result<()> {
+		let s = &self.sales;
+		if s.onchain_reuse_grace_secs < s.onchain_watch_secs {
+			anyhow::bail!("sales.onchain_reuse_grace_secs must be at least sales.onchain_watch_secs, \
+				so an address is never handed out while a late payment to it is still watched");
+		}
+		if s.onchain_gap_limit == 0 {
+			anyhow::bail!("sales.onchain_gap_limit must be at least 1");
+		}
+		if s.final_confirmations == 0 {
+			anyhow::bail!("sales.final_confirmations must be at least 1");
+		}
+		if self.nyms.min_sendable_sat == 0 || self.nyms.min_sendable_sat > self.nyms.max_sendable_sat {
+			anyhow::bail!("nyms.min_sendable_sat must be at least 1 and at most nyms.max_sendable_sat");
+		}
+		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	#[test]
+	fn reuse_grace_covers_the_late_payment_watch() {
+		let mut sales = Sales::default();
+		assert!(sales.onchain_reuse_grace_secs >= sales.onchain_watch_secs);
+		assert!(sales.onchain_watch_secs >= 7 * 24 * 3600);
+		let cfg = |sales: Sales| Config {
+			network: Network::Regtest,
+			http: Http { listen: "127.0.0.1:1".parse().unwrap(), public_url: "http://x".into() },
+			postgres: Postgres {
+				host: "h".into(), port: 1, name: "n".into(), user: None, password: None, max_connections: 1,
+			},
+			ark_server_url: "http://a".into(),
+			barkd: Barkd { url: "http://b".into(), token: None },
+			bitcoind: crate::rails::onchain::BitcoindConfig {
+				url: "http://c".into(), cookie: None, rpc_user: None, rpc_password: None, wallet: "w".into(),
+			},
+			price: Price { url: String::new(), fixed_btc_price: None, cache_secs: 1 },
+			nyms: Nyms::default(),
+			sales,
+			startup: Startup::default(),
+		};
+		assert!(cfg(sales.clone()).validate().is_ok());
+		sales.onchain_reuse_grace_secs = sales.onchain_watch_secs - 1;
+		assert!(cfg(sales).validate().is_err());
 	}
 }

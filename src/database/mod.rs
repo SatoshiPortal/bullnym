@@ -60,6 +60,10 @@ pub enum SaleState {
 	InProgress,
 	#[postgres(name = "paid")]
 	Paid,
+	/// A counted on-chain payment went away in a reorg. The sale is held
+	/// until the payment confirms again.
+	#[postgres(name = "payment-issue")]
+	PaymentIssue,
 	#[postgres(name = "expired")]
 	Expired,
 	#[postgres(name = "canceled")]
@@ -72,6 +76,7 @@ impl SaleState {
 			SaleState::Open => "open",
 			SaleState::InProgress => "in-progress",
 			SaleState::Paid => "paid",
+			SaleState::PaymentIssue => "payment-issue",
 			SaleState::Expired => "expired",
 			SaleState::Canceled => "canceled",
 		}
@@ -80,6 +85,12 @@ impl SaleState {
 	/// Whether the state can still change through a payment.
 	pub fn is_live(&self) -> bool {
 		matches!(self, SaleState::Open | SaleState::InProgress)
+	}
+
+	/// Whether the sale ended without being paid. A payment to it then is
+	/// a late payment.
+	pub fn ended_unpaid(&self) -> bool {
+		matches!(self, SaleState::Expired | SaleState::Canceled)
 	}
 }
 
@@ -96,6 +107,7 @@ impl FromStr for SaleState {
 			"open" => SaleState::Open,
 			"in-progress" => SaleState::InProgress,
 			"paid" => SaleState::Paid,
+			"payment-issue" => SaleState::PaymentIssue,
 			"expired" => SaleState::Expired,
 			"canceled" => SaleState::Canceled,
 			_ => anyhow::bail!("unknown sale state: {}", s),
@@ -229,11 +241,19 @@ pub struct Sale {
 	pub btc_price: Option<String>,
 	pub memo: Option<String>,
 	pub state: SaleState,
+	/// Why the sale is in progress: `onchain` or `ark`.
+	pub progress: Option<String>,
+	/// What happened to a payment that went away.
+	pub notice: Option<String>,
 	pub paid_rail: Option<Rail>,
 	pub received_sat: i64,
+	/// Unconfirmed on-chain payments. They never count.
+	pub seen_sat: i64,
+	pub warnings: Vec<String>,
 	pub created_at: DateTime<Utc>,
 	pub expires_at: DateTime<Utc>,
 	pub paid_at: Option<DateTime<Utc>>,
+	pub final_at: Option<DateTime<Utc>>,
 	pub lightning_invoice: Option<String>,
 	pub onchain_address: Option<String>,
 }
@@ -241,8 +261,10 @@ pub struct Sale {
 /// Selects a sale joined with its rails. Callers add the WHERE clause.
 pub const SALE_SELECT: &str = "
 	SELECT s.id, s.public_id, s.store_id, s.link, s.cashier_name, s.amount_sat, s.fiat_amount,
-		s.currency, s.btc_price, s.memo, s.state, s.paid_rail, s.received_sat, s.created_at,
-		s.expires_at, s.paid_at, ln.invoice AS lightning_invoice, oc.onchain_address
+		s.currency, s.btc_price, s.memo, s.state, s.progress, s.notice, s.paid_rail,
+		s.received_sat, coalesce(oc.pending_sat, 0) AS seen_sat,
+		coalesce(oc.warnings, '{}') AS warnings, s.created_at, s.expires_at, s.paid_at,
+		s.final_at, ln.invoice AS lightning_invoice, oc.onchain_address
 	FROM sale s
 	LEFT JOIN sale_payment ln ON ln.sale_id = s.id AND ln.rail = 'lightning'
 	LEFT JOIN sale_payment oc ON oc.sale_id = s.id AND oc.rail = 'onchain'
@@ -262,11 +284,16 @@ impl Sale {
 			btc_price: row.get("btc_price"),
 			memo: row.get("memo"),
 			state: row.get("state"),
+			progress: row.get("progress"),
+			notice: row.get("notice"),
 			paid_rail: row.get("paid_rail"),
 			received_sat: row.get("received_sat"),
+			seen_sat: row.get("seen_sat"),
+			warnings: row.get("warnings"),
 			created_at: row.get("created_at"),
 			expires_at: row.get("expires_at"),
 			paid_at: row.get("paid_at"),
+			final_at: row.get("final_at"),
 			lightning_invoice: row.get("lightning_invoice"),
 			onchain_address: row.get("onchain_address"),
 		}
@@ -285,6 +312,7 @@ pub struct WatchedPayment {
 	pub rail: Rail,
 	pub payment_hash: Option<String>,
 	pub onchain_address: Option<String>,
+	pub onchain_address_id: Option<i64>,
 	pub received_sat: i64,
 	pub pending_sat: i64,
 	pub settled: bool,
@@ -302,6 +330,7 @@ impl WatchedPayment {
 			rail: row.get("rail"),
 			payment_hash: row.get("payment_hash"),
 			onchain_address: row.get("onchain_address"),
+			onchain_address_id: row.get("onchain_address_id"),
 			received_sat: row.get("received_sat"),
 			pending_sat: row.get("pending_sat"),
 			settled: row.get::<_, Option<DateTime<Utc>>>("settled_at").is_some(),

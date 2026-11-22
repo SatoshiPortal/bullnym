@@ -4,6 +4,11 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 
+/// The one message shown when a payment option is unavailable because its
+/// backend (barkd, the Ark server, bitcoind or the price feed) is not
+/// healthy. Details stay in the logs.
+pub const UNAVAILABLE_MESSAGE: &str = "This payment method is temporarily unavailable. Try again later.";
+
 /// An API error. Internal and upstream errors are logged in full and shown
 /// to the caller with a generic message.
 #[derive(Debug, thiserror::Error)]
@@ -16,7 +21,9 @@ pub enum ApiError {
 	NotFound(String),
 	#[error("{0}")]
 	Conflict(String),
-	#[error("an upstream service failed")]
+	/// A backend failed or is unhealthy: the payment option is withdrawn,
+	/// with one fixed message.
+	#[error("{}", UNAVAILABLE_MESSAGE)]
 	Upstream(anyhow::Error),
 	#[error("internal error")]
 	Internal(#[from] anyhow::Error),
@@ -56,8 +63,8 @@ impl IntoResponse for ApiError {
 			ApiError::NotFound(_) => StatusCode::NOT_FOUND,
 			ApiError::Conflict(_) => StatusCode::CONFLICT,
 			ApiError::Upstream(e) => {
-				tracing::warn!("upstream error: {:#}", e);
-				StatusCode::BAD_GATEWAY
+				tracing::warn!("backend unavailable: {:#}", e);
+				StatusCode::SERVICE_UNAVAILABLE
 			},
 			ApiError::Internal(e) => {
 				tracing::error!("internal error: {:#}", e);

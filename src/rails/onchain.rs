@@ -1,10 +1,12 @@
 //! The on-chain rail: one address per sale, derived from the owner's
 //! public descriptor.
 //!
-//! posd watches the addresses in a watch-only wallet of its own on bitcoind.
-//! Each sale address is imported when the sale is created. A fresh address
-//! has no history, so the import needs no rescan.
+//! The service watches the addresses in a watch-only wallet of its own on
+//! bitcoind, never through a third-party API. Each sale address is imported
+//! when it is first handed out. A fresh address has no history, so the
+//! import needs no rescan.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -15,6 +17,8 @@ use bdk_wallet::miniscript::descriptor::{Descriptor, DescriptorPublicKey, Wildca
 use bitcoin::{Address, Amount, Network};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::stages::{Mempool, TxObservation};
 
 
 /// A public, single-path, ranged descriptor such as
@@ -65,16 +69,6 @@ impl StoreDescriptor {
 	}
 }
 
-/// What the chain shows for an address.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AddressFunds {
-	/// Paid to the address with at least 1 confirmation.
-	pub confirmed: Amount,
-	/// Paid to the address in mempool transactions.
-	pub pending: Amount,
-	pub txids: Vec<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BitcoindConfig {
 	/// The RPC URL, for example `http://127.0.0.1:8332`.
@@ -84,12 +78,12 @@ pub struct BitcoindConfig {
 	pub rpc_user: Option<String>,
 	#[serde(skip_serializing)]
 	pub rpc_password: Option<String>,
-	/// The watch-only wallet posd creates and uses.
+	/// The watch-only wallet the service creates and uses.
 	#[serde(default = "default_wallet")]
 	pub wallet: String,
 }
 
-fn default_wallet() -> String { "posd".into() }
+fn default_wallet() -> String { "bullnym".into() }
 
 pub struct Chain {
 	cfg: BitcoindConfig,
@@ -138,42 +132,130 @@ impl Chain {
 		Ok(())
 	}
 
-	/// The payments to an address. Spends from it do not count: the owner
-	/// spending a payment does not undo the sale.
-	pub async fn funds(&self, address: &Address) -> anyhow::Result<AddressFunds> {
-		let wallet = Some(self.cfg.wallet.as_str());
+	/// The transactions paying each address of the wallet, with unconfirmed
+	/// ones. A transaction that conflicts with a confirmed one is left out
+	/// by bitcoind; the watcher keeps the ones it saw.
+	pub async fn received_by_address(&self) -> anyhow::Result<HashMap<String, Vec<String>>> {
+		let list = self.call(Some(&self.cfg.wallet), "listreceivedbyaddress", json!([0, false, true])).await?;
+		let mut out = HashMap::new();
+		for entry in list.as_array().context("listreceivedbyaddress returned no list")? {
+			let Some(address) = entry.get("address").and_then(|a| a.as_str()) else { continue };
+			let txids = entry.get("txids").and_then(|t| t.as_array())
+				.map(|t| t.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>())
+				.unwrap_or_default();
+			out.insert(address.to_string(), txids);
+		}
+		Ok(out)
+	}
+
+	/// Whether the wallet saw any payment, confirmed or not, to `address`.
+	pub async fn has_received(&self, address: &Address) -> anyhow::Result<bool> {
+		let list = self.call(
+			Some(&self.cfg.wallet), "listreceivedbyaddress", json!([0, true, true, address.to_string()]),
+		).await?;
+		let Some(entry) = list.as_array().and_then(|l| l.first()) else { return Ok(false) };
+		let amount = entry.get("amount").map(btc_value).transpose()?.unwrap_or(Amount::ZERO);
+		let txids = entry.get("txids").and_then(|t| t.as_array()).map_or(0, |t| t.len());
+		Ok(amount > Amount::ZERO || txids > 0)
+	}
+
+	/// What bitcoind says about transaction `txid` paying `address`.
+	/// `address_txids` are every transaction known to pay the address: a
+	/// conflict among them still pays the sale.
+	pub async fn observe_tx(
+		&self,
+		txid: &str,
+		address: &Address,
+		address_txids: &[String],
+	) -> anyhow::Result<TxObservation> {
+		let tx = self.call(Some(&self.cfg.wallet), "gettransaction", json!([txid, true, true])).await?;
+		let confirmations = tx.get("confirmations").and_then(|c| c.as_i64())
+			.context("gettransaction returned no confirmations")?;
 		let addr = address.to_string();
-		let all = self.call(wallet, "getreceivedbyaddress", json!([addr, 0])).await?;
-		let confirmed = self.call(wallet, "getreceivedbyaddress", json!([addr, 1])).await?;
-		let all = btc_value(&all)?;
-		let confirmed = btc_value(&confirmed)?;
-		let list = self.call(wallet, "listreceivedbyaddress", json!([0, false, true, addr])).await?;
-		let txids = list.get(0).and_then(|e| e.get("txids")).and_then(|t| t.as_array())
-			.map(|t| t.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-			.unwrap_or_default();
-		Ok(AddressFunds {
-			confirmed,
-			pending: all.checked_sub(confirmed).unwrap_or(Amount::ZERO),
-			txids,
-		})
+		let mut amount = Amount::ZERO;
+		for out in tx.pointer("/decoded/vout").and_then(|v| v.as_array()).context("gettransaction returned no outputs")? {
+			if out.pointer("/scriptPubKey/address").and_then(|a| a.as_str()) == Some(addr.as_str()) {
+				amount += btc_value(out.get("value").context("output without value")?)?;
+			}
+		}
+		let conflicts = ["walletconflicts", "mempoolconflicts"].iter()
+			.filter_map(|k| tx.get(*k).and_then(|c| c.as_array()))
+			.flatten()
+			.filter_map(|c| c.as_str())
+			.collect::<Vec<_>>();
+		let foreign_conflicts = conflicts.iter().any(|c| !address_txids.iter().any(|t| t == c));
+		let mempool = if confirmations == 0 { self.mempool_entry(txid).await } else { Mempool::Unknown };
+		Ok(TxObservation { txid: txid.to_string(), amount, confirmations, mempool, foreign_conflicts })
+	}
+
+	/// The mempool entry of `txid`. Only bitcoind's own answer that the
+	/// transaction is not in its mempool counts as [Mempool::NotIn]; any
+	/// other failure is [Mempool::Unknown].
+	async fn mempool_entry(&self, txid: &str) -> Mempool {
+		match self.call_rpc(None, "getmempoolentry", json!([txid])).await {
+			Ok(Ok(entry)) => {
+				let fee = entry.pointer("/fees/base").map(btc_value).and_then(Result::ok);
+				let vsize = entry.get("vsize").and_then(|v| v.as_u64()).filter(|v| *v > 0);
+				let ancestors = entry.get("ancestorcount").and_then(|a| a.as_u64()).unwrap_or(1);
+				match (fee, vsize) {
+					(Some(fee), Some(vsize)) => Mempool::In {
+						fee_rate_sat_vb: fee.to_sat() as f64 / vsize as f64,
+						unconfirmed_parents: ancestors > 1,
+					},
+					_ => Mempool::Unknown,
+				}
+			},
+			Ok(Err(RPC_INVALID_ADDRESS_OR_KEY)) => Mempool::NotIn,
+			Ok(Err(_)) | Err(_) => Mempool::Unknown,
+		}
+	}
+
+	/// bitcoind's fee rate estimate for a confirmation within `blocks`, in
+	/// sat/vB, if it has one.
+	pub async fn fee_estimate(&self, blocks: u16) -> Option<f64> {
+		let res = self.call(None, "estimatesmartfee", json!([blocks])).await.ok()?;
+		let btc_per_kvb = res.get("feerate").and_then(|f| f.as_f64())?;
+		Some(btc_per_kvb * 100_000.0)
+	}
+
+	/// Whether bitcoind answers and has the wallet loaded.
+	pub async fn ping(&self) -> anyhow::Result<()> {
+		self.call(Some(&self.cfg.wallet), "getwalletinfo", json!([])).await?;
+		Ok(())
 	}
 
 	async fn call(&self, wallet: Option<&str>, method: &str, params: Value) -> anyhow::Result<Value> {
+		match self.call_rpc(wallet, method, params).await? {
+			Ok(v) => Ok(v),
+			Err(code) => bail!("bitcoind {} failed with error code {}", method, code),
+		}
+	}
+
+	/// Calls bitcoind. The outer error is a failure to get an answer; the
+	/// inner one is bitcoind's own error code.
+	async fn call_rpc(
+		&self,
+		wallet: Option<&str>,
+		method: &str,
+		params: Value,
+	) -> anyhow::Result<Result<Value, i64>> {
 		let url = match wallet {
 			Some(w) => format!("{}/wallet/{}", self.cfg.url.trim_end_matches('/'), w),
 			None => self.cfg.url.clone(),
 		};
 		let (user, pass) = self.credentials()?;
-		let body = json!({ "jsonrpc": "1.0", "id": "posd", "method": method, "params": params });
+		let body = json!({ "jsonrpc": "1.0", "id": "bullnym", "method": method, "params": params });
 		let resp = self.http.post(url).basic_auth(user, Some(pass)).json(&body).send().await
 			.with_context(|| format!("bitcoind {} request failed", method))?;
 		let status = resp.status();
 		let resp: Value = resp.json().await
 			.with_context(|| format!("bitcoind {} returned {} without JSON", method, status))?;
 		if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
-			bail!("bitcoind {} failed: {}", method, err);
+			let code = err.get("code").and_then(|c| c.as_i64())
+				.with_context(|| format!("bitcoind {} failed: {}", method, err))?;
+			return Ok(Err(code));
 		}
-		Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+		Ok(Ok(resp.get("result").cloned().unwrap_or(Value::Null)))
 	}
 
 	fn credentials(&self) -> anyhow::Result<(String, String)> {
@@ -189,12 +271,15 @@ impl Chain {
 	}
 }
 
+/// bitcoind's error code for a transaction that is not in its mempool.
+const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
+
 fn btc_value(v: &Value) -> anyhow::Result<Amount> {
-	// bitcoind prints amounts with exactly 8 decimals, so the text form is
-	// exact.
-	let s = v.to_string();
-	Amount::from_str_in(&s, bitcoin::Denomination::Bitcoin)
-		.with_context(|| format!("bitcoind returned an invalid amount: {}", s))
+	// An amount has 8 decimals, well within the precision of an f64, and
+	// rounding to the nearest sat gives it back exactly. The text form is
+	// not usable: small amounts print in exponent notation.
+	let btc = v.as_f64().with_context(|| format!("bitcoind returned an invalid amount: {}", v))?;
+	Amount::from_btc(btc).with_context(|| format!("bitcoind returned an invalid amount: {}", v))
 }
 
 #[cfg(test)]
@@ -233,5 +318,9 @@ mod test {
 		assert_eq!(btc_value(&json!(0.00035)).unwrap(), Amount::from_sat(35_000));
 		assert_eq!(btc_value(&json!(0)).unwrap(), Amount::ZERO);
 		assert_eq!(btc_value(&json!(21.12345678)).unwrap(), Amount::from_sat(2_112_345_678));
+		// Small amounts, which serialize in exponent notation.
+		assert_eq!(btc_value(&json!(0.00001)).unwrap(), Amount::from_sat(1_000));
+		assert_eq!(btc_value(&json!(0.00000001)).unwrap(), Amount::from_sat(1));
+		assert!(btc_value(&json!("x")).is_err());
 	}
 }

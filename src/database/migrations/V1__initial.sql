@@ -118,7 +118,10 @@ CREATE TABLE lnurl_invoice (
 CREATE INDEX lnurl_invoice_open_idx ON lnurl_invoice (nym_id) WHERE state = 'open';
 CREATE INDEX lnurl_invoice_nym_idx ON lnurl_invoice (nym_id, id DESC);
 
-CREATE TYPE sale_state AS ENUM ('open', 'in-progress', 'paid', 'expired', 'canceled');
+-- in-progress: a payment is seen but does not count yet: an on-chain payment
+-- in the mempool, or an Ark payment the Ark server has not delivered.
+-- payment-issue: a counted on-chain payment went away in a reorg.
+CREATE TYPE sale_state AS ENUM ('open', 'in-progress', 'paid', 'payment-issue', 'expired', 'canceled');
 CREATE TYPE payment_rail AS ENUM ('lightning', 'ark', 'onchain');
 -- How a sale was created: through the store's public checkout under its
 -- nym, or through its unlisted cashier link.
@@ -140,15 +143,43 @@ CREATE TABLE sale (
 	btc_price TEXT,
 	memo TEXT,
 	state sale_state NOT NULL DEFAULT 'open',
+	-- Why the sale is in progress: onchain or ark.
+	progress TEXT CHECK (progress IN ('onchain', 'ark')),
+	-- What happened to a payment that went away: payment-replaced or
+	-- payment-dropped.
+	notice TEXT,
 	paid_rail payment_rail,
+	-- Only counted payments: delivered invoices and confirmed outputs.
 	received_sat BIGINT NOT NULL DEFAULT 0,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	expires_at TIMESTAMPTZ NOT NULL,
 	paid_at TIMESTAMPTZ,
+	-- Paid by an invoice, or by on-chain payments with 3 confirmations.
+	final_at TIMESTAMPTZ,
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX sale_store_id_idx ON sale (store_id, id DESC);
 CREATE INDEX sale_watch_idx ON sale (state, expires_at);
+
+-- An on-chain address of a store. It is handed to one live sale at a time.
+-- An address that never received anything is handed out again once its last
+-- sale ended more than the grace period ago; one that received anything,
+-- confirmed or not, never is.
+CREATE TABLE onchain_address (
+	id BIGSERIAL PRIMARY KEY,
+	store_id BIGINT NOT NULL REFERENCES store(id),
+	derivation_index BIGINT NOT NULL,
+	address TEXT NOT NULL UNIQUE,
+	ever_received BOOLEAN NOT NULL DEFAULT FALSE,
+	-- The sale it is handed to, while that sale is live.
+	sale_id BIGINT UNIQUE REFERENCES sale(id),
+	-- When its last sale ended.
+	released_at TIMESTAMPTZ,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE (store_id, derivation_index)
+);
+CREATE INDEX onchain_address_reuse_idx ON onchain_address (store_id, derivation_index)
+	WHERE NOT ever_received AND sale_id IS NULL;
 
 -- One row per payment rail offered for a sale: the invoice, which
 -- Lightning and Ark payers both pay, and the on-chain address.
@@ -159,14 +190,35 @@ CREATE TABLE sale_payment (
 	rail payment_rail NOT NULL,
 	payment_hash TEXT UNIQUE,
 	invoice TEXT,
-	onchain_index BIGINT,
+	onchain_address_id BIGINT REFERENCES onchain_address(id),
 	onchain_address TEXT,
 	-- The amount this rail delivered: the invoice amount once delivered, or
 	-- the sum of the confirmed outputs to the address.
 	received_sat BIGINT NOT NULL DEFAULT 0,
-	-- The amount in unconfirmed outputs to the address.
+	-- The amount in unconfirmed outputs to the address. It never counts.
 	pending_sat BIGINT NOT NULL DEFAULT 0,
-	txids TEXT[],
+	-- The warnings about the unconfirmed payments: not-guaranteed, low-fee,
+	-- unconfirmed-parents, replaced.
+	warnings TEXT[] NOT NULL DEFAULT '{}',
 	settled_at TIMESTAMPTZ,
 	UNIQUE (sale_id, rail)
+);
+
+-- A transaction paying a sale's address, as the service last saw it.
+CREATE TABLE onchain_tx (
+	id BIGSERIAL PRIMARY KEY,
+	sale_payment_id BIGINT NOT NULL REFERENCES sale_payment(id),
+	txid TEXT NOT NULL,
+	amount_sat BIGINT NOT NULL,
+	-- seen, confirmed or gone.
+	status TEXT NOT NULL CHECK (status IN ('seen', 'confirmed', 'gone')),
+	confirmations BIGINT NOT NULL DEFAULT 0,
+	low_fee BOOLEAN NOT NULL DEFAULT FALSE,
+	unconfirmed_parents BOOLEAN NOT NULL DEFAULT FALSE,
+	replaced BOOLEAN NOT NULL DEFAULT FALSE,
+	-- How many answers in a row said it is not in the mempool.
+	absent_count INT NOT NULL DEFAULT 0,
+	first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	UNIQUE (sale_payment_id, txid)
 );
