@@ -4,6 +4,7 @@ version = "0.1.0"
 license = "MIT"
 description = "Lightning Address and store service that pays an Ark wallet by Lightning, Ark and on-chain"
 edition = "2024"
+autotests = false
 rust-version = "1.90"
 
 [workspace]
