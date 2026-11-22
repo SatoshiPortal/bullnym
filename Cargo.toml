@@ -61,3 +61,8 @@ url = "2.5"
 ark-testing = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6" }
 bark-wallet = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6", features = ["sqlite"] }
 bip39 = { version = "2.0.0", features = ["rand"] }
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+strip = "symbols"
