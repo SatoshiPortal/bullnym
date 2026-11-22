@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Builds a static x86_64 Linux bullnym binary, with the web app embedded, in
 # a Debian Rust container with musl. The binary runs on any x86_64 Linux.
+# The compiler runs at the lowest CPU priority, so the build does not slow
+# a shared machine down.
 #
 # Environment:
 #   OUT_DIR           where the binary goes (default: target/static)
@@ -31,7 +33,7 @@ docker run --rm \
 		apt-get update -qq
 		apt-get install -y -qq musl-tools protobuf-compiler cmake >/dev/null
 		rustup target add x86_64-unknown-linux-musl
-		cargo build --locked --release --target x86_64-unknown-linux-musl --bin bullnym
+		nice -n 19 cargo build --locked --release --target x86_64-unknown-linux-musl --bin bullnym
 		chown -R '"$(id -u):$(id -g)"' /target /cargo
 	'
 
