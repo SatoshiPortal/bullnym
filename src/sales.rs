@@ -383,12 +383,17 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 && app.protect.health.onchain() {
 		let mut conn = app.public.db.conn().await?;
 		let mut tx = conn.transaction().await?;
-		match next_address(app, &mut tx, store).await {
-			Ok((index, address)) => {
-				tx.execute("
-					INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
-					VALUES ($1, 'onchain', $2, $3)
-				", &[&res.sale_id, &index, &address.to_string()]).await?;
+		let taken = match next_address(app, &mut tx, store).await {
+			// The address column is unique: should another sale have the
+			// address after all, this sale offers no on-chain payment.
+			Ok((index, address)) => tx.execute("
+				INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
+				VALUES ($1, 'onchain', $2, $3)
+			", &[&res.sale_id, &index, &address.to_string()]).await.map_err(anyhow::Error::from),
+			Err(e) => Err(e),
+		};
+		match taken {
+			Ok(_) => {
 				tx.commit().await?;
 				true
 			},

@@ -300,6 +300,22 @@ async fn cashier_link() {
 	assert_eq!(status, StatusCode::NOT_FOUND);
 	store.new_sale(json!({ "amount_sat": 1000 })).await;
 
+	// Amounts past 21,000,000 BTC, or a fiat amount of 10^15 or more, are
+	// refused before a sale, an invoice or an address is allocated.
+	let before = svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"].clone();
+	for body in [
+		json!({ "amount_sat": 2_100_000_000_000_001u64 }),
+		json!({ "amount_sat": u64::MAX }),
+		json!({ "fiat_amount": "1000000000000000" }),
+	] {
+		let (status, err) = svc.call(Method::POST, "/api/v1/checkout/cafe/sales", None, Some(body.clone())).await;
+		assert_eq!((status, err["error"].clone()), (StatusCode::BAD_REQUEST, json!("the amount is too large")), "{}", body);
+	}
+	assert_eq!(svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], before);
+	let (status, _) = svc.call(Method::PATCH, "/api/v1/owner/store", owner,
+		Some(json!({ "onchain_min_sat": 2_100_000_000_000_001u64 }))).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST);
+
 	// The link is always on: the owner has no switch for it, and no other
 	// link exists.
 	let unchanged = svc.ok(Method::PATCH, "/api/v1/owner/store", owner,
