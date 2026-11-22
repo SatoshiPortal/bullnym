@@ -314,4 +314,30 @@ mod test {
 		sales.onchain_reuse_grace_secs = sales.onchain_watch_secs - 1;
 		assert!(cfg(sales).validate().is_err());
 	}
+
+	/// The documented default config parses, and documents the defaults.
+	#[test]
+	fn default_config_file() {
+		let cfg: Config = config::Config::builder()
+			.add_source(config::File::from_str(
+				include_str!("../bullnym.default.toml"), config::FileFormat::Toml,
+			))
+			.build().unwrap()
+			.try_deserialize().unwrap();
+		cfg.validate().unwrap();
+		assert_eq!(json(&cfg.nyms), json(&Nyms::default()));
+		assert_eq!(json(&cfg.sales), json(&Sales::default()));
+		assert_eq!(json(&cfg.startup), json(&Startup::default()));
+		assert_eq!(json(&cfg.limits), json(&crate::protect::Limits::default()));
+		assert_eq!(json(&cfg.certification), json(&crate::protect::Certification::default()));
+		assert_eq!(json(&cfg.watcher), json(&Watcher::default()));
+		assert_eq!(cfg.postgres.max_connections, default_max_connections());
+		assert_eq!(cfg.price.cache_secs, default_price_cache_secs());
+		assert_eq!(cfg.price.url, default_price_url());
+		assert_eq!(cfg.bitcoind.wallet, "bullnym");
+	}
+
+	fn json<T: Serialize>(v: &T) -> String {
+		serde_json::to_string(v).unwrap()
+	}
 }
