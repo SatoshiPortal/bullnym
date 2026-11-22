@@ -1,0 +1,159 @@
+# bullnym configuration. Every setting is listed with its default; the ones
+# without a default must be set. Every value can be overridden with an
+# environment variable BULLNYM__<SECTION>__<KEY>, for example
+# BULLNYM__POSTGRES__PASSWORD.
+
+# The bitcoin network: bitcoin, signet, testnet or regtest. The Ark server
+# must run on the same one.
+network = "bitcoin"
+
+# The Ark server's public gRPC address. The service uses only its public API,
+# like any wallet. It refuses to start unless the server is in expiry payout
+# mode. A store sale is refused, with a message saying so, if barkd returns
+# its invoice without the store's Ark address in the route hints: the server
+# must allow Ark address hints (ln_receive_ark_address_hints).
+ark_server_url = "https://ark.example.com"
+
+[http]
+# The address the service listens on. Put a TLS proxy in front of it.
+listen = "127.0.0.1:3080"
+# The public base URL, without a trailing slash. Its host is the domain of
+# every Lightning Address (<nym>@<host>), and checkout links start with it.
+public_url = "https://pay.example.com"
+
+# The service's own database.
+[postgres]
+host = "localhost"
+port = 5432
+name = "bullnym"
+user = "bullnym"
+# password = ""
+# Connections for public traffic. The watchers have their own pool, set in
+# [watcher].
+max_connections = 10
+
+# The private barkd that issues the forwarding invoices and forwards the
+# payments to the owners. It needs no funds. Do not expose it publicly. Run
+# it with daemon_sync_interval_secs = 5 in its own config.toml: a sale paid
+# over Ark counts once barkd settles the receive, and barkd checks on that
+# interval.
+[barkd]
+url = "http://127.0.0.1:3000"
+# The barkd bearer token.
+# token = ""
+
+# The bitcoind that watches the stores' on-chain addresses. The service
+# creates a watch-only wallet on it, with no keys, and imports one address
+# per on-chain sale. Use cookie, or rpc_user and rpc_password.
+[bitcoind]
+url = "http://127.0.0.1:8332"
+cookie = "/var/lib/bitcoind/.cookie"
+# rpc_user = ""
+# rpc_password = ""
+wallet = "bullnym"
+
+[price]
+# The Bull Bitcoin price API, for sales keyed in fiat.
+url = "https://api.bullbitcoin.com/public/price"
+# How long a price is reused, in seconds.
+cache_secs = 60
+# A fixed price per bitcoin in every currency, in place of the API. For test
+# networks only.
+# fixed_btc_price = "62500000.00"
+
+# The Lightning Address.
+[nyms]
+# Names nobody can register, on top of the built-in route and brand names.
+reserved = []
+# The smallest and largest Lightning Address payments, in sats. The largest
+# is at most 2100000000000000 (21,000,000 BTC).
+min_sendable_sat = 1
+max_sendable_sat = 10000000
+# How long a Lightning Address invoice stays payable. barkd cancels it at
+# expiry.
+invoice_expiry_secs = 600
+
+# Store sales.
+[sales]
+# How long an open sale and its invoice stay payable. A sale with a payment
+# in progress stays open past it.
+expiry_secs = 600
+# The on-chain minimum of a new store, in sats, at most 2100000000000000. The
+# owner can change it per store. Below it, Bitcoin cannot be added to a sale.
+default_onchain_min_sat = 50000
+# How often the watcher checks open sales, in milliseconds. On-chain
+# addresses are checked every fifth time.
+poll_interval_ms = 2000
+# Each sale Bitcoin is added to takes the store's next address, and no address
+# is handed out twice, even to two stores with the same descriptor. The
+# owner's wallet scans the store account up to the store's next index, which
+# the owner's store view shows. A sale is paid at 1 confirmation, for good.
+# How long an on-chain address is watched after its sale was created, for
+# late and extra payments.
+onchain_watch_secs = 604800
+# A payment whose fee rate is below this share of bitcoind's estimate gets
+# the low-fee warning.
+low_fee_ratio = 0.5
+# A payment below this fee rate, in sat/vB, gets the low-fee warning
+# whatever the estimate.
+low_fee_floor_sat_vb = 1.0
+# The confirmation target of the fee estimate, in blocks.
+fee_estimate_blocks = 3
+
+# Protections against floods. Per-source limits count IPv4 callers by
+# address and IPv6 callers by /56.
+[limits]
+# Proxies whose X-Forwarded-For header is read, as addresses or networks.
+# Empty: the header is never read.
+trusted_proxies = []
+# Registrations of nyms and stores per source per minute.
+register_per_minute = 5
+# New registering Ark addresses per source per hour.
+register_identities_per_hour = 10
+# The most nyms the service holds.
+max_nyms = 100000
+# Name lookups (LNURL metadata, public checkout data) per source
+# per minute, and distinct names a source can look up per hour.
+lookups_per_minute = 30
+lookup_names_per_hour = 20
+# LNURL callbacks per source per minute, and per nym from all sources.
+callbacks_per_minute = 30
+callbacks_per_nym_per_minute = 60
+# Sale creations per source per minute, loose enough for a busy counter.
+sales_per_minute = 60
+# Sale status reads per source per minute, long-polls included.
+status_reads_per_minute = 600
+# Owner login requests per source per minute.
+owner_per_minute = 20
+# Cashier PIN checks per source per hour. Wrong PINs also back off per
+# source and per store: 5 are free, then each locks further checks for twice
+# as long as the one before, up to 15 minutes.
+pin_checks_per_hour = 10
+# Open Lightning Address invoices per nym, and open invoices of all nyms and
+# sales together. Each is a hold invoice on the Ark server.
+max_open_invoices_per_nym = 20
+max_open_invoices = 2000
+# Open, unpaid sales per store.
+max_open_sales_per_store = 50
+# New invoices per second from public traffic, all callers together.
+public_invoices_per_second = 20
+# Callers that skip the rate limits (never the caps or the health checks).
+# For tests only.
+ip_allowlist = []
+
+# A token that, from the allowed sources, skips the rate limits. For
+# deterministic tests of a deployment only. It is sent in the
+# X-Bullnym-Certification-Token header.
+[certification]
+enabled = false
+# token = ""
+allowed_sources = []
+
+# The watchers' own resources, apart from public traffic.
+[watcher]
+# Database connections of the watchers.
+max_connections = 4
+# How often barkd, the Ark server and bitcoind are probed. A payment option
+# closes after three failed probes in a row and reopens after two
+# successes.
+health_interval_secs = 5
