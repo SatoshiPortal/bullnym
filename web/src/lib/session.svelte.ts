@@ -1,72 +1,110 @@
-// The cashier link this page serves, the store behind it, and the cashier
-// name typed on this device. There is no device token: the link is all a
-// cashier needs. The name is never verified; it only labels the sales made
-// here.
-import { CashierClient, linkFromPath, type Link, type Store } from './api'
+// The cashier link of this page, from its path ("/<nym>" or "/c/<secret>"):
+// any device with the link takes payments, with no pairing and no token.
+// The owner's session token, which the history and the CSV need, comes
+// from the wallet in the fragment of "/owner#token=<token>" and stays in
+// this tab.
+import { PosClient, type Checkout, type Link } from './api'
 
-function storageKey(link: Link, what: string): string {
-	return `bullnym:${link.kind === 'public' ? `nym:${link.nym}` : `link:${link.secret}`}:${what}`
-}
+const TOKEN_KEY = 'bullnym:owner-token'
 
-function read(key: string): string | null {
+function readToken(): string | null {
 	try {
-		return localStorage.getItem(key)
+		const match = location.hash.match(/token=([0-9a-fA-F]+)/)
+		if (match) {
+			sessionStorage.setItem(TOKEN_KEY, match[1]!)
+			history.replaceState(null, '', location.pathname)
+			return match[1]!
+		}
+		return sessionStorage.getItem(TOKEN_KEY)
 	} catch {
 		return null
 	}
 }
 
-function write(key: string, value: string | null): void {
+/** The cashier link in "/<nym>" or "/c/<secret>", or null. */
+export function linkFromPath(pathname: string): Link | null {
+	const unlisted = pathname.match(/^\/c\/([0-9a-fA-F]{1,64})\/?$/)
+	if (unlisted) return { kind: 'unlisted', secret: unlisted[1]! }
+	const pub = pathname.match(/^\/([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)\/?$/)
+	if (pub && pub[1] !== 'owner') return { kind: 'public', nym: pub[1]! }
+	return null
+}
+
+const link = linkFromPath(location.pathname)
+
+function linkKey(what: string): string | null {
+	if (!link) return null
+	return `bullnym:${link.kind === 'public' ? link.nym : link.secret}:${what}`
+}
+
+function readLocal(key: string | null): string | null {
 	try {
-		if (value === null) localStorage.removeItem(key)
-		else localStorage.setItem(key, value)
+		return key ? localStorage.getItem(key) : null
+	} catch {
+		return null
+	}
+}
+
+function writeLocal(key: string | null, value: string): void {
+	try {
+		if (key) localStorage.setItem(key, value)
 	} catch {
 		/* storage unavailable: it lasts for this page only */
 	}
 }
 
-const link = linkFromPath(location.pathname)
-
-const state = $state<{ store: Store | null; cashierName: string }>({
-	store: null,
-	cashierName: link ? (read(storageKey(link, 'cashier-name')) ?? '') : '',
+const state = $state<{ token: string | null; checkout: Checkout | null; cashierName: string }>({
+	token: readToken(),
+	checkout: null,
+	cashierName: readLocal(linkKey('cashier-name')) ?? '',
 })
 
 export const session = {
 	get link(): Link | null {
 		return link
 	},
-	get store(): Store | null {
-		return state.store
+	/** The owner's session token, on "/owner". */
+	get token(): string | null {
+		return state.token
 	},
-	set store(value: Store | null) {
-		state.store = value
+	get checkout(): Checkout | null {
+		return state.checkout
 	},
+	set checkout(value: Checkout | null) {
+		state.checkout = value
+	},
+	/** A name typed on this device. It labels the sales made here and is never verified. */
 	get cashierName(): string {
 		return state.cashierName
 	},
 	set cashierName(value: string) {
 		state.cashierName = value
-		if (link) write(storageKey(link, 'cashier-name'), value.trim() || null)
+		writeLocal(linkKey('cashier-name'), value)
+	},
+	signOut(): void {
+		try {
+			sessionStorage.removeItem(TOKEN_KEY)
+		} catch {
+			/* storage unavailable */
+		}
+		state.token = null
 	},
 }
 
-/** A client for this page's cashier link. */
-export function client(): CashierClient {
-	if (!link) throw new Error('no cashier link')
-	return new CashierClient(link)
+/** A client for this page's link, with the owner token if there is one. A 401 drops the token. */
+export function client(): PosClient {
+	return new PosClient({ link, token: state.token, onUnauthorized: () => session.signOut() })
 }
 
-/**
- * The sales this device created on this link, newest first. It is a
- * convenience of this screen, never the record: the owner's history is.
- */
-const LOCAL_HISTORY_MAX = 50
+const LOCAL_SALES_MAX = 50
 
+/**
+ * The sales this device made with this link, newest first. It is a
+ * convenience of the screen, never the record: the owner's history is.
+ */
 export function localSaleIds(): string[] {
-	if (!link) return []
 	try {
-		const ids = JSON.parse(read(storageKey(link, 'sales')) ?? '[]')
+		const ids = JSON.parse(readLocal(linkKey('sales')) ?? '[]')
 		return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : []
 	} catch {
 		return []
@@ -74,7 +112,5 @@ export function localSaleIds(): string[] {
 }
 
 export function rememberLocalSale(id: string): void {
-	if (!link) return
-	const ids = [id, ...localSaleIds().filter((x) => x !== id)].slice(0, LOCAL_HISTORY_MAX)
-	write(storageKey(link, 'sales'), JSON.stringify(ids))
+	writeLocal(linkKey('sales'), JSON.stringify([id, ...localSaleIds().filter((x) => x !== id)].slice(0, LOCAL_SALES_MAX)))
 }

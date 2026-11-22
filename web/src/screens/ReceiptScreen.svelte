@@ -66,8 +66,8 @@
 		<p class="py-20 text-center">Receipt not found.</p>
 	{:else if sale}
 		<ReceiptView
-			merchantName={session.store?.name ?? ''}
-			posName={sale.cashier_name ?? (sale.link === 'unlisted' ? 'Cashier' : 'Checkout')}
+			merchantName={session.checkout?.store.name ?? ''}
+			posName={sale.cashier_name ?? 'Checkout'}
 			receiptNumber={receiptNumber(sale.id)}
 			{dateLabel}
 			methodLabel={railLabel(sale.paid_rail)}

@@ -175,17 +175,12 @@
 				<div class="mx-auto flex max-w-md flex-col items-center gap-5 py-6 text-center">
 					<p class="font-display text-7xl tabular-nums tracking-display leading-none">{amountLabel}</p>
 					<BullSpinner size={72} label="Payment in progress" />
-					<div class="rounded-md bg-[#fff0c7] px-5 py-4 text-left text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]" role="status">
-						<p class="font-semibold">{progress?.title}. Not paid yet.</p>
-						<ul class="mt-2 space-y-1.5 text-sm">
-							{#each progress?.lines ?? [] as line (line)}
-								<li>{line}</li>
-							{/each}
-						</ul>
-						<p class="mt-2 text-sm">
-							Handing over goods before the sale shows paid is the store's own risk. You can start a new sale; this one completes on
-							its own and stays in the owner's history.
-						</p>
+					<div class="rounded-md bg-[#fff0c7] px-5 py-4 text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]" role="status">
+						<p class="font-semibold">{progress?.title}. It is not paid yet.</p>
+						{#each progress?.lines ?? [] as line (line)}
+							<p class="mt-1 text-sm">{line}</p>
+						{/each}
+						<p class="mt-1 text-sm">You can start a new sale; this one stays in history and completes on its own.</p>
 					</div>
 					<Button variant="secondary" onclick={newSale}>New Sale</Button>
 				</div>

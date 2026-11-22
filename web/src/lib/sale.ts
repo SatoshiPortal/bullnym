@@ -1,8 +1,8 @@
 // Presentation of a Sale: labels, tones, warnings and the receipt number.
 //
 // A payment the service has seen but cannot count yet is "in progress":
-// amber, with plain words that it is not guaranteed. It is never shown
-// green; only a paid sale is.
+// amber, with plain words that it is not guaranteed. Only a paid sale is
+// green.
 import type { PaidRail, Sale, SaleState, Warning } from './api'
 
 export function railLabel(rail: PaidRail | null): string {
@@ -50,38 +50,11 @@ export function stageLabel(sale: Sale): string {
 	}
 }
 
-export type Tone = 'ok' | 'warn' | 'err'
-
-/** Green only for a paid sale. In progress is amber, never green. */
-export function stageTone(sale: Sale): Tone {
-	switch (sale.state) {
-		case 'paid':
-			return 'ok'
-		case 'open':
-		case 'in-progress':
-			return 'warn'
-		default:
-			return sale.late_payment ? 'warn' : 'err'
-	}
-}
-
-/** Left-border tone for a history row, as in nostr-pos's TransactionSheet. */
-export function stateBorderTone(sale: Sale): string {
-	switch (stageTone(sale)) {
-		case 'ok':
-			return 'border-[#1f513a]'
-		case 'warn':
-			return 'border-[#c99a2e]'
-		case 'err':
-			return 'border-[#a9362f]'
-	}
-}
-
 /** The always-on warning while an on-chain payment is unconfirmed. */
 export const NOT_GUARANTEED =
 	"Payment seen, not confirmed yet. It isn't guaranteed until 1 confirmation, which usually takes 10 to 60 minutes."
 
-/** The extra warnings, in plain words. */
+/** The warnings, in plain words. */
 export function warningText(w: Warning): string {
 	switch (w) {
 		case 'not-guaranteed':
@@ -95,21 +68,20 @@ export function warningText(w: Warning): string {
 	}
 }
 
-/** What the in-progress panel says. */
+/** What the amber in-progress panel says. */
 export function progressText(sale: Sale): { title: string; lines: string[] } {
 	if (sale.progress === 'ark') {
 		return {
-			title: 'Ark payment in progress',
-			lines: [
-				'The Ark server accepted the payment and is delivering it to the wallet. The sale is paid once it is delivered; it completes on its own.',
-			],
+			title: 'The Ark payment is being delivered',
+			lines: ['The Ark server accepted it and is delivering it to the wallet. The sale is paid once it is delivered.'],
 		}
 	}
 	const lines = sale.warnings.map(warningText)
 	if (!sale.warnings.includes('not-guaranteed')) lines.unshift(NOT_GUARANTEED)
-	return { title: 'Bitcoin payment seen', lines }
+	return { title: 'The bitcoin payment is in the mempool', lines }
 }
 
+/** What happened to a payment that went away. */
 export function noticeText(sale: Sale): string | null {
 	switch (sale.notice) {
 		case 'payment-replaced':
@@ -126,6 +98,19 @@ export function missingSats(sale: Sale): number {
 	if (sale.state !== 'open') return 0
 	const inSight = sale.received_sat + sale.seen_sat
 	return inSight > 0 && inSight < sale.amount_sat ? sale.amount_sat - inSight : 0
+}
+
+/** Left-border tone for a history row, as in nostr-pos's TransactionSheet. */
+export function stateBorderTone(state: SaleState): string {
+	switch (state) {
+		case 'paid':
+			return 'border-[#1f513a]'
+		case 'in-progress':
+		case 'open':
+			return 'border-[#c99a2e]'
+		default:
+			return 'border-[#a9362f]'
+	}
 }
 
 /** The sale is still waiting for its payment. */

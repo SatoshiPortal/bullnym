@@ -1,5 +1,5 @@
 // Sales this page created or loaded, so the pay and receipt screens can
-// render at once and refresh from the service after.
+// render at once and refresh from posd after.
 import type { Sale } from './api'
 
 const sales = new Map<string, Sale>()

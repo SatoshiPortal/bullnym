@@ -11,7 +11,6 @@ import {
 	receiptNumber,
 	saleAmountLabel,
 	stageLabel,
-	stageTone,
 	stateLabel,
 } from './sale'
 
@@ -37,7 +36,6 @@ function sale(overrides: Partial<Sale> = {}): Sale {
 		warnings: [],
 		notice: null,
 		final: false,
-		final_at: null,
 		late_payment: false,
 		link: 'public',
 		cashier_name: 'Front till',
@@ -59,13 +57,11 @@ describe('sale presentation', () => {
 		expect(stateLabel('canceled')).toBe('Canceled')
 	})
 
-	it('never shows a payment in progress as paid or green', () => {
-		const seen = sale({ state: 'in-progress', progress: 'onchain', seen_sat: 35000, warnings: ['not-guaranteed'] })
-		expect(stageLabel(seen)).toBe('In progress, not guaranteed')
-		expect(stageTone(seen)).toBe('warn')
-		expect(stageTone(sale({ state: 'in-progress', progress: 'ark' }))).toBe('warn')
-		expect(stageTone(sale({ state: 'paid' }))).toBe('ok')
-		expect(stageTone(sale({ state: 'payment-issue' }))).toBe('err')
+	it('never calls a payment in progress paid', () => {
+		expect(stageLabel(sale({ state: 'in-progress', progress: 'onchain' }))).toBe('In progress, not guaranteed')
+		expect(stageLabel(sale({ state: 'in-progress', progress: 'ark' }))).toBe('In progress')
+		expect(stageLabel(sale({ state: 'paid', final: true }))).toBe('Paid · final')
+		expect(stageLabel(sale({ state: 'expired', late_payment: true }))).toBe('Expired · late payment')
 	})
 
 	it('states the risk of an unconfirmed payment in plain words', () => {
@@ -74,17 +70,11 @@ describe('sale presentation', () => {
 		expect(text.lines).toHaveLength(3)
 		// The not-guaranteed line is there even if the list lacks it.
 		expect(progressText(sale({ state: 'in-progress', progress: 'onchain' })).lines).toEqual([NOT_GUARANTEED])
-		expect(progressText(sale({ state: 'in-progress', progress: 'ark' })).title).toBe('Ark payment in progress')
-	})
-
-	it('marks final, late and replaced payments', () => {
-		expect(stageLabel(sale({ state: 'paid', final: true }))).toBe('Paid · final')
-		expect(stageLabel(sale({ state: 'expired', late_payment: true }))).toBe('Expired · late payment')
 		expect(noticeText(sale({ notice: 'payment-replaced' }))).toMatch(/^Payment replaced/)
 		expect(noticeText(sale())).toBeNull()
 	})
 
-	it('shows what is missing from a partial payment', () => {
+	it('shows what a partial payment is missing', () => {
 		expect(missingSats(sale({ seen_sat: 20000 }))).toBe(15000)
 		expect(missingSats(sale())).toBe(0)
 		expect(missingSats(sale({ state: 'in-progress', seen_sat: 35000 }))).toBe(0)
@@ -94,7 +84,6 @@ describe('sale presentation', () => {
 		expect(isLive('open')).toBe(true)
 		expect(isLive('in-progress')).toBe(true)
 		expect(isLive('paid')).toBe(false)
-		expect(isLive('payment-issue')).toBe(false)
 		expect(isLive('expired')).toBe(false)
 	})
 

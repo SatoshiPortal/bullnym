@@ -8,5 +8,5 @@ if (!target) throw new Error('missing #app root')
 
 mount(App, { target })
 
-// The service worker caches the app shell only; every API call goes to the service.
+// The service worker caches the app shell only; every API call goes to posd.
 if (import.meta.env.PROD) registerSW({ immediate: true })

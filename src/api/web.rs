@@ -33,8 +33,8 @@ fn serve_index() -> Response {
 /// not share storage with the browser that opened the link.
 fn manifest(start_url: String) -> Response {
 	let manifest = json!({
-		"name": "Checkout",
-		"short_name": "Checkout",
+		"name": "Point of sale",
+		"short_name": "POS",
 		"start_url": start_url,
 		"scope": "/",
 		"display": "standalone",

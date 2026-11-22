@@ -1,8 +1,7 @@
 <script lang="ts">
 	// Ported from bullnym's KeypadScreen (nostr-pos's Keypad layout): header
 	// with the store name and History/Settings buttons, a big amount, the
-	// keypad, a memo, and the Charge button pinned at the bottom. A cashier
-	// at the counter and a payer on their own phone use the same screen.
+	// keypad, a memo, and the Charge button pinned at the bottom.
 	import { ApiError, type Rate } from '$lib/api'
 	import { applyAmountInput } from '$lib/amount-input'
 	import { currencyPrecision, fiatToSats, formatFiat, formatRate, formatSats, normalizeFiat } from '$lib/money'
@@ -17,7 +16,7 @@
 
 	const RATE_REFRESH_MS = 60_000
 
-	const store = $derived(session.store)
+	const store = $derived(session.checkout?.store ?? null)
 	const currency = $derived(store?.currency ?? 'USD')
 
 	let unit = $state<'fiat' | 'sat'>('fiat')
@@ -76,8 +75,8 @@
 		creating = true
 		errorMsg = null
 		const note = memo.trim() || undefined
+		const cashier_name = session.cashierName.trim() || undefined
 		try {
-			const cashier_name = session.cashierName.trim() || undefined
 			const sale = await client().createSale(
 				unit === 'sat'
 					? { amount_sat: sats, memo: note, cashier_name }
@@ -90,7 +89,7 @@
 			router.go(`/pay/${sale.id}`)
 		} catch (e) {
 			if (e instanceof ApiError && e.status === 0) errorMsg = 'The server is not reachable'
-			else if (e instanceof ApiError && e.status === 503) errorMsg = e.message
+			else if (e instanceof ApiError && e.status === 503) errorMsg = 'Payments are not available right now. Try again in a moment.'
 			else if (e instanceof ApiError && e.status === 429) errorMsg = 'Too many sales at once. Try again in a moment.'
 			else errorMsg = e instanceof Error ? e.message : 'Something went wrong'
 		} finally {
@@ -104,10 +103,12 @@
 		<section class="flex min-h-0 flex-1 flex-col overflow-hidden px-5 py-3 sm:px-8 sm:py-5">
 			<header class="mb-3 flex shrink-0 items-center justify-between gap-4 sm:mb-5">
 				<div class="min-w-0">
-					<h1 class="truncate font-display text-3xl uppercase tracking-display leading-none">{store?.name ?? 'Checkout'}</h1>
-					<p class="mt-0.5 truncate text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
-						{session.cashierName || store?.lightning_address || ''}
-					</p>
+					<h1 class="truncate font-display text-3xl uppercase tracking-display leading-none">{store?.name ?? 'Point of sale'}</h1>
+					{#if session.cashierName}
+						<p class="mt-0.5 truncate text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
+							{session.cashierName}
+						</p>
+					{/if}
 				</div>
 				<HeaderLinks />
 			</header>
