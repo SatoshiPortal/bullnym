@@ -150,8 +150,9 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 				ForwardStatus::AwaitingDelivery => awaiting_delivery(p.sale_state, p.awaiting_delivery),
 				// barkd settled it: paid. The Ark server only labels the rail.
 				ForwardStatus::Delivered(amount) => {
-					let via_ark = match app.ark.receive(hash).await {
-						Ok(r) => Some(via_ark(&r)),
+					// Only a Lightning payment gets HTLCs.
+					let via_ark = match app.ark.has_htlcs(hash).await {
+						Ok(htlcs) => Some(!htlcs),
 						Err(e) => {
 							tracing::warn!("invoice {} is paid; the Ark server could not say how: {:#}", hash, e);
 							None
@@ -165,13 +166,6 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 		},
 		Rail::Onchain => Ok(None),
 	}
-}
-
-/// The rail of an invoice barkd settled, from the Ark server's view: only
-/// a Lightning payment gets HTLCs, so an invoice without them was paid by
-/// an Ark transfer.
-pub fn via_ark(r: &crate::ark::ServerReceive) -> bool {
-	!r.has_htlcs
 }
 
 /// What an invoice that barkd shows awaiting delivery means for its sale:
@@ -679,13 +673,6 @@ mod test {
 	#[test]
 	fn barkd_settles_and_the_server_only_labels_the_rail() {
 		use SaleState::*;
-		use crate::ark::ServerReceive;
-		let r = |has_htlcs, delivered| ServerReceive { has_htlcs, delivered, amount: Amount::from_sat(1000) };
-		assert!(!via_ark(&r(true, None)), "HTLCs: Lightning");
-		// The server's delivery report plays no part.
-		assert!(via_ark(&r(false, None)));
-		assert!(via_ark(&r(false, Some(false))));
-		assert!(via_ark(&r(false, Some(true))));
 		// The server could not be read: paid all the same, the rail unknown,
 		// never taken from the sale's state.
 		let unknown = Observation::invoice(Amount::from_sat(1000), true, false, None);
