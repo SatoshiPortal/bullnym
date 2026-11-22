@@ -1,21 +1,22 @@
 # Private signet deployment
 
-One Debian 13 VM runs a private custom signet and the whole scuttle stack,
-for testing the point of sale and wallets end to end. The test deployment is
-`scuttle-signet.tailc408a.ts.net`. To try it without access to the VM, use
-`wallets.sh` (see "Trying it" below).
+One Debian 13 VM runs a private custom signet, a Scuttle Ark server and
+bullnym, for testing the Lightning Address, the store and wallets end to
+end. These scripts started with posd's signet deployment. To try a
+deployment without access to its VM, use `wallets.sh` (see "Trying it"
+below). `<host>` stands for the deployment's public host name.
 
 | Service | Unit | Address |
 |---|---|---|
 | bitcoind 32.1, custom signet | `scuttle-bitcoind` | RPC 127.0.0.1:38332, no peers |
 | Block miner, every 10 minutes | `scuttle-miner.timer` | |
-| Postgres 17 (`captaind`, `posd`) | `postgresql` | 127.0.0.1:5432 |
+| Postgres 17 (`captaind`, `bullnym`) | `postgresql` | 127.0.0.1:5432 |
 | CLN with the hold plugin (the Ark server's node) | `scuttle-cln-internal` | p2p 9735, gRPC 9736, hold 9737 |
 | CLN without plugins (an outside payer) | `scuttle-cln-external` | p2p 9745, gRPC 9746 |
-| captaind (expiry payouts, route hints, zero fees) | `scuttle-captaind` | gRPC 0.0.0.0:3535 |
+| captaind (expiry payouts, address hints, zero fees), a release with S1 and S4 | `scuttle-captaind` | gRPC 0.0.0.0:3535 |
 | watchmand | `scuttle-watchmand` | |
 | Forwarder barkd | `scuttle-barkd` | 127.0.0.1:3000 |
-| posd and the terminal PWA | `scuttle-posd` | 127.0.0.1:3080 |
+| bullnym and its cashier and checkout app | `scuttle-bullnym` | 127.0.0.1:3080 |
 | electrs (Esplora API) | `scuttle-electrs` | 127.0.0.1:3002 |
 
 ## The chain
@@ -37,22 +38,22 @@ for testing the point of sale and wallets end to end. The test deployment is
 
 ## Build, set up, fund, check
 
-On the VM, from a checkout of the branch to deploy:
+On the VM, from a checkout of this repository, with the Scuttle release
+binaries (`captaind`, `watchmand`, `barkd`, `bark`) in a directory and the
+bullnym binary built (`contrib/build-static.sh`, or `cargo build --release`
+after building `web/dist`):
 
 ```sh
-cd pos/web && npm ci && npm run build && cd ../..   # the PWA posd embeds
-CARGO_PROFILE_RELEASE_LTO=thin cargo build -j 3 --release -p bark-server -p bark-cli -p scuttle-pos
+export SCUTTLE_BIN=~/scuttle-bin BULLNYM_BIN=target/static/bullnym
 ./contrib/deploy/signet/setup.sh    # installs binaries, configs and units; safe to rerun
 ./contrib/deploy/signet/fund.sh     # funds captaind and opens a 2 BTC channel; safe to rerun
-./contrib/deploy/signet/smoke.sh    # a Lightning sale and an Ark sale, end to end
-./contrib/deploy/signet/public.sh   # Tailscale Funnel: posd, Ark server, Esplora
+./contrib/deploy/signet/smoke.sh    # Lightning, Ark and on-chain sales and the Lightning Address
+./contrib/deploy/signet/public.sh   # Tailscale Funnel: bullnym, Ark server, Esplora
 ```
 
-Use `-j 3` and thin LTO. With 16 GB of RAM, a full-LTO release build with
-8 jobs runs out of memory.
-
-To update a deployment, rebuild and run `setup.sh` again, then restart the
-units it changed (`sudo systemctl restart scuttle-captaind scuttle-posd …`).
+To update a deployment, run `setup.sh` again with the new binaries, then
+restart the units it changed (`sudo systemctl restart scuttle-captaind
+scuttle-bullnym …`).
 
 ## Secrets and data
 
@@ -67,14 +68,13 @@ units it changed (`sudo systemctl restart scuttle-captaind scuttle-posd …`).
 
 ## Reaching it
 
-The VM is on the tailnet as `scuttle-signet.tailc408a.ts.net`. `public.sh`
-publishes three services on the internet with Tailscale Funnel:
+`public.sh` publishes three services on the internet with Tailscale Funnel:
 
 | URL | Service |
 |---|---|
-| https://scuttle-signet.tailc408a.ts.net | posd: terminal PWA, API, Lightning address |
-| https://scuttle-signet.tailc408a.ts.net:8443 | the Ark server (captaind gRPC) for wallets |
-| https://scuttle-signet.tailc408a.ts.net:10000 | Esplora (electrs) |
+| https://&lt;host&gt; | bullnym: cashier and checkout app, API, Lightning Address |
+| https://&lt;host&gt;:8443 | the Ark server (captaind gRPC) for wallets |
+| https://&lt;host&gt;:10000 | Esplora (electrs) |
 
 A wallet uses `--signet --ark https://…:8443 --esplora https://…:10000`.
 
@@ -86,29 +86,30 @@ A wallet uses `--signet --ark https://…:8443 --esplora https://…:10000`.
   (`scuttle-renew-cert`) renews the certificate.
 - **electrs** imports blocks over RPC (`--jsonrpc-import`). It cannot read
   bitcoind's block files, because a custom signet has its own network magic.
-- **Test helpers:** `/dev/` on the posd host, from `devtools.py`, gives
-  faucet coins, mines blocks and creates a store's on-chain wallet. Each
-  has a cap and a rate limit.
+- **Test helpers:** `/dev/` on the bullnym host, from `devtools.py`, gives
+  faucet coins, mines blocks, creates a store's on-chain wallet and gives a
+  test Silent Payment address. Each has a cap and a rate limit.
 
 ## Trying it
 
-`wallets.sh` runs on your own machine and needs only `bark` (built from this
-branch), `curl` and `jq`. It drives a store owner's wallet, a customer's
-wallet, the owner API and terminals. Run it with no arguments for the full
+`wallets.sh` runs on your own machine and needs only `bark` (the Scuttle
+release), `curl` and `jq`. It drives an owner's wallet, a customer's wallet,
+the owner API and the cashier link. Run it with no arguments for the full
 command list.
 
 ```sh
-cargo build -p bark-cli --bin bark
+export SIGNET_HOST=<host>
 alias sw=./contrib/deploy/signet/wallets.sh
 sw create owner; sw create customer
 sw faucet customer 0.05; sw board customer
-sw register "My Cafe" CRC
-sw pair                                # open on a phone, or: sw till-pair <link>
+sw nym mycafe                          # mycafe@<host>
+sw register "My Cafe" CRC              # the store, at https://<host>/mycafe
+sw link                                # an unlisted cashier link for staff
 sw sell 6250 "2 coffees"; sw pay customer; sw wait
 ```
 
 ## Known limits
 
 - **The Bull app as it ships cannot use this chain.** It runs upstream bark
-  from pub.dev. Its Esplora setting can point here once it runs scuttle.
+  from pub.dev. Its Esplora setting can point here once it runs Scuttle.
 - **The Lightning network is just these two CLN nodes.**

@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
-# Sets up a private custom signet with the whole scuttle stack on one
-# Debian 13 VM: bitcoind with a 10-minute block miner, Postgres, two CLN
-# nodes, captaind, watchmand, a forwarder barkd and posd.
+# Sets up a private custom signet with the whole stack on one Debian 13 VM:
+# bitcoind with a 10-minute block miner, Postgres, two CLN nodes, captaind,
+# watchmand, a forwarder barkd and bullnym.
 #
-# Run as a sudo user on the VM, from a checkout whose release binaries are
-# built (target/release/{captaind,watchmand,barkd,bark,posd}). Safe to run
-# again: it keeps existing secrets, keys, chain data and databases.
+# Run as a sudo user on the VM. SCUTTLE_BIN is a directory with the Scuttle
+# release binaries (captaind, watchmand, barkd, bark), from a release with
+# S1 and S4; BULLNYM_BIN is the bullnym binary. Safe to run again: it keeps
+# existing secrets, keys, chain data and databases.
 #
-#   ./contrib/deploy/signet/setup.sh
+#   SCUTTLE_BIN=~/scuttle/bin ./contrib/deploy/signet/setup.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
-BIN_SRC="$REPO/target/release"
+SCUTTLE_BIN="${SCUTTLE_BIN:?set SCUTTLE_BIN to the directory of the Scuttle binaries}"
+BULLNYM_BIN="${BULLNYM_BIN:-$REPO/target/release/bullnym}"
 PREFIX=/opt/scuttle
 DATA=/var/lib/scuttle
 ETC=/etc/scuttle
 CLN_IMAGE="${CLN_IMAGE:-secondark/cln-hold:v26.06.10-efc7d5f}"
-# The URL phones use for posd. Pairing links and the Lightning address come
-# from it. Over Tailscale Serve this is https://<host>.<tailnet>.ts.net.
+# The URL phones use for bullnym. Cashier links and the Lightning Address
+# domain come from it. Behind a TLS proxy this is https://<host>.
 PUBLIC_URL="${PUBLIC_URL:-http://$(hostname -I | awk '{print $1}'):3080}"
 
 # The block interval. Signet retargets like mainnet, so blocks must come
@@ -31,12 +33,13 @@ as_scuttle() { sudo -u scuttle -H "$@"; }
 log "user, directories, binaries"
 id scuttle >/dev/null 2>&1 || sudo useradd --system --create-home --home-dir "$DATA" --shell /usr/sbin/nologin scuttle
 sudo usermod -aG docker scuttle
-sudo install -d -o scuttle -g scuttle -m 750 "$DATA" "$DATA"/{bitcoind,captaind,watchmand,cln-internal,cln-external,barkd,posd,electrs}
+sudo install -d -o scuttle -g scuttle -m 750 "$DATA" "$DATA"/{bitcoind,captaind,watchmand,cln-internal,cln-external,barkd,bullnym,electrs}
 sudo install -d -o root -g scuttle -m 750 "$ETC"
 sudo install -d -m 755 "$PREFIX/bin"
-for b in captaind watchmand barkd bark posd; do
-	sudo install -m 755 "$BIN_SRC/$b" "$PREFIX/bin/$b"
+for b in captaind watchmand barkd bark; do
+	sudo install -m 755 "$SCUTTLE_BIN/$b" "$PREFIX/bin/$b"
 done
+sudo install -m 755 "$BULLNYM_BIN" "$PREFIX/bin/bullnym"
 # Blockstream electrs, built separately (see README).
 ELECTRS_BIN="${ELECTRS_BIN:-$HOME/electrs/target/release/electrs}"
 sudo install -m 755 "$ELECTRS_BIN" "$PREFIX/bin/electrs"
@@ -47,8 +50,7 @@ if ! sudo test -f "$ETC/secrets.env"; then
 	sudo tee "$ETC/secrets.env" >/dev/null <<EOF
 BITCOIND_RPC_PASS=$(gen)
 PG_CAPTAIND_PASS=$(gen)
-PG_POSD_PASS=$(gen)
-PG_RECEIPTS_PASS=$(gen)
+PG_BULLNYM_PASS=$(gen)
 EOF
 	sudo chown root:scuttle "$ETC/secrets.env"
 	sudo chmod 640 "$ETC/secrets.env"
@@ -155,10 +157,9 @@ ensure_db() {
 		|| psql_su -c "CREATE DATABASE $1 OWNER $2;"
 }
 ensure_role captaind "$PG_CAPTAIND_PASS"
-ensure_role posd "$PG_POSD_PASS"
-ensure_role posd_receipts "$PG_RECEIPTS_PASS"
+ensure_role bullnym "$PG_BULLNYM_PASS"
 ensure_db captaind captaind
-ensure_db posd posd
+ensure_db bullnym bullnym
 
 log "CLN nodes (docker)"
 sudo docker pull -q "$CLN_IMAGE" >/dev/null
@@ -386,13 +387,6 @@ unit watchmand "Ark watchman" "$PREFIX/bin/watchmand --config $ETC/watchmand.tom
 sudo systemctl daemon-reload
 sudo systemctl enable --now scuttle-captaind.service scuttle-watchmand.service
 
-# The delivery receipt view exists once captaind ran its migrations.
-for i in $(seq 1 60); do
-	psql_su -d captaind -tAc "SELECT 1 FROM pg_views WHERE viewname = 'v_arkoor_receive_delivery'" | grep -q 1 && break
-	sleep 2
-done
-psql_su -d captaind -c "GRANT USAGE ON SCHEMA public TO posd_receipts; GRANT SELECT ON v_arkoor_receive_delivery TO posd_receipts;"
-
 log "forwarder barkd"
 sudo chmod 700 "$DATA/barkd"
 # barkd writes its own auth token on first start.
@@ -410,8 +404,9 @@ if ! sudo test -f "$DATA/barkd/db.sqlite"; then
 		>/dev/null
 fi
 
-log "posd"
-sudo tee "$ETC/posd.toml" >/dev/null <<EOF
+log "bullnym"
+# bullnym uses the Ark server's public API only: no database access.
+sudo tee "$ETC/bullnym.toml" >/dev/null <<EOF
 network = "signet"
 ark_server_url = "http://127.0.0.1:3535"
 
@@ -419,14 +414,7 @@ ark_server_url = "http://127.0.0.1:3535"
 listen = "0.0.0.0:3080"
 public_url = "$PUBLIC_URL"
 
-$(pg_section posd "$PG_POSD_PASS" posd)
-
-[ark_server_postgres]
-host = "127.0.0.1"
-port = 5432
-name = "captaind"
-user = "posd_receipts"
-password = "$PG_RECEIPTS_PASS"
+$(pg_section bullnym "$PG_BULLNYM_PASS" bullnym)
 
 [barkd]
 url = "http://127.0.0.1:3000"
@@ -436,18 +424,18 @@ token = "$BARKD_TOKEN"
 url = "http://127.0.0.1:$RPC_PORT"
 rpc_user = "scuttle"
 rpc_password = "$BITCOIND_RPC_PASS"
-wallet = "posd"
+wallet = "bullnym"
 
 [price]
 # Signet coins have no price; a fixed one keeps the fiat keypad working.
 fixed_btc_price = "62500000.00"
 EOF
-sudo chown root:scuttle "$ETC/posd.toml"
-sudo chmod 640 "$ETC/posd.toml"
-unit posd "point-of-sale service" "$PREFIX/bin/posd --config $ETC/posd.toml start" \
+sudo chown root:scuttle "$ETC/bullnym.toml"
+sudo chmod 640 "$ETC/bullnym.toml"
+unit bullnym "Lightning Address and store service" "$PREFIX/bin/bullnym --config $ETC/bullnym.toml start" \
 	"scuttle-captaind.service scuttle-barkd.service"
 sudo systemctl daemon-reload
-sudo systemctl enable --now scuttle-posd.service
+sudo systemctl enable --now scuttle-bullnym.service
 
 log "electrs (Esplora API)"
 # A custom signet has its own network magic, which electrs cannot read from
@@ -463,5 +451,5 @@ sudo systemctl enable --now scuttle-electrs.service
 
 log "status"
 systemctl --no-pager --plain list-units 'scuttle-*' | head -20
-echo "posd: $PUBLIC_URL   Ark server: port 3535   Esplora: 127.0.0.1:3002"
+echo "bullnym: $PUBLIC_URL   Ark server: port 3535   Esplora: 127.0.0.1:3002"
 echo "Fund captaind next: contrib/deploy/signet/fund.sh"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Drives the public signet deployment from your own machine: two local bark
-# wallets (a store owner and a customer), the owner API and terminals.
+# wallets (an owner and a customer), the owner API and the cashier link.
 #
 # Wallets
 #   create owner|customer             new wallet
@@ -12,19 +12,21 @@
 #   bark <wallet> <args...>           any bark command
 #
 # Owner
-#   register "<name>" [CRC]           register the owner's store
+#   nym <nym>                         register the Lightning Address <nym>@<host>
+#   register "<name>" [CRC]           register the store of the nym
 #   store                             show the store
 #   store-set <key>=<value>...        name, currency, onchain_min_sat,
-#                                     lightning_address_name ("" removes it)
-#   pair                              a single-use pairing link for a till
-#   devices                           list paired terminals
-#   revoke <device-id>                revoke a terminal
+#                                     public_checkout (true or false)
+#   link                              a new unlisted cashier link; the
+#                                     previous one stops working
+#   unlink                            remove the unlisted cashier link
 #   owner-sales [n]                   the store's latest sales
 #   owner-csv [from] [to]             CSV export (dates YYYY-MM-DD)
+#   payments [n]                      Lightning payments to the Lightning
+#                                     Address
 #
-# Terminal (a till run from this script; the PWA is the real one)
-#   till-pair <code|url> [name]       pair a till here (default name: till)
-#   till [name]                       terminal info
+# Cashier (the store's public checkout, or its unlisted link with
+# LINK=<secret>; the web app at https://<host>/<nym> is the real one)
 #   rate                              the store's bitcoin price
 #   sell <amount> [memo]              new sale; amount is fiat ("6250",
 #                                     "12.50") or sats ("20000sat")
@@ -32,33 +34,33 @@
 #   wait [id] [state]                 wait until the sale leaves state
 #                                     (default: open)
 #   cancel [id]                       cancel an open sale
-#   sales [n]                         the till's latest sales
-#   csv [from] [to]                   CSV export from the till
 #   qr [id]                           print the sale's QR (needs qrencode)
 #
 # Customer
-#   pay <wallet> [id] [ark|lightning|onchain]
+#   pay <wallet> [id] [invoice|onchain]
 #                                     pay a sale (default: the last one, by
-#                                     ark). onchain pays from the wallet's
-#                                     on-chain coins; mine 1 to confirm.
-#   pay-uri <wallet> <uri|invoice>    pay a copied QR or invoice, default way
-#   lnaddress <wallet> <name> <sats>  pay the store's Lightning address
+#                                     its invoice: over Ark when the wallet
+#                                     has address hints on and the invoice
+#                                     has the hint, else over Lightning).
+#                                     onchain pays from the wallet's on-chain
+#                                     coins; mine 1 to confirm.
+#   pay-uri <wallet> <uri|invoice>    pay a copied QR or invoice
+#   lnaddress <wallet> <nym> <sats>   pay a Lightning Address
 #
-# Use TILL=<name> to pick a till. State lives in $SIGNET_HOME (default
-# ~/.scuttle-signet). The faucet, mining and the store's on-chain wallet use
+# SIGNET_HOST names the deployment. State lives in $SIGNET_HOME (default
+# ~/.bullnym-signet). The faucet, mining and the store's on-chain wallet use
 # the deployment's public test helpers at https://<host>/dev/.
 set -euo pipefail
 
-HOST="${SIGNET_HOST:-scuttle-signet.tailc408a.ts.net}"
+HOST="${SIGNET_HOST:?set SIGNET_HOST to the deployment host name}"
 ARK="https://$HOST:8443"
 ESPLORA="https://$HOST:10000"
-POSD="https://$HOST"
-HOME_DIR="${SIGNET_HOME:-$HOME/.scuttle-signet}"
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
-BARK="${BARK:-$REPO/target/debug/bark}"
-TILL="${TILL:-till}"
+SERVICE="https://$HOST"
+HOME_DIR="${SIGNET_HOME:-$HOME/.bullnym-signet}"
+BARK="${BARK:-bark}"
+LINK="${LINK:-}"
 
-mkdir -p "$HOME_DIR/tills"
+mkdir -p "$HOME_DIR"
 
 die() { echo "error: $*" >&2; exit 1; }
 wallet_dir() {
@@ -66,33 +68,33 @@ wallet_dir() {
 }
 bark() { local d; d=$(wallet_dir "$1"); shift; "$BARK" --datadir "$d" -q "$@" 2>/dev/null; }
 dev() { # endpoint json
-	curl -sS -f -X POST "$POSD/dev/$1" -H 'Content-Type: application/json' -d "$2" \
+	curl -sS -f -X POST "$SERVICE/dev/$1" -H 'Content-Type: application/json' -d "$2" \
 		|| die "the test helper /dev/$1 failed"
 }
 mine() { dev mine "{\"blocks\": ${1:-1}}" | jq -r .height; }
 
-# Calls posd. Prints the body; on an error status prints it and fails.
+# Calls the service. Prints the body; on an error status prints it and fails.
 api() { # method path [token] [json]
 	local out status
-	out=$(curl -sS -w '\n%{http_code}' -X "$1" "$POSD$2" ${3:+-H "Authorization: Bearer $3"} \
+	out=$(curl -sS -w '\n%{http_code}' -X "$1" "$SERVICE$2" ${3:+-H "Authorization: Bearer $3"} \
 		${4:+-H 'Content-Type: application/json' -d "$4"})
 	status=${out##*$'\n'}
 	out=${out%$'\n'*}
 	if [ "$status" -ge 400 ]; then
-		echo "posd $1 $2: $status $out" >&2
+		echo "bullnym $1 $2: $status $out" >&2
 		return 1
 	fi
 	printf '%s\n' "$out"
 }
 
-# The owner logs in by signing a challenge with the store's address. The
-# token lasts 24 hours and is cached.
+# The owner logs in by signing a challenge with the nym's address. The token
+# lasts 24 hours and is cached.
 owner_token() {
 	local cache="$HOME_DIR/owner-token" address challenge sig token
 	if [ -f "$cache" ] && [ "$(( $(date +%s) - $(stat -c %Y "$cache") ))" -lt 80000 ]; then
 		cat "$cache"; return
 	fi
-	address=$(cat "$HOME_DIR/store-address" 2>/dev/null) || die "register the store first"
+	address=$(cat "$HOME_DIR/nym-address" 2>/dev/null) || die "register the nym first"
 	challenge=$(api POST /api/v1/owner/challenge "" "$(jq -n --arg a "$address" '{ark_address: $a}')" | jq -r .challenge)
 	sig=$(bark owner message sign "$challenge" "$address" | jq -r .signature)
 	token=$(api POST /api/v1/owner/login "" "$(jq -n --arg a "$address" --arg c "$challenge" --arg s "$sig" \
@@ -101,19 +103,23 @@ owner_token() {
 	echo "$token"
 }
 
-till_token() {
-	cat "$HOME_DIR/tills/$TILL" 2>/dev/null || die "no till '$TILL'; run till-pair first"
+# The API prefix of the cashier link: the public checkout under the nym, or
+# the unlisted link in LINK.
+checkout() {
+	if [ -n "$LINK" ]; then echo "/api/v1/links/$LINK"; return; fi
+	echo "/api/v1/checkout/$(cat "$HOME_DIR/nym" 2>/dev/null || die "register the nym first")"
 }
 
 sale_id() {
 	if [ -n "${1:-}" ]; then echo "$1"; else cat "$HOME_DIR/last-sale" 2>/dev/null || die "no sale yet"; fi
 }
 
-get_sale() { api GET "/api/v1/sales/$1" "$(till_token)"; }
+get_sale() { api GET "/api/v1/sales/$1"; }
 
 show_sale() {
-	jq '{id, state, amount_sat, fiat_amount, currency, memo, received_sat, paid_rail, paid_at,
-		expires_at, device_name, onchain_address, payment_request}'
+	jq '{id, state, progress, warnings, notice, amount_sat, fiat_amount, currency, memo,
+		received_sat, seen_sat, paid_rail, paid_at, final, late_payment, expires_at, link,
+		cashier_name, onchain_address, payment_request}'
 }
 
 # A query parameter of a BIP 321 URI.
@@ -170,27 +176,43 @@ bark)
 
 # Owner
 
+nym)
+	nym="${1:?nym}"
+	[ -f "$HOME_DIR/nym" ] && die "already registered: $(cat "$HOME_DIR/nym")"
+	address=$(bark owner address)
+	# The owner's wallet gives its Silent Payment address; this test wallet
+	# has none, so the deployment's helper makes one.
+	sp=$(dev silent-payment-address '{}' | jq -r .address)
+	ts=$(date +%s)
+	msg=$(printf 'bullnym registration v1\nnym:%s\nark_address:%s\nsilent_payment_address:%s\ntimestamp:%s' \
+		"$nym" "$address" "$sp" "$ts")
+	sig=$(bark owner message sign "$msg" "$address" | jq -r .signature)
+	api POST /api/v1/nym "" "$(jq -n --arg n "$nym" --arg a "$address" --arg p "$sp" --argjson t "$ts" --arg s "$sig" \
+		'{registration: {nym: $n, ark_address: $a, silent_payment_address: $p, timestamp: $t}, signature: $s}')" \
+		| jq -c .nym
+	echo "$address" > "$HOME_DIR/nym-address"
+	echo "$nym" > "$HOME_DIR/nym"
+	;;
 register)
 	name="${1:?store name}"; currency="${2:-CRC}"
-	[ -f "$HOME_DIR/store-address" ] && die "already registered: $(cat "$HOME_DIR/store-address")"
-	address=$(bark owner address)
-	mailbox=$(bark owner debug-info | jq -r .mailbox_id)
-	# The host app keeps the store's on-chain account. Here it is a wallet on
+	address=$(cat "$HOME_DIR/nym-address" 2>/dev/null) || die "register the nym first"
+	nym=$(cat "$HOME_DIR/nym")
+	# The store's on-chain account is a dedicated one. Here it is a wallet on
 	# the deployment's bitcoind, named after the store.
 	sw=$(dev store-wallet "$(jq -n --arg n "$name" '{name: $n}')")
 	wallet=$(jq -r .wallet <<<"$sw")
 	descriptor=$(jq -r .onchain_descriptor <<<"$sw")
 	ts=$(date +%s)
-	msg=$(printf 'scuttle-pos registration v1\nname:%s\nark_address:%s\nmailbox_id:%s\nonchain_descriptor:%s\ncurrency:%s\ntimestamp:%s' \
-		"$name" "$address" "$mailbox" "$descriptor" "$currency" "$ts")
+	msg=$(printf 'scuttle-pos registration v1\nname:%s\nark_address:%s\nonchain_descriptor:%s\ncurrency:%s\ntimestamp:%s\nnym:%s' \
+		"$name" "$address" "$descriptor" "$currency" "$ts" "$nym")
 	sig=$(bark owner message sign "$msg" "$address" | jq -r .signature)
-	api POST /api/v1/stores "" "$(jq -n --arg n "$name" --arg a "$address" --arg m "$mailbox" \
-		--arg d "$descriptor" --arg c "$currency" --argjson t "$ts" --arg s "$sig" \
-		'{registration: {name: $n, ark_address: $a, mailbox_id: $m, onchain_descriptor: $d, currency: $c, timestamp: $t}, signature: $s}')" \
+	api POST /api/v1/stores "" "$(jq -n --arg n "$name" --arg a "$address" --arg d "$descriptor" \
+		--arg c "$currency" --argjson t "$ts" --arg y "$nym" --arg s "$sig" \
+		'{registration: {name: $n, ark_address: $a, onchain_descriptor: $d, currency: $c, timestamp: $t, nym: $y}, signature: $s}')" \
 		| jq -c .store
-	echo "$address" > "$HOME_DIR/store-address"
 	echo "$wallet" > "$HOME_DIR/store-onchain-wallet"
 	echo "on-chain sales go to the test wallet '$wallet' on the deployment"
+	echo "checkout: $SERVICE/$nym"
 	;;
 store)
 	api GET /api/v1/owner/store "$(owner_token)" | jq .
@@ -201,46 +223,37 @@ store-set)
 	for kv in "$@"; do
 		k=${kv%%=*}; v=${kv#*=}
 		case "$k" in
-			onchain_min_sat) body=$(jq --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$body") ;;
-			name|currency|lightning_address_name) body=$(jq --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$body") ;;
+			onchain_min_sat|public_checkout) body=$(jq --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$body") ;;
+			name|currency) body=$(jq --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$body") ;;
 			*) die "unknown key $k" ;;
 		esac
 	done
 	api PATCH /api/v1/owner/store "$(owner_token)" "$body" | jq .
 	;;
-pair)
-	api POST /api/v1/owner/invites "$(owner_token)" | jq -r '"\(.url)\n(single use, expires \(.expires_at))"'
+link)
+	api POST /api/v1/owner/store/unlisted-link "$(owner_token)" | jq -r '"\(.url)\n(use LINK=\(.secret) here; the previous link stopped working)"'
 	;;
-devices)
-	api GET /api/v1/owner/devices "$(owner_token)" | jq -r '.devices[] | "\(.id)\t\(.name)\t\(.created_at)\t\(if .revoked_at then "revoked" else "active" end)"'
-	;;
-revoke)
-	api DELETE "/api/v1/owner/devices/${1:?device id}" "$(owner_token)" >/dev/null
-	echo "revoked device $1"
+unlink)
+	api DELETE /api/v1/owner/store/unlisted-link "$(owner_token)" >/dev/null
+	echo "the unlisted link stopped working"
 	;;
 owner-sales)
 	api GET "/api/v1/owner/sales?limit=${1:-10}" "$(owner_token)" \
-		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.device_name // "lnaddress")\t\(.memo // "")"'
+		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.warnings | join(","))\t\(.link)\t\(.cashier_name // "")\t\(.memo // "")"'
 	;;
 owner-csv)
 	q=""; [ -n "${1:-}" ] && q="from=$1"; [ -n "${2:-}" ] && q="$q&to=$2"
 	api GET "/api/v1/owner/sales.csv?$q" "$(owner_token)"
 	;;
-
-# Terminal
-
-till-pair)
-	code="${1:?pairing code or link}"; code=${code##*/pair/}; name="${2:-$TILL}"
-	out=$(api POST /api/v1/pair "" "$(jq -n --arg c "$code" --arg n "$name" '{code: $c, device_name: $n}')")
-	(umask 077; jq -r .token <<<"$out" > "$HOME_DIR/tills/$name")
-	echo "paired till '$name' to $(jq -r .store.name <<<"$out")"
+payments)
+	api GET "/api/v1/owner/nym/payments?limit=${1:-10}" "$(owner_token)" \
+		| jq -r '.payments[] | "\(.payment_hash)\t\(.state)\t\(.amount_sat) sat\t\(.created_at)"'
 	;;
-till)
-	TILL="${1:-$TILL}"
-	api GET /api/v1/terminal "$(till_token)" | jq .
-	;;
+
+# Cashier
+
 rate)
-	api GET /api/v1/rate "$(till_token)" | jq -c .
+	api GET "$(checkout)/rate" | jq -c .
 	;;
 sell)
 	amount="${1:?amount}"; memo="${2:-}"
@@ -249,7 +262,7 @@ sell)
 	else
 		body=$(jq -n --arg a "$amount" --arg m "$memo" '{fiat_amount: $a} + (if $m == "" then {} else {memo: $m} end)')
 	fi
-	sale=$(api POST /api/v1/sales "$(till_token)" "$body")
+	sale=$(api POST "$(checkout)/sales" "" "$body")
 	jq -r .id <<<"$sale" > "$HOME_DIR/last-sale"
 	show_sale <<<"$sale"
 	;;
@@ -260,21 +273,13 @@ wait)
 	id=$(sale_id "${1:-}"); from="${2:-open}"
 	# The API long-polls for 25 s at a time.
 	for i in $(seq 1 24); do
-		sale=$(api GET "/api/v1/sales/$id?wait=$from" "$(till_token)")
+		sale=$(api GET "/api/v1/sales/$id?wait=$from")
 		[ "$(jq -r .state <<<"$sale")" != "$from" ] && break
 	done
 	show_sale <<<"$sale"
 	;;
 cancel)
-	api POST "/api/v1/sales/$(sale_id "${1:-}")/cancel" "$(till_token)" | show_sale
-	;;
-sales)
-	api GET "/api/v1/sales?limit=${1:-10}" "$(till_token)" \
-		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.memo // "")"'
-	;;
-csv)
-	q=""; [ -n "${1:-}" ] && q="from=$1"; [ -n "${2:-}" ] && q="$q&to=$2"
-	api GET "/api/v1/sales.csv?$q" "$(till_token)"
+	api POST "/api/v1/sales/$(sale_id "${1:-}")/cancel" | show_sale
 	;;
 qr)
 	command -v qrencode >/dev/null || die "install qrencode"
@@ -284,17 +289,13 @@ qr)
 # Customer
 
 pay)
-	who="${1:?wallet}"; id=$(sale_id "${2:-}"); method="${3:-ark}"
+	who="${1:?wallet}"; id=$(sale_id "${2:-}"); method="${3:-invoice}"
 	sale=$(get_sale "$id")
 	case "$method" in
-	ark)
-		# The hinted invoice. bark pays it by arkoor when its long-lived VTXOs
-		# cover the amount, and otherwise over Lightning.
-		inv=$(jq -r '.ark_invoice // empty' <<<"$sale"); [ -n "$inv" ] || die "the sale has no Ark invoice"
-		bark "$who" send "$inv" >/dev/null || die "payment failed, see $(wallet_dir "$who")/debug.log"
-		;;
-	lightning)
-		inv=$(jq -r .lightning_invoice <<<"$sale")
+	invoice)
+		# One invoice for every payer. With address hints on, bark pays its
+		# Ark hint by an Ark transfer; otherwise it pays over Lightning.
+		inv=$(jq -r '.lightning_invoice // empty' <<<"$sale"); [ -n "$inv" ] || die "the sale has no invoice"
 		bark "$who" send "$inv" >/dev/null || die "payment failed, see $(wallet_dir "$who")/debug.log"
 		;;
 	onchain)
@@ -304,15 +305,14 @@ pay)
 			|| die "on-chain payment failed: does the wallet have on-chain coins? (faucet)"
 		echo "sent; the sale is in progress until 'mine 1'"
 		;;
-	*) die "method is ark, lightning or onchain" ;;
+	*) die "method is invoice or onchain" ;;
 	esac
 	echo "paid $id by $method"
 	;;
 pay-uri)
 	who="${1:?wallet}"; uri="${2:?uri or invoice}"
 	if [[ "$uri" == bitcoin:* ]]; then
-		# Prefer the hinted invoice, as a scuttle wallet would.
-		inv=$(uri_param "$uri" ark-lightning); [ -n "$inv" ] || inv=$(uri_param "$uri" lightning)
+		inv=$(uri_param "$uri" lightning)
 		[ -n "$inv" ] || die "no invoice in the URI"
 		bark "$who" send "$inv" >/dev/null || die "payment failed"
 	else
@@ -321,7 +321,7 @@ pay-uri)
 	echo "paid"
 	;;
 lnaddress)
-	who="${1:?wallet}"; name="${2:?name}"; sats="${3:?sats}"
+	who="${1:?wallet}"; name="${2:?nym}"; sats="${3:?sats}"
 	bark "$who" send "$name@$HOST" "$sats sats" >/dev/null || die "payment failed, see $(wallet_dir "$who")/debug.log"
 	echo "paid $sats sats to $name@$HOST"
 	;;

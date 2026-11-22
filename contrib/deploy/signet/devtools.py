@@ -7,8 +7,11 @@ every endpoint has a cap and there is a global rate limit.
   POST /dev/faucet        {"address": "tb1...", "btc": 0.01}   max 0.1 BTC
   POST /dev/mine          {"blocks": 1}                        max 6 blocks
   POST /dev/store-wallet  {"name": "My Store"}
-      creates a watch-only stand-in for the host app's on-chain account and
-      returns its public descriptor, for a store registration.
+      creates a wallet that stands in for the store's dedicated on-chain
+      account and returns its public descriptor, for a store registration.
+  POST /dev/silent-payment-address  {}
+      a signet Silent Payment address for a nym registration. It is a test
+      address: nobody scans it.
   GET  /dev/              this text
 
 Mining is limited because signet retargets like mainnet: many quick blocks
@@ -29,7 +32,51 @@ LISTEN = ("127.0.0.1", 3090)
 MAX_FAUCET_BTC = 0.1
 MAX_BLOCKS = 6
 # A sliding window per endpoint: (max calls, seconds).
-LIMITS = {"faucet": (30, 600), "mine": (20, 600), "store-wallet": (20, 600)}
+LIMITS = {"faucet": (30, 600), "mine": (20, 600), "store-wallet": (20, 600),
+	"silent-payment-address": (60, 600)}
+
+# BIP 352 test keys: the scan and spend keys are the generator points G and
+# 2G, which are valid public keys whose private keys everyone knows.
+SCAN_KEY = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+SPEND_KEY = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+BECH32M_CONST = 0x2BC830A3
+
+
+def bech32_polymod(values: list[int]) -> int:
+	gen = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]
+	chk = 1
+	for v in values:
+		top = chk >> 25
+		chk = (chk & 0x1FFFFFF) << 5 ^ v
+		for i in range(5):
+			chk ^= gen[i] if (top >> i) & 1 else 0
+	return chk
+
+
+def bech32m_encode(hrp: str, data: list[int]) -> str:
+	expanded = [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+	polymod = bech32_polymod(expanded + data + [0] * 6) ^ BECH32M_CONST
+	checksum = [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+	return hrp + "1" + "".join(BECH32_CHARSET[d] for d in data + checksum)
+
+
+def to_5bit(data: bytes) -> list[int]:
+	acc, bits, out = 0, 0, []
+	for b in data:
+		acc = (acc << 8) | b
+		bits += 8
+		while bits >= 5:
+			bits -= 5
+			out.append((acc >> bits) & 31)
+	if bits:
+		out.append((acc << (5 - bits)) & 31)
+	return out
+
+
+def silent_payment_address(_body: dict) -> dict:
+	payload = bytes.fromhex(SCAN_KEY + SPEND_KEY)
+	return {"address": bech32m_encode("tsp", [0] + to_5bit(payload))}
 
 _calls: dict[str, list[float]] = {}
 _lock = threading.Lock()
@@ -114,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
 	def do_POST(self) -> None:
 		endpoint = self.endpoint()
 		handlers = {"faucet": faucet, "mine": lambda b: {"height": mine(min(max(int(b.get("blocks", 1)), 1), MAX_BLOCKS))},
-			"store-wallet": store_wallet}
+			"store-wallet": store_wallet, "silent-payment-address": silent_payment_address}
 		if endpoint not in handlers:
 			return self.reply(404, {"error": "no such endpoint"})
 		if not allowed(endpoint):

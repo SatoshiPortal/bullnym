@@ -3,7 +3,7 @@
 # Run after setup.sh, on a VM that has joined a tailnet with Funnel and
 # HTTPS certificates enabled.
 #
-#   https://<host>/         posd: terminal PWA, API, Lightning address
+#   https://<host>/         bullnym: cashier and checkout app, API, Lightning Address
 #   https://<host>:8443     captaind gRPC, the Ark server address for wallets
 #   https://<host>:10000    Esplora (electrs)
 #   https://<host>/dev/     test faucet, mining and store wallets (devtools.py)
@@ -100,5 +100,5 @@ sudo tailscale funnel --bg --https=10000 http://127.0.0.1:3002 >/dev/null
 sudo tailscale funnel status
 
 echo
-echo "posd public_url must be https://$HOST. If it is not, rerun:"
-echo "  PUBLIC_URL=https://$HOST ./contrib/deploy/signet/setup.sh && sudo systemctl restart scuttle-posd"
+echo "bullnym public_url must be https://$HOST. If it is not, rerun:"
+echo "  PUBLIC_URL=https://$HOST SCUTTLE_BIN=... ./contrib/deploy/signet/setup.sh && sudo systemctl restart scuttle-bullnym"
