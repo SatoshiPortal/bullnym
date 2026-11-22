@@ -11,7 +11,7 @@ It started from posd, Lee Salminen's point-of-sale service for Scuttle. See
 |---|---|---|
 | Lightning | A barkd forwarding invoice, paying the registered Ark address | One barkd forwarding invoice that names the registered Ark address as its hint |
 | Ark | LUD-22 `ARK`: the registered Ark address | Through the invoice's hint |
-| Bitcoin | LUD-22 `SP`: the static Silent Payment address | An address per sale from the store's descriptor |
+| Bitcoin | LUD-22 `SP`: the static Silent Payment address | An address per sale from the descriptor of the account the wallet chose |
 | Who starts a payment | Any payer, through LNURL | Anyone with the store's cashier link, which is also its public checkout |
 
 - **The nym** is permanent and is the Lightning Address: `<nym>@<domain>`.

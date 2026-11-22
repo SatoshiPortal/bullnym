@@ -130,9 +130,10 @@ nym:<nym>
 - The nym must exist (`404` otherwise) and `ark_address` must be its
   registered address.
 - A nym has at most one store (`409`).
-- The descriptor is public, ranged, single-path, without a hardened
-  wildcard, with one extended key that no other store uses (`409`). It
-  should come from an account used only by the store.
+- `onchain_descriptor` is the account the wallet chose. The service checks
+  only what posd checks: it is public, ranged, single-path, without a
+  hardened wildcard. The wallet should use an account it uses for nothing
+  else; the service does not check it.
 - The store's Lightning address is always `<nym>@<domain>`.
 
 ### Store

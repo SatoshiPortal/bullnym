@@ -41,10 +41,8 @@ CREATE TABLE store (
 	nym_id BIGINT NOT NULL UNIQUE,
 	name TEXT NOT NULL,
 	ark_address TEXT NOT NULL UNIQUE,
+	-- The public descriptor of the on-chain account the wallet chose.
 	onchain_descriptor TEXT NOT NULL,
-	-- The extended public key of the descriptor. A store's on-chain account
-	-- is its own: no two stores share one.
-	onchain_xpub TEXT NOT NULL UNIQUE,
 	-- The next derivation index to hand out for an on-chain sale. The
 	-- owner's wallet scans the store account up to it.
 	next_onchain_index BIGINT NOT NULL DEFAULT 0,
@@ -65,7 +63,6 @@ BEGIN
 	IF NEW.nym_id IS DISTINCT FROM OLD.nym_id
 		OR NEW.ark_address IS DISTINCT FROM OLD.ark_address
 		OR NEW.onchain_descriptor IS DISTINCT FROM OLD.onchain_descriptor
-		OR NEW.onchain_xpub IS DISTINCT FROM OLD.onchain_xpub
 		OR NEW.registration_timestamp IS DISTINCT FROM OLD.registration_timestamp
 		OR NEW.registration_signature IS DISTINCT FROM OLD.registration_signature
 	THEN

@@ -101,9 +101,8 @@ pub async fn register_store(
 	if currency_decimals(&reg.currency).is_none() {
 		return Err(bad_request(format!("unsupported currency: {}", reg.currency)));
 	}
-	let descriptor = StoreDescriptor::parse(&reg.onchain_descriptor)
-		.map_err(|e| bad_request(format!("{:#}", e)))?;
-	let xpub = descriptor.account_key().map_err(|e| bad_request(format!("{:#}", e)))?;
+	// posd's check, and no more: the wallet chooses the account.
+	StoreDescriptor::parse(&reg.onchain_descriptor).map_err(|e| bad_request(format!("{:#}", e)))?;
 	check_registration(&app, &caller, &reg.ark_address).await?;
 
 	let mut conn = app.public.db.conn().await?;
@@ -118,23 +117,18 @@ pub async fn register_store(
 		return Err(bad_request("the store must use the Ark address its nym was registered with"));
 	}
 	let row = tx.query_opt("
-		INSERT INTO store (nym_id, name, ark_address, onchain_descriptor, onchain_xpub, currency,
+		INSERT INTO store (nym_id, name, ark_address, onchain_descriptor, currency,
 			onchain_min_sat, registration_timestamp, registration_signature)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT DO NOTHING
 		RETURNING id
 	", &[
-		&nym.id, &name, &nym.ark_address, &reg.onchain_descriptor, &xpub, &reg.currency,
+		&nym.id, &name, &nym.ark_address, &reg.onchain_descriptor, &reg.currency,
 		&(app.cfg.sales.default_onchain_min_sat as i64), &(reg.timestamp as i64),
 		&signature.to_string(),
 	]).await?;
 	if row.is_none() {
-		let has = tx.query_opt("SELECT 1 FROM store WHERE nym_id = $1", &[&nym.id]).await?;
-		return Err(conflict(if has.is_some() {
-			"this nym already has a store"
-		} else {
-			"another store uses this on-chain account; use an account dedicated to this store"
-		}));
+		return Err(conflict("this nym already has a store"));
 	}
 	let store = tx.query_one(&format!(
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.nym_id = $1", STORE_COLUMNS,

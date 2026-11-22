@@ -137,8 +137,7 @@ pub struct StoreRegistration {
 	pub name: String,
 	/// The nym's registered Ark address.
 	pub ark_address: String,
-	/// The public descriptor of a dedicated on-chain account, used only by
-	/// the store.
+	/// The public descriptor of the on-chain account the wallet chose.
 	pub onchain_descriptor: String,
 	pub currency: String,
 	/// Seconds since the UNIX epoch.

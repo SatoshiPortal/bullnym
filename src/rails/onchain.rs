@@ -48,20 +48,6 @@ impl StoreDescriptor {
 		Ok(StoreDescriptor(desc))
 	}
 
-	/// The extended public key of the account. A store descriptor has
-	/// exactly one.
-	pub fn account_key(&self) -> anyhow::Result<String> {
-		let mut keys = Vec::new();
-		self.0.for_each_key(|k| {
-			keys.push(k.clone());
-			true
-		});
-		match keys.as_slice() {
-			[DescriptorPublicKey::XPub(x)] => Ok(x.xkey.to_string()),
-			_ => bail!("the descriptor must have exactly one extended public key"),
-		}
-	}
-
 	pub fn address(&self, index: u32, network: Network) -> anyhow::Result<Address> {
 		let derived = self.0.at_derivation_index(index)
 			.context("index out of range for the descriptor")?;
@@ -303,14 +289,6 @@ mod test {
 		assert!(StoreDescriptor::parse(&format!("tr({}/<0;1>/*)", xpub)).is_err(), "multipath");
 		assert!(StoreDescriptor::parse(&format!("tr({}/0/*')", xpub)).is_err(), "hardened");
 		assert!(StoreDescriptor::parse("tr(nonsense)").is_err());
-
-		// The account key identifies the account, whatever the origin info.
-		assert_eq!(desc.account_key().unwrap(), xpub);
-		let with_origin = StoreDescriptor::parse(&format!("tr([deadbeef/86'/1'/0']{}/0/*)", xpub)).unwrap();
-		assert_eq!(with_origin.account_key().unwrap(), xpub);
-		let other = Xpub::from_priv(&Secp256k1::new(), &Xpriv::new_master(Network::Regtest, &[8u8; 32]).unwrap());
-		let multi = format!("wsh(multi(1,{}/0/*,{}/0/*))", xpub, other);
-		assert!(StoreDescriptor::parse(&multi).unwrap().account_key().is_err());
 	}
 
 	#[test]

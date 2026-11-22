@@ -73,7 +73,7 @@ pub fn silent_payment_address() -> String {
 		.collect()
 }
 
-/// The public descriptor of a dedicated on-chain account of the store.
+/// The public descriptor of the on-chain account the wallet chose.
 pub fn store_descriptor(seed: u8) -> String {
 	let xpriv = Xpriv::new_master(Network::Regtest, &[seed; 32]).unwrap();
 	format!("tr({}/0/*)", Xpub::from_priv(&Secp256k1::new(), &xpriv))

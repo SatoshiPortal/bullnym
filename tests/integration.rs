@@ -354,11 +354,12 @@ async fn registration_rules() {
 	assert!(body["store"]["lightning_address"].as_str().unwrap().starts_with("cafe@"));
 	let (status, _) = common::register_store(&svc, &alice, &a1, "cafe", common::store_descriptor(2)).await;
 	assert_eq!(status, StatusCode::CONFLICT, "one store per nym");
-	// No two stores share an on-chain account.
+	// The service does not judge the account the wallet chose: another
+	// store may register the same descriptor.
 	let (b2, (status, _)) = common::register_nym(&svc, &bob, "bob").await;
 	assert!(status.is_success());
-	let (status, _) = common::register_store(&svc, &bob, &b2, "bob", common::store_descriptor(1)).await;
-	assert_eq!(status, StatusCode::CONFLICT);
+	let (status, body) = common::register_store(&svc, &bob, &b2, "bob", common::store_descriptor(1)).await;
+	assert!(status.is_success(), "{}", body);
 
 	// Nothing can change a nym's name or destinations, or delete it.
 	assert!(svc.sql("UPDATE nym SET ark_address = 'x' WHERE name = 'cafe'").await.is_err());
