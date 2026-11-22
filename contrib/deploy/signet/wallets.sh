@@ -16,6 +16,8 @@
 #   register "<name>" [CRC]           register the store of the nym
 #   store                             show the store
 #   store-set <key>=<value>...        name, currency, onchain_min_sat
+#   cashier-pin <digits>              set or change the PIN that shows the
+#                                     cashier screen its own sales
 #   owner-sales [n]                   the store's latest sales
 #   owner-csv [from] [to]             CSV export (dates YYYY-MM-DD)
 #   payments [n]                      Lightning payments to the Lightning
@@ -111,7 +113,7 @@ get_sale() { api GET "/api/v1/sales/$1"; }
 
 show_sale() {
 	jq '{id, state, progress, warnings, notice, amount_sat, fiat_amount, currency, memo,
-		received_sat, seen_sat, paid_rail, paid_at, final, late_payment, expires_at,
+		received_sat, seen_sat, paid_rail, paid_at, late_payment, expires_at,
 		cashier_name, onchain_address, payment_request}'
 }
 
@@ -195,13 +197,15 @@ register)
 	sw=$(dev store-wallet "$(jq -n --arg n "$name" '{name: $n}')")
 	wallet=$(jq -r .wallet <<<"$sw")
 	descriptor=$(jq -r .onchain_descriptor <<<"$sw")
+	# posd's mailbox id, which the service stores and does not use.
+	mailbox=$(bark owner debug-info | jq -r .mailbox_id)
 	ts=$(date +%s)
-	msg=$(printf 'scuttle-pos registration v1\nname:%s\nark_address:%s\nonchain_descriptor:%s\ncurrency:%s\ntimestamp:%s\nnym:%s' \
-		"$name" "$address" "$descriptor" "$currency" "$ts" "$nym")
+	msg=$(printf 'scuttle-pos registration v1\nname:%s\nark_address:%s\nmailbox_id:%s\nonchain_descriptor:%s\ncurrency:%s\ntimestamp:%s\nnym:%s' \
+		"$name" "$address" "$mailbox" "$descriptor" "$currency" "$ts" "$nym")
 	sig=$(bark owner message sign "$msg" "$address" | jq -r .signature)
-	api POST /api/v1/stores "" "$(jq -n --arg n "$name" --arg a "$address" --arg d "$descriptor" \
+	api POST /api/v1/stores "" "$(jq -n --arg n "$name" --arg a "$address" --arg m "$mailbox" --arg d "$descriptor" \
 		--arg c "$currency" --argjson t "$ts" --arg y "$nym" --arg s "$sig" \
-		'{registration: {name: $n, ark_address: $a, onchain_descriptor: $d, currency: $c, timestamp: $t, nym: $y}, signature: $s}')" \
+		'{registration: {name: $n, ark_address: $a, mailbox_id: $m, onchain_descriptor: $d, currency: $c, timestamp: $t, nym: $y}, signature: $s}')" \
 		| jq -c .store
 	echo "$wallet" > "$HOME_DIR/store-onchain-wallet"
 	echo "on-chain sales go to the test wallet '$wallet' on the deployment"
@@ -222,6 +226,11 @@ store-set)
 		esac
 	done
 	api PATCH /api/v1/owner/store "$(owner_token)" "$body" | jq .
+	;;
+cashier-pin)
+	pin="${1:?4 to 12 digits}"
+	api PUT /api/v1/owner/store/cashier-pin "$(owner_token)" "$(jq -n --arg p "$pin" '{pin: $p}')" \
+		| jq -c '{name, cashier_pin_set}'
 	;;
 owner-sales)
 	api GET "/api/v1/owner/sales?limit=${1:-10}" "$(owner_token)" \

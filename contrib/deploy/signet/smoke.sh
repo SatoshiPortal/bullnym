@@ -59,12 +59,14 @@ api POST /api/v1/nym "" "$(jq -n --arg n "$NYM" --arg a "$address" --arg p "$sp"
 cli -named createwallet wallet_name=smoke-store >/dev/null 2>&1 || true
 descriptor=$(cli -rpcwallet=smoke-store listdescriptors \
 	| jq -r '[.descriptors[] | select(.desc | startswith("tr(")) | select(.internal == false)][0].desc')
+# posd's mailbox id, which the service stores and does not use.
+mailbox=$(bark owner debug-info | jq -r .mailbox_id)
 ts=$(date +%s)
-msg=$(printf 'scuttle-pos registration v1\nname:%s\nark_address:%s\nonchain_descriptor:%s\ncurrency:%s\ntimestamp:%s\nnym:%s' \
-	"Smoke Cafe" "$address" "$descriptor" CRC "$ts" "$NYM")
+msg=$(printf 'scuttle-pos registration v1\nname:%s\nark_address:%s\nmailbox_id:%s\nonchain_descriptor:%s\ncurrency:%s\ntimestamp:%s\nnym:%s' \
+	"Smoke Cafe" "$address" "$mailbox" "$descriptor" CRC "$ts" "$NYM")
 sig=$(bark owner message sign "$msg" "$address" | jq -r .signature)
-reg=$(jq -n --arg a "$address" --arg d "$descriptor" --argjson t "$ts" --arg y "$NYM" --arg s "$sig" \
-	'{registration: {name: "Smoke Cafe", ark_address: $a, onchain_descriptor: $d, currency: "CRC", timestamp: $t, nym: $y}, signature: $s}')
+reg=$(jq -n --arg a "$address" --arg m "$mailbox" --arg d "$descriptor" --argjson t "$ts" --arg y "$NYM" --arg s "$sig" \
+	'{registration: {name: "Smoke Cafe", ark_address: $a, mailbox_id: $m, onchain_descriptor: $d, currency: "CRC", timestamp: $t, nym: $y}, signature: $s}')
 api POST /api/v1/stores "" "$reg" >/dev/null || echo "(store already registered)"
 challenge=$(api POST /api/v1/owner/challenge "" "{\"ark_address\": \"$address\"}" | jq -r .challenge)
 login_sig=$(bark owner message sign "$challenge" "$address" | jq -r .signature)
@@ -112,10 +114,11 @@ api GET "/api/v1/sales/$id" | jq -c '{state, paid_rail, received_sat}'
 echo "== the Lightning Address"
 pr=$(api GET "/api/v1/lnurlp/$NYM/callback?amount=5000000" | jq -r .pr)
 lncli cln-external xpay "$pr" >/dev/null
-api GET "/api/v1/lnurlp/$NYM/callback?amount=5000000&payment_method=ARK" | jq -c .
+api GET "/api/v1/lnurlp/$NYM/callback?amount=5000000&payment_method=SCUTTLE" | jq -c .
 api GET "/api/v1/lnurlp/$NYM/callback?amount=5000000&payment_method=SP" | jq -c .
+api GET "/api/v1/lnurlp/$NYM/callback?amount=5000000&payment_method=SCUTTLE,SP" | jq -c .
 
 echo "== the owner's history and wallet"
-api GET "/api/v1/owner/sales?limit=3" "$owner" | jq -c '.sales[] | {state, paid_rail, final, warnings}'
+api GET "/api/v1/owner/sales?limit=3" "$owner" | jq -c '.sales[] | {state, paid_rail, received_sat, warnings}'
 bark owner sync >/dev/null 2>&1 || true
 bark owner balance | jq -c '{spendable_sat}'

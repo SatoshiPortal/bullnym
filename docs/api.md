@@ -12,11 +12,15 @@ endpoints, which use `{"status": "ERROR", "reason": "<message>"}`:
 | Status | Meaning |
 |---|---|
 | 400 | The request is not valid |
-| 401 | The owner token is missing, not valid or expired |
+| 401 | The owner token is missing, not valid or expired; or a wrong cashier PIN |
 | 404 | The resource does not exist, or the cashier link does not work |
 | 409 | The request conflicts with the current state |
-| 429 | A rate limit or cap was reached |
-| 503 | `This payment method is temporarily unavailable. Try again later.` A backend is down, or no payment option is left |
+| 429 | A rate limit or cap was reached, or wrong cashier PINs locked the check |
+| 503 | `This payment method is temporarily unavailable. Try again later.` A backend is down, or no payment option is left. Or a message saying what to change, when the setup refuses the request (see Sale) |
+
+Amounts are at most 2,100,000,000,000,000 sats (21,000,000 BTC), and a fiat
+amount is below 10^15 units: larger ones are refused (`400`) before anything
+is allocated.
 
 ## Signed messages
 
@@ -28,9 +32,12 @@ receives the payments (`Wallet::sign_message`, or `POST
 field with a line break is refused, and the timestamp must be within 10
 minutes of the service's clock.
 
-The registered Ark address must be an address of the service's Ark server,
-paying a public key, with delivery to the server mailbox. The service never
-asks for the unblinded mailbox id.
+The registered Ark address must be one the Ark server accepts as the
+destination hint of a forwarded invoice: an address of the service's Ark
+server and network (`ark1…` on bitcoin, `tark1…` on the test networks),
+paying a public key, with exactly one delivery, to the server mailbox. The
+server also unblinds the mailbox with its own key, which the service cannot
+check.
 
 ## Lightning Address
 
@@ -80,17 +87,21 @@ be registered.
 ### LNURL (LUD-06, LUD-16, LUD-22)
 
 - `GET /.well-known/lnurlp/<nym>` returns the pay request, with
-  `"payment_methods": ["ARK", "SP"]`. `ARK` is left out while the Ark server
-  is unhealthy.
-- `GET /api/v1/lnurlp/<nym>/callback?amount=<msat>` returns `{"pr":
-  "<invoice>", "routes": []}`: a barkd forwarding invoice without an Ark
-  hint, paying the registered Ark address. Any Lightning wallet pays it;
-  barkd forwards the payment to the owner.
-- `…&payment_method=ARK` returns `{"ARK": {"address": "<registered Ark
-  address>"}}`, and `…&payment_method=SP` returns `{"SP": {"address":
-  "<Silent Payment address>"}}`. A method reply carries only that method
-  and creates no invoice. `payment_method` may list several methods; the
-  first one the service offers wins.
+  `"payment_methods": ["SCUTTLE", "SP"]`. `SCUTTLE` is left out while the
+  Ark server is unhealthy.
+- `GET /api/v1/lnurlp/<nym>/callback?amount=<msat>`, with no
+  `payment_method`, returns `{"pr": "<invoice>", "routes": []}`: a barkd
+  forwarding invoice without an Ark hint, paying the registered Ark address.
+  Any Lightning wallet pays it; barkd forwards the payment to the owner.
+- `…&payment_method=SCUTTLE` returns `{"SCUTTLE": {"address": "<registered
+  Ark address>"}}`, and `…&payment_method=SP` returns `{"SP": {"address":
+  "<Silent Payment address>"}}`. `…&payment_method=SCUTTLE,SP` returns both
+  objects. A reply carries only the requested methods, and no `pr`, and
+  creates no invoice. A method whose backend is down is left out of the
+  reply, and `503` comes when none is left.
+- An unknown method, anywhere in the list, is refused with `400` and
+  `"reason": "unsupported payment method <m>; this Lightning Address offers
+  SCUTTLE and SP"`. There is no `ARK` alias.
 
 The Ark server cannot put a description hash in an invoice, so the invoice
 carries the metadata's text description. Wallets that enforce the LUD-06
@@ -100,14 +111,15 @@ hash check refuse these invoices.
 
 ### Registration
 
-`POST /api/v1/stores`, with no token. This is posd's registration with
-`nym` added and `mailbox_id` removed:
+`POST /api/v1/stores`, with no token. This is posd's registration, with
+`nym` added last:
 
 ```json
 {
   "registration": {
     "name": "Café Uvita",
     "ark_address": "ark1…",
+    "mailbox_id": "02…",
     "onchain_descriptor": "tr([fingerprint/86'/0'/0']xpub…/0/*)",
     "currency": "CRC",
     "timestamp": 1795190400,
@@ -121,6 +133,7 @@ hash check refuse these invoices.
 scuttle-pos registration v1
 name:<name>
 ark_address:<ark_address>
+mailbox_id:<mailbox_id>
 onchain_descriptor:<onchain_descriptor>
 currency:<currency>
 timestamp:<timestamp>
@@ -129,11 +142,23 @@ nym:<nym>
 
 - The nym must exist (`404` otherwise) and `ark_address` must be its
   registered address.
+- `mailbox_id` is the unblinded mailbox of the owner's wallet, as in posd
+  (`bark owner debug-info`, or `Wallet::mailbox_identifier()`). It must
+  parse as a mailbox id. The service stores it with the registration and
+  uses it for nothing; as in posd, it does not check that it belongs to the
+  address.
 - A nym has at most one store (`409`).
 - `onchain_descriptor` is the account the wallet chose. The service checks
-  only what posd checks: it is public, ranged, single-path, without a
-  hardened wildcard. The wallet should use an account it uses for nothing
-  else; the service does not check it.
+  only what posd checks: it is a public descriptor, ranged, single-path,
+  without a hardened wildcard. Refused: a private key, a fixed index, a
+  multipath `<0;1>` step, a `*'` wildcard. Accepted without any other
+  check: the network of the key (a `xpub` gives addresses of the service's
+  network), the script type, and whether the wallet uses the account for
+  anything else. Two stores may register the same descriptor (see Sale).
+- A descriptor without an address form, such as a bare `pk(…)` or
+  `multi(…)`, is accepted as in posd, but no address can be derived from it,
+  not even the first. Its sales then offer no on-chain payment and the
+  index stays free; posd refused such a sale.
 - The store's Lightning address is always `<nym>@<domain>`.
 
 ### Store
@@ -144,15 +169,21 @@ nym:<nym>
   "nym": "cafe",
   "lightning_address": "cafe@pay.example.com",
   "currency": "CRC",
-  "onchain_min_sat": 50000
+  "onchain_min_sat": 50000,
+  "cashier_pin_set": true
 }
 ```
 
+`cashier_pin_set` says whether the owner set a cashier PIN; the PIN and its
+hash are never shown.
+
 The owner's view adds `checkout_url`, the store's cashier link, and
-`next_onchain_index`: each sale that offers Bitcoin
-takes the store's next derivation index, as in posd, and no address is
-handed out twice. The owner's wallet scans the store account up to this
-index, so a payment after many empty addresses is still found.
+`next_onchain_index`: each sale that offers Bitcoin takes the store's next
+derivation index, as in posd, and no address is handed out twice. When
+another store registered the same descriptor, an address that store's sale
+already has is skipped and its index used up. The owner's wallet scans the
+store account up to this index, so a payment after many empty addresses is
+still found.
 
 ## Owner
 
@@ -171,7 +202,8 @@ serves the nym and its store.
 | `PATCH /api/v1/owner/nym` | `display_name` (empty removes it) | `{"nym": Nym}` |
 | `GET /api/v1/owner/nym/payments?before=<id>&limit=<n>` | | `{"payments": [...]}`: the Lightning payments to the Lightning Address |
 | `GET /api/v1/owner/store` | | Owner store |
-| `PATCH /api/v1/owner/store` | any of `name`, `currency`, `onchain_min_sat` | Owner store |
+| `PATCH /api/v1/owner/store` | any of `name`, `currency`, `onchain_min_sat` (at most 2,100,000,000,000,000) | Owner store |
+| `PUT /api/v1/owner/store/cashier-pin` | `{"pin": "<4 to 12 digits>"}` | Owner store. Sets or changes the cashier PIN |
 | `GET /api/v1/owner/sales?before=<id>&limit=<n>` | | `{"sales": [Sale]}`, newest first, at most 100 |
 | `GET /api/v1/owner/sales.csv?from=<date>&to=<date>` | | CSV, one row per sale |
 
@@ -179,7 +211,7 @@ serves the nym and its store.
 as `to` includes that whole day. The CSV columns are: `id, created_at,
 paid_at, state, paid_rail, amount_sat, received_sat, fiat_amount, currency,
 btc_price, memo, cashier_name, seen_sat, progress, warnings, notice,
-final_at, late_payment`.
+late_payment`.
 
 The owner's wallet calls these endpoints; the service has no owner page.
 
@@ -198,9 +230,33 @@ token and no login. The same page is the public checkout. Its API prefix is
 | `GET /api/v1/sales/<id>` | | `Sale` |
 | `GET /api/v1/sales/<id>?wait=<state>` | | `Sale`, when the state is not `<state>` or after 25 s |
 | `POST /api/v1/sales/<id>/cancel` | | `Sale`; `409` unless the sale is open and no payment is arriving |
+| `POST <prefix>/pin` | `{"pin": "…"}` | `{"ok": true}` when it is the cashier PIN |
 
 The link cannot list the store's sales, export them or see other sales.
 Holding a sale's unguessable id is what lets a cashier follow and cancel it.
+Selling, following and canceling need no PIN.
+
+### Cashier PIN
+
+The cashier screen keeps the ids of the sales it created, and lists them
+only after the service accepted the cashier PIN typed on its keypad. Without
+a PIN set (`cashier_pin_set` false) the list stays hidden and the check
+returns `404`. The owner sets the PIN; the service keeps only its Argon2id
+hash with a random salt, and the answer to a check says only whether it
+matched:
+
+- A wrong PIN returns `401` with `{"error": "wrong PIN", "retry_after":
+  <seconds>}`.
+- Wrong PINs are counted per source and per store. Five are free; then each
+  wrong PIN locks further checks for twice as long as the one before (2 s,
+  4 s, …), up to 15 minutes. While locked, a check returns `429` with
+  `retry_after` and a `Retry-After` header, and the PIN is not checked. A
+  right PIN clears no count. A count is forgotten a day after its last wrong
+  PIN, and a store's count when the owner sets a new PIN.
+- Checks are also limited per source per minute (`pin_checks_per_minute`).
+
+The list is a convenience of the screen: anyone with the browser's storage
+can read the remembered sale ids, and a sale id alone opens its sale.
 
 ### Sale
 
@@ -225,8 +281,6 @@ Holding a sale's unguessable id is what lets a cashier follow and cancel it.
   "progress": "onchain",
   "warnings": ["not-guaranteed", "low-fee"],
   "notice": null,
-  "final": false,
-  "final_at": null,
   "late_payment": false,
   "cashier_name": "Front till"
 }
@@ -238,6 +292,15 @@ Holding a sale's unguessable id is what lets a cashier follow and cancel it.
   wallet with address hints on pays it over Ark. The address and `amount`
   are left out below the store's on-chain minimum: `bitcoin:?lightning=…`.
   A rail whose backend is down is left out.
+- As in posd, each sale checks that its invoice names the store's Ark
+  address as its hint. An invoice without it refuses the sale with `503`
+  and `"the Ark server must allow Ark address hints: barkd returned the
+  sale's invoice without the store's Ark address in its route hints"`; an
+  invoice naming another address is refused the same way. The invoice is
+  canceled in barkd, and the sale takes no address.
+- Every on-chain address belongs to one sale, even when two stores
+  registered the same descriptor, so a payment to it counts for that sale
+  only.
 - `state`:
   - `open`: waiting for a payment.
   - `in-progress`: a payment is seen and does not count yet. `progress` is
@@ -245,19 +308,23 @@ Holding a sale's unguessable id is what lets a cashier follow and cancel it.
     (the Ark server settled the invoice and has not reported the coins
     delivered to the owner, S4). It cannot be canceled, and it stays open
     past `expires_at` until the payment confirms or explicitly goes away.
+    An Ark payment stays `in-progress` until the server reports it
+    delivered, with no deadline. The rail that paid an invoice is recorded
+    only on the Ark server's positive evidence: HTLCs granted (Lightning) or
+    its delivery report (Ark); until then the sale keeps its state.
   - `paid`: Lightning delivered by barkd, Ark delivered (S4), or on-chain
-    with 1 confirmation. `final` is true at once for an invoice, and at 3
-    confirmations on-chain.
-  - `payment-issue`: a counted on-chain payment went away in a reorg. It
-    returns to `paid` when it confirms again.
+    with 1 confirmation. Paid is final, as in posd: the sale stays paid, and
+    the service stops observing it.
   - `expired` or `canceled`. A payment after that is a late payment
     (`late_payment`): it shows on this sale and never pays another one,
-    because no address is handed out twice. An address is watched for 7
-    days after its sale was created.
+    because no address is handed out twice. The address of such a sale is
+    watched for 7 days after the sale was created.
 - `received_sat` counts only delivered invoices and confirmed outputs;
   `seen_sat` is the unconfirmed amount, never counted. Nothing sets the
   paid time or rail before a payment counts, and nothing marks a sale paid
-  by hand.
+  by hand. A new unconfirmed payment shows only once bitcoind answered that
+  it is in its mempool: while the mempool query fails, nothing is recorded
+  for it.
 - `warnings`: `not-guaranteed` (always, while on-chain in progress),
   `low-fee` (well below bitcoind's estimate), `unconfirmed-parents` (spends
   unconfirmed outputs), `replaced` (a transaction that does not pay the

@@ -10,7 +10,7 @@ It started from posd, Lee Salminen's point-of-sale service for Scuttle. See
 | | Lightning Address | Store |
 |---|---|---|
 | Lightning | A barkd forwarding invoice, paying the registered Ark address | One barkd forwarding invoice that names the registered Ark address as its hint |
-| Ark | LUD-22 `ARK`: the registered Ark address | Through the invoice's hint |
+| Ark | LUD-22 `SCUTTLE`: the registered Ark address | Through the invoice's hint |
 | Bitcoin | LUD-22 `SP`: the static Silent Payment address | An address per sale from the descriptor of the account the wallet chose |
 | Who starts a payment | Any payer, through LNURL | Anyone with the store's cashier link, which is also its public checkout |
 
@@ -21,12 +21,16 @@ It started from posd, Lee Salminen's point-of-sale service for Scuttle. See
   Lightning Address, with the same Ark address. A nym has one store.
 - **The cashier link** replaces posd's paired terminals. Any device with it
   takes payments; the store's history and CSV are behind the owner login.
+  The screen lists its own sales only after the service accepted the
+  owner's cashier PIN.
 - **Bitcoin for the store** is an address per sale from the store's
-  descriptor, as in posd: never reused. The owner's wallet scans the store
-  account up to the store's next index, which the owner's store view shows.
+  descriptor, as in posd: never reused, not even by another store with the
+  same descriptor. The owner's wallet scans the store account up to the
+  store's next index, which the owner's store view shows.
 - **Paid** means: Lightning delivered by barkd; Ark delivered to the owner's
-  mailbox (S4); on-chain at 1 confirmation. A payment seen but not counted
-  shows as in progress, not guaranteed, and never as paid.
+  mailbox (S4); on-chain at 1 confirmation. Paid is final, as in posd. A
+  payment seen but not counted shows as in progress, not guaranteed, and
+  never as paid.
 
 The API is in [docs/api.md](docs/api.md). `bullnym.default.toml` documents
 every setting.
@@ -36,8 +40,10 @@ every setting.
 - A Scuttle Ark server in expiry payout mode, with
   `ln_receive_ark_address_hints = true`, and a release with S1 (a forwarded
   invoice that names its destination in its hint) and S4 (the delivery of
-  Ark payments in the receive status). The service checks all of them at
-  startup, through the server's public API, and refuses to start otherwise.
+  Ark payments in the receive status). As posd did, the service refuses to
+  start unless the server is in expiry payout mode, and refuses a sale whose
+  invoice does not name the store's Ark address in its hint, with a message
+  saying the server must allow Ark address hints.
 - A private barkd on that server. It issues the forwarding invoices and
   forwards the payments to the owners. It needs no funds.
 - A bitcoind. The service creates a watch-only wallet on it.
@@ -75,10 +81,14 @@ integration tests: `CAPTAIND_EXEC`, `BARKD_EXEC`, `BARK_EXEC`,
 `nix` shell and `justfile`).
 
 ```sh
-cargo nextest run --test integration --test-threads 6
+cargo nextest run --features test-overrides --test integration --test-threads 6
 ```
 
-The tests that need S1 and S4 skip unless `BULLNYM_TEST_S1_S4=1`, with
-`CAPTAIND_EXEC` and `BARKD_EXEC` pointing at a release that has them. Without
-it, the service starts with `startup.allow_missing_s1_s4`, and store
-invoices carry no hint.
+The `test-overrides` feature lets the tests start the service with
+`TestOverrides`, which no config can set and the service binary never
+builds with. The tests that need S1 and S4 skip unless
+`BULLNYM_TEST_S1_S4=1`, with `CAPTAIND_EXEC` and `BARKD_EXEC` pointing at a
+release that has them. Without it, barkd ignores the hint request, and the
+tests run the service with the override that accepts store invoices without
+the Ark hint; one test runs it without the override and checks that the
+sale is refused.
