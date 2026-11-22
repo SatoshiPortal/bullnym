@@ -128,7 +128,7 @@ pub async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> 
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, s.state, s.amount_sat,
 			s.expires_at, p.rail, p.payment_hash, p.onchain_address,
-			p.received_sat, p.pending_sat, p.settled_at
+			p.received_sat, p.pending_sat, p.awaiting_delivery_at, p.settled_at
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
 		WHERE p.settled_at IS NULL AND p.rail <> 'onchain' AND p.payment_hash IS NOT NULL
@@ -147,7 +147,7 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 				ForwardStatus::Unpaid | ForwardStatus::Arriving | ForwardStatus::Unknown => None,
 				// Settled by an Ark transfer, not yet in the owner's mailbox
 				// as barkd sees it: in progress until barkd settles it.
-				ForwardStatus::AwaitingDelivery => awaiting_delivery(p.sale_state),
+				ForwardStatus::AwaitingDelivery => awaiting_delivery(p.sale_state, p.awaiting_delivery),
 				// barkd settled it: paid. The Ark server only labels the rail.
 				ForwardStatus::Delivered(amount) => {
 					let via_ark = match app.ark.receive(hash).await {
@@ -175,12 +175,15 @@ pub fn via_ark(r: &crate::ark::ServerReceive) -> bool {
 }
 
 /// What an invoice that barkd shows awaiting delivery means for its sale:
-/// in progress, until barkd settles it.
-pub fn awaiting_delivery(state: SaleState) -> Option<Observation> {
-	match state {
-		SaleState::InProgress => None,
-		_ => Some(Observation::invoice(Amount::ZERO, false, true, Some(true))),
+/// in progress, until barkd settles it. The pending Ark payment is recorded
+/// on the invoice, also when the sale is already in progress for an
+/// on-chain payment, so the sale stays in progress for it if that one goes
+/// away. `known`: it is recorded already.
+pub fn awaiting_delivery(state: SaleState, known: bool) -> Option<Observation> {
+	if known && state == SaleState::InProgress {
+		return None;
 	}
+	Some(Observation::invoice(Amount::ZERO, false, true, Some(true)))
 }
 
 /// The state a sale moves to after an observation of its invoice, if it
@@ -214,9 +217,11 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 	let amount_sat: i64 = row.get("amount_sat");
 
 	tx.execute("
-		UPDATE sale_payment SET received_sat = $2, settled_at = CASE WHEN $3 THEN NOW() END
+		UPDATE sale_payment SET received_sat = $2, settled_at = CASE WHEN $3 THEN NOW() END,
+			awaiting_delivery_at = CASE WHEN $4 THEN coalesce(awaiting_delivery_at, NOW())
+				ELSE awaiting_delivery_at END
 		WHERE id = $1
-	", &[&p.payment_id, &(obs.received.to_sat() as i64), &obs.settled]).await?;
+	", &[&p.payment_id, &(obs.received.to_sat() as i64), &obs.settled, &obs.awaiting_delivery]).await?;
 	tx.execute("
 		UPDATE sale SET received_sat = (
 			SELECT coalesce(sum(received_sat), 0) FROM sale_payment WHERE sale_id = $1
@@ -372,6 +377,11 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat") as u64);
 	let expired: bool = row.get("expired");
 	let progress: Option<String> = row.get("progress");
+	// An Ark payment barkd showed awaiting delivery and has not settled.
+	let ark_pending: bool = tx.query_one("
+		SELECT EXISTS (SELECT 1 FROM sale_payment WHERE sale_id = $1 AND rail = 'lightning'
+			AND awaiting_delivery_at IS NOT NULL AND settled_at IS NULL)
+	", &[&w.sale_id]).await?.get(0);
 
 	for r in records {
 		tx.execute("
@@ -399,9 +409,15 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 	", &[&w.sale_id]).await?;
 
 	let t = stages::next_onchain_state(
-		state, amount, progress.as_deref() == Some("onchain"), expired, &summary,
+		state, amount, progress.as_deref() == Some("onchain"), ark_pending, expired, &summary,
 	);
 	match t.state {
+		Some(SaleState::InProgress) if t.ark_progress => {
+			let notice = t.notice.map(|n| n.as_str());
+			tx.execute("
+				UPDATE sale SET state = 'in-progress', progress = 'ark', notice = $2 WHERE id = $1
+			", &[&w.sale_id, &notice]).await?;
+		},
 		Some(SaleState::InProgress) => {
 			tx.execute("
 				UPDATE sale SET state = 'in-progress', progress = 'onchain', notice = NULL WHERE id = $1
@@ -447,6 +463,9 @@ pub enum CancelError {
 	/// barkd reports a payment arriving, settled by Ark, or delivered.
 	#[error("a payment is arriving")]
 	PaymentArriving,
+	/// barkd reports a state the service does not know.
+	#[error("barkd reports a state this service does not know")]
+	UnknownState,
 	/// barkd did not answer.
 	#[error("barkd is unavailable: {0:#}")]
 	Unavailable(anyhow::Error),
@@ -463,11 +482,14 @@ pub async fn cancel_invoice(b: &Backends, hash: &str) -> Result<(), CancelError>
 			Err(e) => match b.forwarder.status(hash).await {
 				Ok(ForwardStatus::Gone) => Ok(()),
 				Ok(ForwardStatus::Unpaid) | Err(_) => Err(CancelError::Unavailable(e)),
+				Ok(ForwardStatus::Unknown) => Err(CancelError::UnknownState),
 				Ok(_) => Err(CancelError::PaymentArriving),
 			},
 		},
-		ForwardStatus::Arriving | ForwardStatus::AwaitingDelivery | ForwardStatus::Delivered(_)
-			| ForwardStatus::Unknown => Err(CancelError::PaymentArriving),
+		ForwardStatus::Arriving | ForwardStatus::AwaitingDelivery | ForwardStatus::Delivered(_) => {
+			Err(CancelError::PaymentArriving)
+		},
+		ForwardStatus::Unknown => Err(CancelError::UnknownState),
 	}
 }
 
@@ -507,20 +529,33 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 		let sale_id: i64 = row.get("id");
 		let past_grace: bool = row.get("past_grace");
 		if let Some(hash) = row.get::<_, Option<String>>("payment_hash") {
-			match cancel_invoice(&app.watch, &hash).await {
-				Ok(()) => {},
-				// A payment is arriving, or barkd did not answer: the sale
-				// waits, up to the delivery grace.
-				Err(_) if !past_grace => continue,
+			let canceled = cancel_invoice(&app.watch, &hash).await;
+			if !expires_now(&canceled, past_grace) {
+				continue;
+			}
+			if let Err(e) = canceled {
 				// The invoice stays watched until barkd says how it ended; a
 				// payment that still arrives shows as a late payment.
-				Err(e) => tracing::info!("expiring sale {} with its invoice open: {}", sale_id, e),
+				tracing::info!("expiring sale {} with its invoice open: {}", sale_id, e);
 			}
 		}
 		let conn = app.watch.db.conn().await?;
 		changed |= expire_sale(&*conn, sale_id).await? > 0;
 	}
 	Ok(changed)
+}
+
+/// Whether an open sale past its expiry expires now, given how canceling
+/// its invoice went. barkd showing a payment arriving, awaiting delivery
+/// or delivered is positive evidence: the sale waits for it, however long.
+/// Without an answer, or with a state the service does not know, it waits
+/// up to the delivery grace.
+pub fn expires_now(canceled: &Result<(), CancelError>, past_grace: bool) -> bool {
+	match canceled {
+		Ok(()) => true,
+		Err(CancelError::PaymentArriving) => false,
+		Err(CancelError::UnknownState | CancelError::Unavailable(_)) => past_grace,
+	}
 }
 
 pub async fn expire_sale(conn: &impl GenericClient, sale_id: i64) -> anyhow::Result<u64> {
@@ -679,11 +714,59 @@ mod test {
 	#[test]
 	fn ark_payment_awaiting_delivery() {
 		use SaleState::*;
-		// barkd shows it awaiting delivery: in progress, with nothing new
-		// until barkd settles it, however long that takes.
-		let o = awaiting_delivery(Open).unwrap();
-		assert!(!o.settled);
+		// barkd shows it awaiting delivery: in progress, recorded on the
+		// invoice, with nothing new until barkd settles it, however long.
+		let o = awaiting_delivery(Open, false).unwrap();
+		assert!(!o.settled && o.awaiting_delivery);
 		assert_eq!(next_state(Open, 1000, &o), Some(InProgress));
-		assert_eq!(awaiting_delivery(InProgress), None);
+		assert_eq!(awaiting_delivery(InProgress, true), None);
+		// In progress for an on-chain payment: the Ark payment is still
+		// recorded, without changing the sale.
+		let o = awaiting_delivery(InProgress, false).unwrap();
+		assert!(o.awaiting_delivery);
+		assert_eq!(next_state(InProgress, 1000, &o), None);
+	}
+
+	/// A synthetic sequence: an unconfirmed Bitcoin payment puts the sale in
+	/// progress, barkd then shows an Ark payment awaiting delivery, and the
+	/// Bitcoin payment goes away. The sale stays in progress for the Ark
+	/// payment, and barkd's settlement pays it.
+	#[test]
+	fn a_pending_ark_payment_survives_a_lost_bitcoin_payment() {
+		use SaleState::*;
+		use crate::stages::{Summary, next_onchain_state};
+		let a = Amount::from_sat(1000);
+		let seen = Summary { seen: a, ..Summary::default() };
+		let t = next_onchain_state(Open, a, false, false, false, &seen);
+		assert_eq!(t.state, Some(InProgress));
+		// barkd: awaiting delivery. Recorded; the sale stays as it is.
+		let o = awaiting_delivery(InProgress, false).unwrap();
+		assert_eq!(next_state(InProgress, 1000, &o), None);
+		// The Bitcoin payment is replaced, after the sale's expiry.
+		let gone = Summary { replaced: true, ..Summary::default() };
+		let t = next_onchain_state(InProgress, a, true, true, true, &gone);
+		assert_eq!((t.state, t.ark_progress), (Some(InProgress), true));
+		// barkd settles: paid.
+		let settled = Observation::invoice(a, true, false, Some(true));
+		assert_eq!(next_state(InProgress, 1000, &settled), Some(Paid));
+	}
+
+	/// An Ark-only sale past its expiry: the first barkd read fails, the
+	/// second, while canceling the invoice, shows the payment awaiting
+	/// delivery. That positive answer never expires the sale, even past
+	/// the grace; only no answer, or an unknown state, does after it.
+	#[test]
+	fn a_positive_pending_answer_never_expires_a_sale() {
+		let unavailable = || Err(CancelError::Unavailable(anyhow::anyhow!("barkd is down")));
+		assert!(!expires_now(&Err(CancelError::PaymentArriving), false));
+		assert!(!expires_now(&Err(CancelError::PaymentArriving), true));
+		assert!(!expires_now(&unavailable(), false));
+		assert!(expires_now(&unavailable(), true));
+		assert!(!expires_now(&Err(CancelError::UnknownState), false));
+		assert!(expires_now(&Err(CancelError::UnknownState), true));
+		assert!(expires_now(&Ok(()), false));
+		// The next pass reads barkd's answer: in progress, and recorded.
+		let o = awaiting_delivery(SaleState::Open, false).unwrap();
+		assert_eq!(next_state(SaleState::Open, 1000, &o), Some(SaleState::InProgress));
 	}
 }

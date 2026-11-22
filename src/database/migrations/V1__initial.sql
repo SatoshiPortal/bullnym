@@ -208,6 +208,9 @@ CREATE TABLE sale_payment (
 	-- The warnings about the unconfirmed payments: not-guaranteed, low-fee,
 	-- unconfirmed-parents, replaced.
 	warnings TEXT[] NOT NULL DEFAULT '{}',
+	-- When barkd first showed an Ark transfer of this invoice awaiting
+	-- delivery. The sale stays in progress for it until barkd settles it.
+	awaiting_delivery_at TIMESTAMPTZ,
 	settled_at TIMESTAMPTZ,
 	UNIQUE (sale_id, rail)
 );

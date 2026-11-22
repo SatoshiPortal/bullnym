@@ -27,6 +27,7 @@ use bark::payment_request::PaymentRequest;
 use ark_testing::{TestContext, sat};
 use bullnym::TestOverrides;
 use bullnym::error::UNAVAILABLE_MESSAGE;
+use bullnym::rails::forward::ForwardStatus;
 use common::{SALE_TIMEOUT, Service, Store, owner_restores, rpc, store_setup, store_setup_with};
 
 
@@ -108,12 +109,51 @@ async fn sale_paid_by_ark() {
 
 	let sale = store.new_sale(json!({ "amount_sat": 30_000 })).await;
 	let id = sale["id"].as_str().unwrap();
+	let hash = Bolt11Invoice::from_str(sale["lightning_invoice"].as_str().unwrap()).unwrap()
+		.payment_hash().to_string();
 	// The Scuttle wallet pays the Lightning QR text over Ark.
 	let qr = sale["lightning_request"].as_str().unwrap();
 	assert!(qr.starts_with("lightning:"), "{}", qr);
+	let start = tokio::time::Instant::now();
 	let kind = pay(&payer, qr).await;
-	// Paid once barkd settles the receive (S4).
-	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+
+	// Paid once barkd settles the receive (S4). Bullnym, barkd and the Ark
+	// server are each read on their own, Bullnym first: a paid sale must
+	// find barkd settled, and until barkd settles Bullnym credits nothing,
+	// whatever the server reports.
+	let (mut awaiting, mut delivered, mut settled, mut paid_at) = (None, None, None, None);
+	let paid = loop {
+		let sale = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
+		let barkd = store.svc.app.watch.forwarder.status(&hash).await.ok();
+		let server = store.svc.app.ark.receive(&hash).await.ok();
+		let t = start.elapsed().as_millis();
+		let barkd_settled = matches!(barkd, Some(ForwardStatus::Delivered(_)));
+		if barkd == Some(ForwardStatus::AwaitingDelivery) {
+			awaiting.get_or_insert(t);
+		}
+		if server.as_ref().is_some_and(|r| r.delivered == Some(true)) {
+			delivered.get_or_insert(t);
+		}
+		if barkd_settled {
+			settled.get_or_insert(t);
+		}
+		if sale["state"] == "paid" {
+			assert!(barkd_settled, "paid before barkd settled: {:?}", barkd);
+			paid_at.get_or_insert(t);
+			break sale;
+		}
+		if !barkd_settled {
+			assert_eq!(sale["received_sat"], 0, "credited before barkd settled: {}", sale);
+		}
+		assert!(start.elapsed() < SALE_TIMEOUT, "not paid: {} (barkd {:?})", sale, barkd);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	};
+	eprintln!(
+		"ARK_TIMING ms after the payment: barkd awaiting delivery {:?}, server delivered {:?}, \
+		barkd settled {:?}, Bullnym paid {:?}; barkd awaiting delivery to settled {:?} ms",
+		awaiting, delivered, settled, paid_at,
+		awaiting.zip(settled).map(|(a, s)| s.saturating_sub(a)),
+	);
 	assert_eq!(paid["paid_rail"], "ark", "payer chose {}", kind);
 	assert_eq!(paid["received_sat"], 30_000);
 
@@ -661,6 +701,9 @@ async fn options_close_while_their_backend_is_down() {
 	let svc = &store.svc;
 
 	let open = store.new_sale(json!({ "amount_sat": 60_000 })).await;
+	let owner = Some(store.owner.token.as_str());
+	let count = |h: Value| h["sales"].as_array().unwrap().len();
+	let before = count(svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await);
 	store.forwarder.stop().await.unwrap();
 	// The health probes close the invoice option after three failures.
 	// A sale needs its invoice, so new sales are refused with one fixed
@@ -677,6 +720,10 @@ async fn options_close_while_their_backend_is_down() {
 		assert!(tokio::time::Instant::now() < deadline, "the invoice option never closed");
 		tokio::time::sleep(Duration::from_secs(1)).await;
 	}
+	// The refused sales left nothing: no sale, no address.
+	let history = svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await;
+	assert_eq!(count(history), before, "a refused sale leaves no record");
+	assert_eq!(svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 0);
 	// The on-chain option has its own backend: Bitcoin can still be added
 	// to an open sale.
 	let added = store.add_onchain(&open).await;
@@ -953,6 +1000,119 @@ async fn stores_sharing_a_descriptor_never_share_an_address() {
 	let history = svc.ok(Method::GET, "/api/v1/owner/sales", Some(&tokens[nym]), None).await;
 	let with_payment = history["sales"].as_array().unwrap().iter().filter(|s| s["seen_sat"] != 0).count();
 	assert_eq!(with_payment, 1);
+}
+
+#[tokio::test]
+async fn allocation_progress_survives_an_occupied_range() {
+	let ctx = TestContext::new("bullnym/allocation_progress_survives_an_occupied_range").await;
+	let store = store_setup_with(&ctx, |cfg| cfg.sales.default_onchain_min_sat = 1000).await;
+	let svc = &store.svc;
+	let owner = Some(store.owner.token.as_str());
+	let next_index = || async { svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"].clone() };
+
+	// Other sales already have the first 1,002 addresses of the store's
+	// account, as when another store with the same descriptor took them.
+	let desc = bullnym::rails::onchain::StoreDescriptor::parse(&common::store_descriptor(42)).unwrap();
+	let address = |i: u32| desc.address(i, bitcoin::Network::Regtest).unwrap().to_string();
+	svc.sql("
+		INSERT INTO sale (public_id, store_id, amount_sat, state, expires_at, created_at)
+		SELECT 'occupied-' || i, (SELECT id FROM store), 2000, 'expired',
+			NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days'
+		FROM generate_series(0, 1001) AS i
+	").await.unwrap();
+	let values = (0..1002u32).map(|i| format!("('{}', {})", address(i), i)).collect::<Vec<_>>().join(",");
+	svc.sql(&format!("
+		INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
+		SELECT s.id, 'onchain', v.idx, v.addr FROM (VALUES {}) AS v(addr, idx)
+		JOIN sale s ON s.public_id = 'occupied-' || v.idx
+	", values)).await.unwrap();
+
+	// The first request runs out of tries in the occupied range, and keeps
+	// the indexes it went through.
+	let sale = store.new_sale(json!({ "amount_sat": 2000 })).await;
+	let (status, body) = svc.call(Method::POST, &format!("/api/v1/sales/{}/onchain", sale["id"].as_str().unwrap()),
+		None, None).await;
+	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", body);
+	assert_eq!(next_index().await, 1001, "the skipped indexes stay used up");
+	// The next request goes on from there to the first free address.
+	let added = store.add_onchain(&sale).await;
+	assert_eq!(added["onchain_address"], address(1002));
+	assert_eq!(next_index().await, 1003);
+}
+
+#[tokio::test]
+async fn cashier_pin_limits_hold_under_parallel_checks() {
+	let ctx = TestContext::new("bullnym/cashier_pin_limits_hold_under_parallel_checks").await;
+	let store = store_setup(&ctx).await;
+	let svc = &store.svc;
+	svc.ok(Method::PUT, "/api/v1/owner/store/cashier-pin", Some(&store.owner.token), Some(json!({ "pin": "2468" }))).await;
+
+	// Twelve wrong PINs at once. Each check is admitted after the ones
+	// before it are counted: five are free, the sixth locks for 2 s, and
+	// checks admitted during a lock are refused without a check. Only a
+	// check that arrives after a lock ended is checked again (4 s, ...).
+	let http = reqwest::Client::new();
+	let url = format!("{}/api/v1/checkout/cafe/pin", svc.url);
+	let mut set = tokio::task::JoinSet::new();
+	for _ in 0..12 {
+		let req = http.post(&url).json(&json!({ "pin": "0000" }));
+		set.spawn(async move {
+			let resp = req.send().await.unwrap();
+			(resp.status(), resp.json::<Value>().await.unwrap()["retry_after"].as_i64().unwrap_or(-1))
+		});
+	}
+	let mut results = Vec::new();
+	while let Some(r) = set.join_next().await {
+		results.push(r.unwrap());
+	}
+	let mut wrong = results.iter().filter(|(s, _)| *s == StatusCode::UNAUTHORIZED).map(|(_, r)| *r).collect::<Vec<_>>();
+	wrong.sort();
+	let locked = results.iter().filter(|(s, _)| *s == StatusCode::TOO_MANY_REQUESTS).count();
+	assert_eq!(wrong.len() + locked, 12, "{:?}", results);
+	// Exactly the five free failures, then the backoff, one check per
+	// lock: never two checks counted against the same state.
+	let backoff = [0, 0, 0, 0, 0, 2, 4, 8];
+	assert!(wrong.len() >= 6 && wrong.len() <= backoff.len(), "{:?}", results);
+	assert_eq!(wrong, backoff[..wrong.len()].to_vec(), "{:?}", results);
+	eprintln!("PIN_PARALLEL {} checked, {} refused while locked", wrong.len(), locked);
+	let (status, _) = svc.call(Method::POST, "/api/v1/checkout/cafe/pin", None, Some(json!({ "pin": "2468" }))).await;
+	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "even the right PIN waits for the lock");
+}
+
+#[tokio::test]
+async fn nym_cap_holds_under_parallel_registrations() {
+	let ctx = TestContext::new("bullnym/nym_cap_holds_under_parallel_registrations").await;
+	let (srv, _lightning, forwarder) = common::ark_server(&ctx).await;
+	let svc = Service::start_with(&ctx, &srv, &forwarder, |cfg| cfg.limits.max_nyms = 3).await;
+	let wallet = ctx.bark_sdk("owners", &srv).create().await;
+
+	// Eight registrations, each with its own name and address, sent at once:
+	// exactly the cap of three is registered.
+	let mut set = tokio::task::JoinSet::new();
+	let http = reqwest::Client::new();
+	for i in 0..8 {
+		let address = wallet.new_address().await.unwrap();
+		let reg = bullnym::registration::NymRegistration {
+			nym: format!("shop{}", i), ark_address: address.to_string(),
+			silent_payment_address: common::silent_payment_address(),
+			timestamp: chrono::Utc::now().timestamp() as u64,
+		};
+		let sig = common::sign(&wallet, &reg.message(), &address).await;
+		let req = http.post(format!("{}/api/v1/nym", svc.url)).json(&json!({ "registration": reg, "signature": sig }));
+		set.spawn(async move {
+			let resp = req.send().await.unwrap();
+			(resp.status(), resp.json::<Value>().await.unwrap())
+		});
+	}
+	let mut results = Vec::new();
+	while let Some(r) = set.join_next().await {
+		results.push(r.unwrap());
+	}
+	let registered = results.iter().filter(|(s, _)| s.is_success()).count();
+	assert_eq!(registered, 3, "{:?}", results);
+	assert!(results.iter().filter(|(s, _)| !s.is_success())
+		.all(|(s, b)| *s == StatusCode::CONFLICT && b["error"] == "the service is not taking new registrations"),
+		"{:?}", results);
 }
 
 /// The two QR codes of a sale, Lightning and Bitcoin, and its invoice

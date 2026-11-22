@@ -300,7 +300,7 @@ pub struct Store {
 }
 
 /// Starts an Ark server in expiry payout mode with Ark address hints, its
-/// Lightning nodes and a forwarding barkd.
+/// Lightning nodes and a forwarding barkd that syncs every 5 seconds.
 pub async fn ark_server(ctx: &TestContext) -> (Arc<Captaind>, LightningPaymentSetup, Barkd) {
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
@@ -312,7 +312,9 @@ pub async fn ark_server(ctx: &TestContext) -> (Arc<Captaind>, LightningPaymentSe
 	// transaction, so a node that starts later knows the VTXO anchor.
 	srv.wait_for_vtxopool(ctx).await;
 	ctx.generate_blocks(1).await;
-	let forwarder = ctx.barkd("forwarder", &*srv).create().await;
+	// The owner's choice for prompt delivery: barkd checks its receives
+	// every 5 seconds.
+	let forwarder = ctx.barkd("forwarder", &*srv).cfg(|cfg| cfg.daemon_sync_interval_secs = 5).create().await;
 	(srv, lightning, forwarder)
 }
 

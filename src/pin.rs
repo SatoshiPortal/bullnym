@@ -69,20 +69,28 @@ pub fn scopes(store_id: i64, source: &str) -> [String; 2] {
 	[format!("store:{}", store_id), format!("source:{}", source)]
 }
 
-/// The seconds until the longest of the locks of `scopes` ends, 0 if none
-/// is locked.
-pub async fn locked_for(conn: &impl GenericClient, scopes: &[String]) -> anyhow::Result<i64> {
-	let row = conn.query_one("
-		SELECT coalesce(ceil(max(extract(epoch FROM locked_until - NOW()))), 0)::BIGINT AS secs
-		FROM pin_failure WHERE scope = ANY($1) AND locked_until > NOW()
-	", &[&scopes]).await?;
+/// Admits a check in `tx`: locks the counters of `scopes` until `tx` ends,
+/// so concurrent checks of the same store or source run one after the
+/// other, each seeing the failures of the ones before. Returns the seconds
+/// until the longest of their locks ends, 0 if none is locked.
+pub async fn admit(tx: &tokio_postgres::Transaction<'_>, scopes: &[String]) -> anyhow::Result<i64> {
+	// Always in the same order, so two checks cannot wait on each other.
+	let mut sorted = scopes.to_vec();
+	sorted.sort();
+	for scope in &sorted {
+		tx.execute("INSERT INTO pin_failure (scope) VALUES ($1) ON CONFLICT DO NOTHING", &[scope]).await?;
+	}
+	let row = tx.query_one("
+		WITH locked AS (SELECT locked_until FROM pin_failure WHERE scope = ANY($1) ORDER BY scope FOR UPDATE)
+		SELECT coalesce(ceil(max(extract(epoch FROM locked_until - NOW()))), 0)::BIGINT AS secs FROM locked
+	", &[&sorted]).await?;
 	Ok(row.get::<_, i64>("secs").max(0))
 }
 
-/// Counts a wrong PIN in each scope and locks it as its count requires.
-/// Returns the longest lock, in seconds.
-pub async fn record_failure(conn: &mut tokio_postgres::Client, scopes: &[String]) -> anyhow::Result<i64> {
-	let tx = conn.transaction().await?;
+/// Counts a wrong PIN in each scope and locks it as its count requires,
+/// in the transaction that admitted the check. Returns the longest lock, in
+/// seconds.
+pub async fn record_failure(tx: &tokio_postgres::Transaction<'_>, scopes: &[String]) -> anyhow::Result<i64> {
 	let mut longest = 0;
 	for scope in scopes {
 		let failures: i32 = tx.query_one("
@@ -101,7 +109,6 @@ pub async fn record_failure(conn: &mut tokio_postgres::Client, scopes: &[String]
 		", &[scope, &(secs as f64)]).await?;
 		longest = longest.max(secs);
 	}
-	tx.commit().await?;
 	Ok(longest)
 }
 

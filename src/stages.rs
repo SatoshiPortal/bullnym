@@ -284,20 +284,25 @@ pub struct Transition {
 	pub state: Option<SaleState>,
 	/// Set the paid time and rail: the first confirmation.
 	pub counts_as_paid: bool,
+	/// The sale stays in progress for its pending Ark payment.
+	pub ark_progress: bool,
 	pub notice: Option<Notice>,
 }
 
 /// The rules of an on-chain payment for a sale. `onchain_progress`: the
 /// sale is in progress because of an on-chain payment, not an Ark payment
-/// awaiting delivery.
+/// awaiting delivery. `ark_pending`: barkd showed an Ark payment of the
+/// sale's invoice awaiting delivery, and has not settled it.
 ///
 /// The total in sight only drops when a transaction is gone, which needs an
-/// explicit signal from bitcoind (see [classify]). A paid, expired or
+/// explicit signal from bitcoind (see [classify]). When it does, a known
+/// pending Ark payment keeps the sale in progress. A paid, expired or
 /// canceled sale never changes.
 pub fn next_onchain_state(
 	state: SaleState,
 	amount: Amount,
 	onchain_progress: bool,
+	ark_pending: bool,
 	expired: bool,
 	summary: &Summary,
 ) -> Transition {
@@ -311,8 +316,13 @@ pub fn next_onchain_state(
 		},
 		SaleState::Open if in_sight => t.state = Some(SaleState::InProgress),
 		SaleState::InProgress if onchain_progress && !in_sight => {
-			t.state = Some(if expired { SaleState::Expired } else { SaleState::Open });
 			t.notice = Some(if summary.replaced { Notice::PaymentReplaced } else { Notice::PaymentDropped });
+			if ark_pending {
+				t.state = Some(SaleState::InProgress);
+				t.ark_progress = true;
+			} else {
+				t.state = Some(if expired { SaleState::Expired } else { SaleState::Open });
+			}
 		},
 		_ => {},
 	}
@@ -439,33 +449,38 @@ mod test {
 	fn sale_stages() {
 		let a = Amount::from_sat(1000);
 		// Seen in the mempool: in progress, never paid.
-		let t = next_onchain_state(Open, a, true, false, &summary(0, 1000, false));
+		let t = next_onchain_state(Open, a, true, false, false, &summary(0, 1000, false));
 		assert_eq!(t.state, Some(InProgress));
 		assert!(!t.counts_as_paid);
 		// Below the amount: stays open.
-		let t = next_onchain_state(Open, a, true, false, &summary(0, 999, false));
+		let t = next_onchain_state(Open, a, true, false, false, &summary(0, 999, false));
 		assert_eq!(t.state, None);
 		// An in-progress sale outlives its expiry.
-		let t = next_onchain_state(InProgress, a, true, true, &summary(0, 1000, false));
+		let t = next_onchain_state(InProgress, a, true, false, true, &summary(0, 1000, false));
 		assert_eq!(t.state, None);
 		// Paid at 1 confirmation, for good.
-		let t = next_onchain_state(InProgress, a, true, true, &summary(1000, 0, false));
+		let t = next_onchain_state(InProgress, a, true, false, true, &summary(1000, 0, false));
 		assert_eq!((t.state, t.counts_as_paid), (Some(Paid), true));
 		// A paid sale never changes, even if its payment leaves the chain.
 		for gone in [summary(0, 1000, false), summary(0, 0, true), summary(1000, 0, false)] {
-			assert_eq!(next_onchain_state(Paid, a, false, true, &gone), Transition::default());
+			assert_eq!(next_onchain_state(Paid, a, false, false, true, &gone), Transition::default());
 		}
 		// Replaced: back to open, or expired, with a notice.
-		let t = next_onchain_state(InProgress, a, true, false, &summary(0, 0, true));
+		let t = next_onchain_state(InProgress, a, true, false, false, &summary(0, 0, true));
 		assert_eq!((t.state, t.notice), (Some(Open), Some(Notice::PaymentReplaced)));
-		let t = next_onchain_state(InProgress, a, true, true, &summary(0, 0, false));
+		let t = next_onchain_state(InProgress, a, true, false, true, &summary(0, 0, false));
 		assert_eq!((t.state, t.notice), (Some(Expired), Some(Notice::PaymentDropped)));
+		// The on-chain payment goes away while barkd shows an Ark payment
+		// awaiting delivery: the sale stays in progress for that one.
+		let t = next_onchain_state(InProgress, a, true, true, true, &summary(0, 0, true));
+		assert_eq!((t.state, t.ark_progress), (Some(InProgress), true));
+		assert_eq!(t.notice, Some(Notice::PaymentReplaced));
 		// An Ark payment awaiting delivery is not undone by the address.
-		let t = next_onchain_state(InProgress, a, false, false, &summary(0, 0, false));
+		let t = next_onchain_state(InProgress, a, false, false, false, &summary(0, 0, false));
 		assert_eq!(t.state, None);
 		// Ended sales do not change: a later payment is a late payment.
 		for s in [Expired, Canceled] {
-			let t = next_onchain_state(s, a, true, true, &summary(1000, 0, false));
+			let t = next_onchain_state(s, a, true, false, true, &summary(1000, 0, false));
 			assert_eq!(t, Transition::default());
 		}
 	}

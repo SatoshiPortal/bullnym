@@ -279,30 +279,35 @@ const MAX_ADDRESS_SKIPS: u32 = 1_000;
 /// address belongs to one sale and a payment to it counts for that sale
 /// only. The address stays locked until `tx` commits the sale's row with
 /// it, so simultaneous checkouts of two such stores cannot both take it.
+/// Skipped indexes stay used up in `tx` even when this fails, so a caller
+/// that commits `tx` keeps the progress through an occupied range.
 async fn next_address(
 	app: &App,
 	tx: &mut tokio_postgres::Transaction<'_>,
 	store: &Store,
 ) -> anyhow::Result<(i64, bitcoin::Address)> {
 	let desc = StoreDescriptor::parse(&store.onchain_descriptor).context("store has an invalid descriptor")?;
-	let sp = tx.savepoint("onchain_index").await?;
 	for _ in 0..=MAX_ADDRESS_SKIPS {
-		let index: i64 = sp.query_one("
-			UPDATE store SET next_onchain_index = next_onchain_index + 1, updated_at = NOW()
-			WHERE id = $1 RETURNING next_onchain_index - 1 AS idx
-		", &[&store.id]).await?.get("idx");
+		// Locking the store row serializes the store's allocations.
+		let index: i64 = tx.query_one(
+			"SELECT next_onchain_index FROM store WHERE id = $1 FOR UPDATE", &[&store.id],
+		).await?.get(0);
 		let address = desc.address(u32::try_from(index).context("on-chain index overflow")?, app.cfg.network)?;
 		let text = address.to_string();
-		sp.execute(
+		tx.execute(
 			"SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)", &[&format!("bullnym:address:{}", text)],
 		).await?;
-		let taken: bool = sp.query_one(
+		let taken: bool = tx.query_one(
 			"SELECT EXISTS (SELECT 1 FROM sale_payment WHERE onchain_address = $1)", &[&text],
 		).await?.get(0);
+		let next = "UPDATE store SET next_onchain_index = $2, updated_at = NOW() WHERE id = $1";
 		if taken {
 			tracing::info!("store {} skips index {}: another sale has its address", store.id, index);
+			tx.execute(next, &[&store.id, &(index + 1)]).await?;
 			continue;
 		}
+		let sp = tx.savepoint("onchain_index").await?;
+		sp.execute(next, &[&store.id, &(index + 1)]).await?;
 		app.public.chain.watch(&address).await?;
 		sp.commit().await?;
 		return Ok((index, address));
@@ -412,7 +417,16 @@ pub async fn add_onchain(app: &App, public_id: &str) -> ApiResult<Sale> {
 		if !app.protect.health.onchain() {
 			return Err(ApiError::Upstream(anyhow::anyhow!("bitcoind is unhealthy")));
 		}
-		let (index, address) = next_address(app, &mut tx, &store).await.map_err(ApiError::Upstream)?;
+		let (index, address) = match next_address(app, &mut tx, &store).await {
+			Ok(taken) => taken,
+			Err(e) => {
+				// Keep the indexes skipped because other sales have them.
+				if let Err(c) = tx.commit().await {
+					tracing::warn!("keeping the skipped indexes of store {} failed: {}", store.id, c);
+				}
+				return Err(ApiError::Upstream(e));
+			},
+		};
 		// The address column is unique: should another sale have the address
 		// after all, this call fails and the sale keeps its invoice only.
 		tx.execute("

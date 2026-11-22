@@ -283,6 +283,8 @@ pub struct WatchedPayment {
 	pub onchain_address: Option<String>,
 	pub received_sat: i64,
 	pub pending_sat: i64,
+	/// barkd showed an Ark transfer of the invoice awaiting delivery.
+	pub awaiting_delivery: bool,
 	pub settled: bool,
 }
 
@@ -300,6 +302,7 @@ impl WatchedPayment {
 			onchain_address: row.get("onchain_address"),
 			received_sat: row.get("received_sat"),
 			pending_sat: row.get("pending_sat"),
+			awaiting_delivery: row.get::<_, Option<DateTime<Utc>>>("awaiting_delivery_at").is_some(),
 			settled: row.get::<_, Option<DateTime<Utc>>>("settled_at").is_some(),
 		}
 	}

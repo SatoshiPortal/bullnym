@@ -33,7 +33,10 @@ user = "bullnym"
 max_connections = 10
 
 # The private barkd that issues the forwarding invoices and forwards the
-# payments to the owners. It needs no funds. Do not expose it publicly.
+# payments to the owners. It needs no funds. Do not expose it publicly. Run
+# it with daemon_sync_interval_secs = 5 in its own config.toml: a sale paid
+# over Ark counts once barkd settles the receive, and barkd checks on that
+# interval.
 [barkd]
 url = "http://127.0.0.1:3000"
 # The barkd bearer token.

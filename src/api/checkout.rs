@@ -161,16 +161,18 @@ pub async fn check_pin(
 		return Err(bad_request("the PIN is too long").into());
 	}
 	let scopes = pin::scopes(store.id, &caller.source);
-	let hash: Option<String> = {
-		let conn = app.public.db.conn().await?;
-		// The backoff holds for every caller, certified or not.
-		let locked = pin::locked_for(&*conn, &scopes).await?;
-		if locked > 0 {
-			return Err(PinRefusal::Locked { retry_after: locked });
-		}
-		conn.query_one("SELECT cashier_pin_hash FROM store WHERE id = $1", &[&store.id]).await
-			.map_err(ApiError::from)?.get("cashier_pin_hash")
-	};
+	// The check is admitted, verified and counted in one transaction that
+	// holds the store's and the source's counters, so concurrent checks
+	// cannot pass the limits together. The backoff holds for every caller,
+	// certified or not.
+	let mut conn = app.public.db.conn().await?;
+	let tx = conn.transaction().await.map_err(ApiError::from)?;
+	let locked = pin::admit(&tx, &scopes).await?;
+	if locked > 0 {
+		return Err(PinRefusal::Locked { retry_after: locked });
+	}
+	let hash: Option<String> = tx.query_one("SELECT cashier_pin_hash FROM store WHERE id = $1", &[&store.id])
+		.await.map_err(ApiError::from)?.get("cashier_pin_hash");
 	let Some(hash) = hash else {
 		return Err(not_found("the owner has not set a cashier PIN").into());
 	};
@@ -178,11 +180,12 @@ pub async fn check_pin(
 	let matches = tokio::task::spawn_blocking(move || pin::verify(&given, &hash)).await
 		.map_err(|e| anyhow::anyhow!("PIN check task: {}", e))?;
 	if !matches {
-		let mut conn = app.public.db.conn().await?;
-		let retry_after = pin::record_failure(&mut conn, &scopes).await?;
+		let retry_after = pin::record_failure(&tx, &scopes).await?;
+		tx.commit().await.map_err(ApiError::from)?;
 		tracing::info!("wrong cashier PIN for store {} from {}", store.id, caller.source);
 		return Err(PinRefusal::Wrong { retry_after });
 	}
+	tx.commit().await.map_err(ApiError::from)?;
 	Ok(Json(json!({ "ok": true })))
 }
 
@@ -256,7 +259,7 @@ pub async fn cancel_sale(
 	if let Some(hash) = watcher::invoice_hash(&app.public, sale.id).await? {
 		match watcher::cancel_invoice(&app.public, &hash).await {
 			Ok(()) => {},
-			Err(watcher::CancelError::PaymentArriving) => {
+			Err(watcher::CancelError::PaymentArriving | watcher::CancelError::UnknownState) => {
 				return Err(conflict("a payment is arriving for this sale"));
 			},
 			Err(watcher::CancelError::Unavailable(e)) => return Err(ApiError::Upstream(e)),

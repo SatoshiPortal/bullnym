@@ -22,6 +22,9 @@ use crate::{nym, silent_payment};
 /// The longest display name.
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
+/// The advisory lock under which the nym cap is counted and a nym inserted.
+const NYM_CAP_LOCK: &str = "bullnym:nym-cap";
+
 #[derive(Deserialize)]
 pub struct RegisterRequest {
 	registration: NymRegistration,
@@ -76,14 +79,18 @@ pub async fn register(
 		.map_err(|e| bad_request(format!("the Silent Payment address is not valid: {}", e)))?;
 	check_registration(&app, &caller, &reg.ark_address).await?;
 
-	let conn = app.public.db.conn().await?;
-	let nyms: i64 = conn.query_one("SELECT count(*) FROM nym", &[]).await?.get(0);
+	// The cap is counted and the nym inserted in one transaction, under a
+	// lock, so simultaneous registrations cannot pass the cap together.
+	let mut conn = app.public.db.conn().await?;
+	let tx = conn.transaction().await?;
+	tx.execute("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)", &[&NYM_CAP_LOCK]).await?;
+	let nyms: i64 = tx.query_one("SELECT count(*) FROM nym", &[]).await?.get(0);
 	if nyms as u64 >= app.protect.limits.max_nyms {
 		return Err(conflict("the service is not taking new registrations"));
 	}
 	// The unique constraints refuse a second nym for one address and a
 	// second address for one nym, even under concurrent registrations.
-	let row = conn.query_opt(&format!("
+	let row = tx.query_opt(&format!("
 		INSERT INTO nym AS n (name, ark_address, silent_payment_address, registration_timestamp,
 			registration_signature)
 		VALUES ($1, $2, $3, $4, $5)
@@ -96,7 +103,7 @@ pub async fn register(
 	let nym = match row {
 		Some(row) => Nym::from_row(&row),
 		None => {
-			let taken = conn.query_opt("SELECT 1 FROM nym WHERE name = $1", &[&reg.nym]).await?;
+			let taken = tx.query_opt("SELECT 1 FROM nym WHERE name = $1", &[&reg.nym]).await?;
 			return Err(conflict(if taken.is_some() {
 				"this nym is taken"
 			} else {
@@ -104,6 +111,7 @@ pub async fn register(
 			}));
 		},
 	};
+	tx.commit().await?;
 	tracing::info!("registered nym {}", nym.name);
 	Ok(Json(json!({ "nym": NymView::new(&app, &nym, None) })))
 }
