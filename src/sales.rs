@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio_postgres::GenericClient;
 
 use crate::App;
-use crate::database::{Rail, SALE_SELECT, Sale, SaleState, Store};
+use crate::database::{CheckoutLink, Rail, SALE_SELECT, Sale, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, not_found};
 use crate::money::{Decimal, currency_decimals};
 use crate::rails::onchain::StoreDescriptor;
@@ -23,6 +23,15 @@ pub const MAX_MEMO_CHARS: usize = 200;
 pub enum SaleAmount {
 	Fiat(Decimal),
 	Sat(Amount),
+}
+
+/// A sale to create.
+#[derive(Debug, Clone)]
+pub struct NewSale {
+	pub link: CheckoutLink,
+	pub cashier_name: Option<String>,
+	pub amount: SaleAmount,
+	pub memo: Option<String>,
 }
 
 /// The sale as the API shows it.
@@ -39,12 +48,12 @@ pub struct SaleView {
 	pub memo: Option<String>,
 	pub payment_request: String,
 	pub lightning_invoice: Option<String>,
-	pub ark_invoice: Option<String>,
 	pub onchain_address: Option<String>,
 	pub paid_at: Option<DateTime<Utc>>,
 	pub paid_rail: Option<Rail>,
 	pub received_sat: i64,
-	pub device_name: Option<String>,
+	pub link: CheckoutLink,
+	pub cashier_name: Option<String>,
 }
 
 impl From<Sale> for SaleView {
@@ -53,7 +62,6 @@ impl From<Sale> for SaleView {
 			s.onchain_address.as_deref(),
 			Amount::from_sat(s.amount_sat as u64),
 			s.lightning_invoice.as_deref(),
-			s.ark_invoice.as_deref(),
 		);
 		SaleView {
 			id: s.public_id,
@@ -67,24 +75,23 @@ impl From<Sale> for SaleView {
 			memo: s.memo,
 			payment_request,
 			lightning_invoice: s.lightning_invoice,
-			ark_invoice: s.ark_invoice,
 			onchain_address: s.onchain_address,
 			paid_at: s.paid_at,
 			paid_rail: s.paid_rail,
 			received_sat: s.received_sat,
-			device_name: s.device_name,
+			link: s.link,
+			cashier_name: s.cashier_name,
 		}
 	}
 }
 
 /// The BIP 321 URI of a sale. The address and amount are only present when
-/// the sale offers on-chain. Every Lightning wallet reads `lightning`; only
-/// a scuttle wallet reads `ark-lightning`.
+/// the sale offers on-chain. The one invoice serves every Lightning wallet,
+/// and a Scuttle wallet pays it over Ark through its route hint.
 pub fn payment_request(
 	onchain_address: Option<&str>,
 	amount: Amount,
 	lightning: Option<&str>,
-	ark_lightning: Option<&str>,
 ) -> String {
 	let mut params = Vec::new();
 	if onchain_address.is_some() {
@@ -92,9 +99,6 @@ pub fn payment_request(
 	}
 	if let Some(inv) = lightning {
 		params.push(format!("lightning={}", inv));
-	}
-	if let Some(inv) = ark_lightning {
-		params.push(format!("ark-lightning={}", inv));
 	}
 	let mut uri = format!("bitcoin:{}", onchain_address.unwrap_or(""));
 	if !params.is_empty() {
@@ -114,20 +118,13 @@ fn btc_amount(amount: Amount) -> String {
 	}
 }
 
-/// Creates a sale with all the rails it offers.
-pub async fn create_sale(
+/// The sat amount of a new sale, and its fiat amount and rate when it was
+/// keyed in fiat.
+async fn resolve_amount(
 	app: &App,
 	store: &Store,
-	device_id: Option<i64>,
 	amount: SaleAmount,
-	memo: Option<String>,
-	lightning_only: bool,
-) -> ApiResult<Sale> {
-	let memo = memo.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
-	if memo.as_ref().is_some_and(|m| m.chars().count() > MAX_MEMO_CHARS) {
-		return Err(bad_request(format!("the memo is longer than {} characters", MAX_MEMO_CHARS)));
-	}
-
+) -> ApiResult<(Amount, Option<(Decimal, Decimal)>)> {
 	let (amount_sat, fiat) = match amount {
 		SaleAmount::Sat(sat) => (sat, None),
 		SaleAmount::Fiat(fiat) => {
@@ -148,32 +145,35 @@ pub async fn create_sale(
 	if amount_sat == Amount::ZERO {
 		return Err(bad_request("the amount must be at least 1 sat"));
 	}
+	Ok((amount_sat, fiat))
+}
+
+/// Creates a sale with all the rails it offers: one invoice for Lightning
+/// and Ark payers, and an address above the store's on-chain minimum.
+pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sale> {
+	let memo = new.memo.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+	if memo.as_ref().is_some_and(|m| m.chars().count() > MAX_MEMO_CHARS) {
+		return Err(bad_request(format!("the memo is longer than {} characters", MAX_MEMO_CHARS)));
+	}
+	let (amount_sat, fiat) = resolve_amount(app, store, new.amount).await?;
 
 	let ark_address = ark::Address::from_str(&store.ark_address)
 		.context("store has an invalid Ark address")?;
 	let expiry = app.cfg.sales.expiry();
 	let description = Some(memo.clone().unwrap_or_else(|| store.name.clone()));
 
-	// The invoices are created first: they need the network, and an invoice
-	// left over from a failed insert just expires.
-	let hinted = async {
-		if lightning_only {
-			return Ok(None);
-		}
-		app.ark.create_invoice(amount_sat, &store.claim_pubkey, &store.mailbox_id, description.clone(), expiry)
-			.await.map(Some)
-	};
-	let (forward, hinted) = tokio::join!(
-		app.forwarder.create_invoice(amount_sat, &ark_address, description.clone(), expiry),
-		hinted,
-	);
-	let forward = forward.map_err(ApiError::Upstream)?;
-	let hinted = hinted.map_err(ApiError::Upstream)?;
+	// The invoice is created first: it needs the network, and an invoice
+	// left over from a failed insert just expires. It names the owner's
+	// address as its Ark hint (S1), so one invoice serves Lightning and Ark
+	// payers.
+	let invoice = app.forwarder.create_invoice(
+		amount_sat, &ark_address, description, expiry, true,
+	).await.map_err(ApiError::Upstream)?;
 
 	let mut conn = app.db.conn().await?;
 	let tx = conn.transaction().await?;
 
-	let onchain = if !lightning_only && amount_sat.to_sat() >= store.onchain_min_sat as u64 {
+	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 {
 		// Each on-chain sale reserves its own index, so two open sales never
 		// share an address.
 		let row = tx.query_one("
@@ -193,12 +193,12 @@ pub async fn create_sale(
 
 	let public_id = token::random_hex(16);
 	let row = tx.query_one("
-		INSERT INTO sale (public_id, store_id, device_id, amount_sat, fiat_amount, currency,
-			btc_price, memo, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + make_interval(secs => $9))
+		INSERT INTO sale (public_id, store_id, link, cashier_name, amount_sat, fiat_amount,
+			currency, btc_price, memo, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + make_interval(secs => $10))
 		RETURNING id
 	", &[
-		&public_id, &store.id, &device_id, &(amount_sat.to_sat() as i64),
+		&public_id, &store.id, &new.link, &new.cashier_name, &(amount_sat.to_sat() as i64),
 		&fiat.as_ref().map(|(f, _)| f.to_string()),
 		&fiat.as_ref().map(|_| store.currency.clone()),
 		&fiat.as_ref().map(|(_, p)| p.to_string()),
@@ -206,13 +206,10 @@ pub async fn create_sale(
 	]).await?;
 	let sale_id = row.get::<_, i64>("id");
 
-	let invoices = [(Rail::Lightning, Some(&forward)), (Rail::Ark, hinted.as_ref())];
-	for (rail, invoice) in invoices.into_iter().filter_map(|(r, i)| Some((r, i?))) {
-		tx.execute("
-			INSERT INTO sale_payment (sale_id, rail, payment_hash, invoice)
-			VALUES ($1, $2, $3, $4)
-		", &[&sale_id, &rail, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
-	}
+	tx.execute("
+		INSERT INTO sale_payment (sale_id, rail, payment_hash, invoice)
+		VALUES ($1, 'lightning', $2, $3)
+	", &[&sale_id, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
 	if let Some((index, address)) = &onchain {
 		tx.execute("
 			INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
@@ -230,12 +227,10 @@ pub async fn get_sale_by_id(conn: &impl GenericClient, id: i64) -> anyhow::Resul
 	Ok(Sale::from_row(&row))
 }
 
-/// A sale of `store` by its public id.
-pub async fn get_sale(conn: &impl GenericClient, store_id: i64, public_id: &str) -> ApiResult<Sale> {
-	let row = conn.query_opt(
-		&format!("{} WHERE s.store_id = $1 AND s.public_id = $2", SALE_SELECT),
-		&[&store_id, &public_id],
-	).await?;
+/// A sale by its public id. Holding the id is what lets a cashier follow
+/// and cancel a sale.
+pub async fn get_sale(conn: &impl GenericClient, public_id: &str) -> ApiResult<Sale> {
+	let row = conn.query_opt(&format!("{} WHERE s.public_id = $1", SALE_SELECT), &[&public_id]).await?;
 	row.map(|r| Sale::from_row(&r)).ok_or_else(|| not_found("no such sale"))
 }
 
@@ -268,7 +263,8 @@ pub async fn sales_csv(
 		ORDER BY s.id
 	", SALE_SELECT), &[&store_id, &from, &to]).await?;
 	let mut out = String::from(
-		"id,created_at,paid_at,state,paid_rail,amount_sat,received_sat,fiat_amount,currency,btc_price,memo,device_name\n",
+		"id,created_at,paid_at,state,paid_rail,amount_sat,received_sat,fiat_amount,currency,\
+		btc_price,memo,link,cashier_name\n",
 	);
 	for row in rows {
 		let s = Sale::from_row(&row);
@@ -284,7 +280,8 @@ pub async fn sales_csv(
 			s.currency.unwrap_or_default(),
 			s.btc_price.unwrap_or_default(),
 			s.memo.unwrap_or_default(),
-			s.device_name.unwrap_or_default(),
+			s.link.as_str().to_string(),
+			s.cashier_name.unwrap_or_default(),
 		];
 		out.push_str(&fields.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(","));
 		out.push('\n');
@@ -310,12 +307,19 @@ mod test {
 	#[test]
 	fn builds_payment_requests() {
 		assert_eq!(
-			payment_request(Some("bc1qaddr"), Amount::from_sat(35_000), Some("lnbc1a"), Some("lnbc1d")),
-			"bitcoin:bc1qaddr?amount=0.00035&lightning=lnbc1a&ark-lightning=lnbc1d",
+			payment_request(Some("bc1qaddr"), Amount::from_sat(35_000), Some("lnbc1a")),
+			"bitcoin:bc1qaddr?amount=0.00035&lightning=lnbc1a",
 		);
 		assert_eq!(
-			payment_request(None, Amount::from_sat(1_000), Some("lnbc1a"), Some("lnbc1d")),
-			"bitcoin:?lightning=lnbc1a&ark-lightning=lnbc1d",
+			payment_request(None, Amount::from_sat(1_000), Some("lnbc1a")),
+			"bitcoin:?lightning=lnbc1a",
+		);
+		// One invoice only: no second Ark invoice.
+		assert!(!payment_request(None, Amount::from_sat(1_000), Some("lnbc1a")).contains("ark-lightning"));
+		// On-chain only, when the invoice rail is unavailable.
+		assert_eq!(
+			payment_request(Some("bc1qaddr"), Amount::from_sat(100_000_000), None),
+			"bitcoin:bc1qaddr?amount=1",
 		);
 		assert_eq!(btc_amount(Amount::from_sat(100_000_000)), "1");
 		assert_eq!(btc_amount(Amount::from_sat(1)), "0.00000001");

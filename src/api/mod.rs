@@ -1,8 +1,19 @@
-//! The posd HTTP API. The contract is in `pos/docs/api.md`.
+//! The HTTP API. The contract is in `docs/api.md`.
+//!
+//! - `/api/v1/nym`: the Lightning Address registration and lookup.
+//! - `/api/v1/stores`: posd's store registration.
+//! - `/api/v1/owner/...`: everything behind the owner login, including the
+//!   sales history and CSV.
+//! - `/api/v1/checkout/<nym>/...` and `/api/v1/links/<secret>/...`: the
+//!   cashier link, which is also the public checkout. It needs no token.
+//! - `/api/v1/sales/<id>`: following and canceling one sale, for whoever
+//!   holds its unguessable id.
+//! - LNURL: `/.well-known/lnurlp/<nym>` and its callback.
 
+mod checkout;
 mod lnurl;
+mod nym;
 mod owner;
-mod terminal;
 mod web;
 
 use std::sync::Arc;
@@ -11,40 +22,45 @@ use axum::Router;
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
+use serde::Serialize;
 
 use crate::App;
-use crate::database::{Device, STORE_COLUMNS, Store};
-use crate::error::ApiError;
+use crate::database::{NYM_COLUMNS, Nym, STORE_COLUMNS, Store};
+use crate::error::{ApiError, ApiResult, not_found};
 use crate::token;
 
 
 pub fn router(app: Arc<App>) -> Router {
 	let api = Router::new()
-		.route("/pair", post(terminal::pair))
-		.route("/terminal", get(terminal::terminal))
-		.route("/rate", get(terminal::rate))
-		.route("/sales", post(terminal::create_sale).get(terminal::list_sales))
-		.route("/sales.csv", get(terminal::sales_csv))
-		.route("/sales/{id}", get(terminal::get_sale))
-		.route("/sales/{id}/cancel", post(terminal::cancel_sale))
-		.route("/stores", post(owner::register))
+		.route("/nym", post(nym::register))
+		.route("/nym/{nym}", get(nym::lookup))
+		.route("/stores", post(owner::register_store))
 		.route("/owner/challenge", post(owner::challenge))
 		.route("/owner/login", post(owner::login))
+		.route("/owner/nym", get(nym::get_own).patch(nym::update_own))
+		.route("/owner/nym/payments", get(nym::list_payments))
 		.route("/owner/store", get(owner::get_store).patch(owner::update_store))
-		.route("/owner/invites", post(owner::create_invite))
-		.route("/owner/devices", get(owner::list_devices))
-		.route("/owner/devices/{id}", delete(owner::revoke_device))
+		.route("/owner/store/unlisted-link",
+			post(owner::rotate_unlisted_link).delete(owner::remove_unlisted_link))
 		.route("/owner/sales", get(owner::list_sales))
 		.route("/owner/sales.csv", get(owner::sales_csv))
-		.route("/lnurlp/{name}/callback", get(lnurl::callback))
+		.route("/checkout/{nym}", get(checkout::public_store))
+		.route("/checkout/{nym}/rate", get(checkout::public_rate))
+		.route("/checkout/{nym}/sales", post(checkout::public_create_sale))
+		.route("/links/{secret}", get(checkout::unlisted_store))
+		.route("/links/{secret}/rate", get(checkout::unlisted_rate))
+		.route("/links/{secret}/sales", post(checkout::unlisted_create_sale))
+		.route("/sales/{id}", get(checkout::get_sale))
+		.route("/sales/{id}/cancel", post(checkout::cancel_sale))
+		.route("/lnurlp/{nym}/callback", get(lnurl::callback))
 		.fallback(|| async { ApiError::NotFound("no such endpoint".into()) });
 
 	Router::new()
 		.nest("/api/v1", api)
-		.route("/.well-known/lnurlp/{name}", get(lnurl::pay_request))
-		.route("/pair/{code}/manifest.webmanifest", get(web::pair_manifest))
-		.route("/pair/{code}", get(web::index))
+		.route("/.well-known/lnurlp/{nym}", get(lnurl::pay_request))
+		.route("/c/{secret}/manifest.webmanifest", get(web::unlisted_manifest))
+		.route("/{nym}/manifest.webmanifest", get(web::public_manifest))
 		.fallback(web::asset)
 		.with_state(app)
 }
@@ -58,40 +74,11 @@ fn bearer(parts: &Parts) -> Result<&str, ApiError> {
 		.ok_or(ApiError::Unauthorized)
 }
 
-/// A paired terminal, from its bearer token.
-pub struct Terminal {
-	pub device: Device,
-	pub store: Store,
-}
-
-impl FromRequestParts<Arc<App>> for Terminal {
-	type Rejection = ApiError;
-
-	async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
-		let hash = token::hash(bearer(parts)?);
-		let conn = app.db.conn().await?;
-		let row = conn.query_opt(&format!("
-			SELECT {}, d.id AS device_id, d.store_id AS device_store_id, d.name AS device_name,
-				d.created_at AS device_created_at, d.revoked_at AS device_revoked_at
-			FROM device d JOIN store s ON s.id = d.store_id
-			WHERE d.token_hash = $1 AND d.revoked_at IS NULL
-		", STORE_COLUMNS), &[&hash]).await?.ok_or(ApiError::Unauthorized)?;
-		Ok(Terminal {
-			device: Device {
-				id: row.get("device_id"),
-				store_id: row.get("device_store_id"),
-				name: row.get("device_name"),
-				created_at: row.get("device_created_at"),
-				revoked_at: row.get("device_revoked_at"),
-			},
-			store: Store::from_row(&row),
-		})
-	}
-}
-
-/// The owner of a store, from an owner session token.
+/// The owner of a nym, from an owner session token. The owner of the nym
+/// also owns its store, if it has one.
 pub struct Owner {
-	pub store: Store,
+	pub nym: Nym,
+	pub store: Option<Store>,
 }
 
 impl FromRequestParts<Arc<App>> for Owner {
@@ -101,32 +88,57 @@ impl FromRequestParts<Arc<App>> for Owner {
 		let hash = token::hash(bearer(parts)?);
 		let conn = app.db.conn().await?;
 		let row = conn.query_opt(&format!("
-			SELECT {} FROM owner_session o JOIN store s ON s.id = o.store_id
+			SELECT {} FROM owner_session o JOIN nym n ON n.id = o.nym_id
 			WHERE o.token_hash = $1 AND o.expires_at > NOW()
-		", STORE_COLUMNS), &[&hash]).await?.ok_or(ApiError::Unauthorized)?;
-		Ok(Owner { store: Store::from_row(&row) })
+		", NYM_COLUMNS), &[&hash]).await?.ok_or(ApiError::Unauthorized)?;
+		let nym = Nym::from_row(&row);
+		let store = store_of_nym(&*conn, nym.id).await?;
+		Ok(Owner { nym, store })
 	}
 }
 
-/// How a store looks to the API.
-#[derive(Debug, serde::Serialize)]
+impl Owner {
+	pub fn store(&self) -> ApiResult<&Store> {
+		self.store.as_ref().ok_or_else(|| not_found("this nym has no store"))
+	}
+}
+
+pub async fn store_of_nym(
+	conn: &impl tokio_postgres::GenericClient,
+	nym_id: i64,
+) -> ApiResult<Option<Store>> {
+	let row = conn.query_opt(&format!(
+		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.nym_id = $1", STORE_COLUMNS,
+	), &[&nym_id]).await?;
+	Ok(row.map(|r| Store::from_row(&r)))
+}
+
+/// How a store looks to anyone with its cashier link.
+#[derive(Debug, Serialize)]
 pub struct StoreView {
 	pub name: String,
+	pub nym: String,
+	/// Always the nym: a store has no Lightning address of its own.
+	pub lightning_address: String,
 	pub currency: String,
 	pub onchain_min_sat: i64,
-	pub lightning_address: Option<String>,
 }
 
 impl StoreView {
 	pub fn new(app: &App, store: &Store) -> StoreView {
 		StoreView {
 			name: store.name.clone(),
+			nym: store.nym.clone(),
+			lightning_address: lightning_address(app, &store.nym),
 			currency: store.currency.clone(),
 			onchain_min_sat: store.onchain_min_sat,
-			lightning_address: store.lightning_address_name.as_ref()
-				.map(|n| format!("{}@{}", n, public_host(app))),
 		}
 	}
+}
+
+/// `<nym>@<domain>`.
+pub fn lightning_address(app: &App, nym: &str) -> String {
+	format!("{}@{}", nym, public_host(app))
 }
 
 /// The host of the public URL, for the Lightning address.
@@ -137,4 +149,9 @@ pub fn public_host(app: &App) -> String {
 			None => h.to_string(),
 		}))
 		.unwrap_or_default()
+}
+
+/// The public base URL, without a trailing slash.
+pub fn public_url(app: &App) -> &str {
+	app.cfg.http.public_url.trim_end_matches('/')
 }

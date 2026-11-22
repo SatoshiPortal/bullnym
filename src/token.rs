@@ -10,10 +10,9 @@ pub fn new_token() -> String {
 	random_hex(32)
 }
 
-/// A new pairing code. It is shorter than a token because people may type
-/// it, and it is single-use and expires.
-pub fn new_code() -> String {
-	random_hex(12)
+/// The secret of a new unlisted cashier link: 16 random bytes, as hex.
+pub fn new_link_secret() -> String {
+	random_hex(16)
 }
 
 pub fn random_hex(len: usize) -> String {
@@ -35,7 +34,8 @@ mod test {
 		let a = new_token();
 		assert_eq!(a.len(), 64);
 		assert_ne!(a, new_token());
-		assert_eq!(new_code().len(), 24);
+		assert_eq!(new_link_secret().len(), 32);
+		assert_ne!(new_link_secret(), new_link_secret());
 		assert_eq!(hash("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 	}
 }

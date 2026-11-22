@@ -1,42 +1,85 @@
--- A store is registered by the Ark address that receives its payments.
+-- A nym: the permanent name of a Lightning Address, registered by the Ark
+-- address that receives its payments. One nym per Ark address and one Ark
+-- address per nym. Only the display name ever changes.
+CREATE TABLE nym (
+	id BIGSERIAL PRIMARY KEY,
+	name TEXT NOT NULL UNIQUE,
+	ark_address TEXT NOT NULL UNIQUE,
+	silent_payment_address TEXT NOT NULL,
+	display_name TEXT,
+	registration_timestamp BIGINT NOT NULL,
+	registration_signature TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	-- Lets a store require the nym's own Ark address.
+	UNIQUE (id, ark_address)
+);
+
+CREATE FUNCTION nym_is_permanent() RETURNS trigger AS $$
+BEGIN
+	IF TG_OP = 'DELETE' THEN
+		RAISE EXCEPTION 'a nym cannot be deleted';
+	END IF;
+	IF NEW.name IS DISTINCT FROM OLD.name
+		OR NEW.ark_address IS DISTINCT FROM OLD.ark_address
+		OR NEW.silent_payment_address IS DISTINCT FROM OLD.silent_payment_address
+		OR NEW.registration_timestamp IS DISTINCT FROM OLD.registration_timestamp
+		OR NEW.registration_signature IS DISTINCT FROM OLD.registration_signature
+	THEN
+		RAISE EXCEPTION 'the name and destinations of a nym cannot change';
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER nym_is_permanent BEFORE UPDATE OR DELETE ON nym
+	FOR EACH ROW EXECUTE FUNCTION nym_is_permanent();
+
+-- A store: at most one per nym, paid at the nym's Ark address.
 CREATE TABLE store (
 	id BIGSERIAL PRIMARY KEY,
+	nym_id BIGINT NOT NULL UNIQUE,
 	name TEXT NOT NULL,
 	ark_address TEXT NOT NULL UNIQUE,
-	claim_pubkey TEXT NOT NULL,
-	mailbox_id TEXT NOT NULL,
 	onchain_descriptor TEXT NOT NULL,
-	-- The next derivation index to reserve for an on-chain sale.
+	-- The extended public key of the descriptor. A store's on-chain account
+	-- is its own: no two stores share one.
+	onchain_xpub TEXT NOT NULL UNIQUE,
+	-- The next derivation index to hand out for an on-chain sale.
 	next_onchain_index BIGINT NOT NULL DEFAULT 0,
 	currency TEXT NOT NULL,
 	onchain_min_sat BIGINT NOT NULL,
-	lightning_address_name TEXT UNIQUE,
+	-- Whether anyone can open the store's checkout under its nym.
+	public_checkout BOOLEAN NOT NULL DEFAULT TRUE,
+	-- The hash of the secret of the unlisted cashier link, if there is one.
+	unlisted_link_hash TEXT UNIQUE,
+	registration_timestamp BIGINT NOT NULL,
 	registration_signature TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	FOREIGN KEY (nym_id, ark_address) REFERENCES nym (id, ark_address)
 );
 
--- A paired terminal. Only the hash of its token is stored.
-CREATE TABLE device (
-	id BIGSERIAL PRIMARY KEY,
-	store_id BIGINT NOT NULL REFERENCES store(id),
-	name TEXT NOT NULL,
-	token_hash TEXT NOT NULL UNIQUE,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	revoked_at TIMESTAMPTZ
-);
-CREATE INDEX device_store_id_idx ON device (store_id);
+CREATE FUNCTION store_is_permanent() RETURNS trigger AS $$
+BEGIN
+	IF TG_OP = 'DELETE' THEN
+		RAISE EXCEPTION 'a store cannot be deleted';
+	END IF;
+	IF NEW.nym_id IS DISTINCT FROM OLD.nym_id
+		OR NEW.ark_address IS DISTINCT FROM OLD.ark_address
+		OR NEW.onchain_descriptor IS DISTINCT FROM OLD.onchain_descriptor
+		OR NEW.onchain_xpub IS DISTINCT FROM OLD.onchain_xpub
+		OR NEW.registration_timestamp IS DISTINCT FROM OLD.registration_timestamp
+		OR NEW.registration_signature IS DISTINCT FROM OLD.registration_signature
+	THEN
+		RAISE EXCEPTION 'the nym and destinations of a store cannot change';
+	END IF;
+	RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
 
--- A single-use pairing code.
-CREATE TABLE invite (
-	id BIGSERIAL PRIMARY KEY,
-	store_id BIGINT NOT NULL REFERENCES store(id),
-	code_hash TEXT NOT NULL UNIQUE,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	expires_at TIMESTAMPTZ NOT NULL,
-	redeemed_at TIMESTAMPTZ,
-	device_id BIGINT REFERENCES device(id)
-);
+CREATE TRIGGER store_is_permanent BEFORE UPDATE OR DELETE ON store
+	FOR EACH ROW EXECUTE FUNCTION store_is_permanent();
 
 CREATE TABLE owner_challenge (
 	id BIGSERIAL PRIMARY KEY,
@@ -47,25 +90,50 @@ CREATE TABLE owner_challenge (
 	used_at TIMESTAMPTZ
 );
 
+-- An owner login. Only the hash of its token is stored.
 CREATE TABLE owner_session (
 	id BIGSERIAL PRIMARY KEY,
-	store_id BIGINT NOT NULL REFERENCES store(id),
+	nym_id BIGINT NOT NULL REFERENCES nym(id),
 	token_hash TEXT NOT NULL UNIQUE,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	expires_at TIMESTAMPTZ NOT NULL
 );
 
+-- An invoice of a Lightning Address payment. Ark and Silent Payment
+-- payments to a Lightning Address are not recorded: they reach the owner's
+-- wallet without the service.
+CREATE TABLE lnurl_invoice (
+	id BIGSERIAL PRIMARY KEY,
+	nym_id BIGINT NOT NULL REFERENCES nym(id),
+	payment_hash TEXT NOT NULL UNIQUE,
+	invoice TEXT NOT NULL,
+	amount_sat BIGINT NOT NULL,
+	-- open, paid or expired.
+	state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'paid', 'expired')),
+	received_sat BIGINT NOT NULL DEFAULT 0,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	expires_at TIMESTAMPTZ NOT NULL,
+	settled_at TIMESTAMPTZ
+);
+CREATE INDEX lnurl_invoice_open_idx ON lnurl_invoice (nym_id) WHERE state = 'open';
+CREATE INDEX lnurl_invoice_nym_idx ON lnurl_invoice (nym_id, id DESC);
+
 CREATE TYPE sale_state AS ENUM ('open', 'in-progress', 'paid', 'expired', 'canceled');
 CREATE TYPE payment_rail AS ENUM ('lightning', 'ark', 'onchain');
+-- How a sale was created: through the store's public checkout under its
+-- nym, or through its unlisted cashier link.
+CREATE TYPE checkout_link AS ENUM ('public', 'unlisted');
 
 CREATE TABLE sale (
 	id BIGSERIAL PRIMARY KEY,
 	-- The identifier the API shows. It is random so that sales cannot be
-	-- enumerated.
+	-- enumerated, and holding it is what lets a cashier follow or cancel
+	-- the sale.
 	public_id TEXT NOT NULL UNIQUE,
 	store_id BIGINT NOT NULL REFERENCES store(id),
-	-- No device for a Lightning address payment.
-	device_id BIGINT REFERENCES device(id),
+	link checkout_link NOT NULL,
+	-- A name typed on the cashier screen. The service never verifies it.
+	cashier_name TEXT,
 	amount_sat BIGINT NOT NULL,
 	fiat_amount TEXT,
 	currency TEXT,
@@ -82,10 +150,12 @@ CREATE TABLE sale (
 CREATE INDEX sale_store_id_idx ON sale (store_id, id DESC);
 CREATE INDEX sale_watch_idx ON sale (state, expires_at);
 
--- One row per payment rail offered for a sale.
+-- One row per payment rail offered for a sale: the invoice, which
+-- Lightning and Ark payers both pay, and the on-chain address.
 CREATE TABLE sale_payment (
 	id BIGSERIAL PRIMARY KEY,
 	sale_id BIGINT NOT NULL REFERENCES sale(id),
+	-- lightning for the invoice, onchain for the address.
 	rail payment_rail NOT NULL,
 	payment_hash TEXT UNIQUE,
 	invoice TEXT,
@@ -96,7 +166,6 @@ CREATE TABLE sale_payment (
 	received_sat BIGINT NOT NULL DEFAULT 0,
 	-- The amount in unconfirmed outputs to the address.
 	pending_sat BIGINT NOT NULL DEFAULT 0,
-	vtxo_ids TEXT[],
 	txids TEXT[],
 	settled_at TIMESTAMPTZ,
 	UNIQUE (sale_id, rail)

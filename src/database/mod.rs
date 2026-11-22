@@ -1,4 +1,4 @@
-//! The posd database.
+//! The service database.
 
 mod migrations {
 	include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
@@ -25,19 +25,24 @@ pub struct Db {
 	pool: PgPool,
 }
 
-pub async fn pool(cfg: &config::Postgres) -> anyhow::Result<PgPool> {
+pub async fn pool(cfg: &config::Postgres, max_size: u32) -> anyhow::Result<PgPool> {
 	let manager = PostgresConnectionManager::new(cfg.to_pg_config(), NoTls);
-	Pool::builder().max_size(cfg.max_connections).build(manager).await
+	Pool::builder().max_size(max_size.max(1)).build(manager).await
 		.with_context(|| format!("failed to connect to Postgres database {}", cfg.name))
 }
 
 impl Db {
 	/// Connects and runs the migrations.
-	pub async fn connect(cfg: &config::Postgres) -> anyhow::Result<Db> {
-		let pool = pool(cfg).await?;
+	pub async fn connect(cfg: &config::Postgres, max_size: u32) -> anyhow::Result<Db> {
+		let pool = pool(cfg, max_size).await?;
 		let mut conn = pool.dedicated_connection().await?;
 		migrations::runner().run_async(&mut conn).await.context("database migration failed")?;
 		Ok(Db { pool })
+	}
+
+	/// A pool of its own on the same database, without the migrations.
+	pub async fn sibling(cfg: &config::Postgres, max_size: u32) -> anyhow::Result<Db> {
+		Ok(Db { pool: pool(cfg, max_size).await? })
 	}
 
 	pub async fn conn(&self) -> anyhow::Result<PooledConnection<'_, PostgresConnectionManager<NoTls>>> {
@@ -120,55 +125,92 @@ impl Rail {
 	}
 }
 
+/// How a sale was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSql, FromSql)]
+#[postgres(name = "checkout_link")]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckoutLink {
+	/// The store's public checkout under its nym.
+	#[postgres(name = "public")]
+	Public,
+	/// The store's unlisted cashier link.
+	#[postgres(name = "unlisted")]
+	Unlisted,
+}
+
+impl CheckoutLink {
+	pub fn as_str(&self) -> &'static str {
+		match self {
+			CheckoutLink::Public => "public",
+			CheckoutLink::Unlisted => "unlisted",
+		}
+	}
+}
+
+/// A nym and its Lightning Address destinations.
 #[derive(Debug, Clone)]
-pub struct Store {
+pub struct Nym {
 	pub id: i64,
 	pub name: String,
 	pub ark_address: String,
-	pub claim_pubkey: String,
-	pub mailbox_id: String,
+	pub silent_payment_address: String,
+	pub display_name: Option<String>,
+	pub created_at: DateTime<Utc>,
+}
+
+pub const NYM_COLUMNS: &str = "n.id, n.name, n.ark_address, n.silent_payment_address, \
+	n.display_name, n.created_at";
+
+impl Nym {
+	pub fn from_row(row: &Row) -> Nym {
+		Nym {
+			id: row.get("id"),
+			name: row.get("name"),
+			ark_address: row.get("ark_address"),
+			silent_payment_address: row.get("silent_payment_address"),
+			display_name: row.get("display_name"),
+			created_at: row.get("created_at"),
+		}
+	}
+
+	/// The name payers see: the display name, or else the nym.
+	pub fn shown_name(&self) -> &str {
+		self.display_name.as_deref().unwrap_or(&self.name)
+	}
+}
+
+#[derive(Debug, Clone)]
+pub struct Store {
+	pub id: i64,
+	pub nym_id: i64,
+	pub nym: String,
+	pub name: String,
+	pub ark_address: String,
 	pub onchain_descriptor: String,
 	pub currency: String,
 	pub onchain_min_sat: i64,
-	pub lightning_address_name: Option<String>,
+	pub public_checkout: bool,
+	pub has_unlisted_link: bool,
 }
 
-pub const STORE_COLUMNS: &str = "s.id, s.name, s.ark_address, s.claim_pubkey, s.mailbox_id, \
-	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.lightning_address_name";
+/// The columns of a store joined with its nym as `n`.
+pub const STORE_COLUMNS: &str = "s.id, s.nym_id, n.name AS nym, s.name, s.ark_address, \
+	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.public_checkout, \
+	s.unlisted_link_hash IS NOT NULL AS has_unlisted_link";
 
 impl Store {
 	pub fn from_row(row: &Row) -> Store {
 		Store {
 			id: row.get("id"),
+			nym_id: row.get("nym_id"),
+			nym: row.get("nym"),
 			name: row.get("name"),
 			ark_address: row.get("ark_address"),
-			claim_pubkey: row.get("claim_pubkey"),
-			mailbox_id: row.get("mailbox_id"),
 			onchain_descriptor: row.get("onchain_descriptor"),
 			currency: row.get("currency"),
 			onchain_min_sat: row.get("onchain_min_sat"),
-			lightning_address_name: row.get("lightning_address_name"),
-		}
-	}
-}
-
-#[derive(Debug, Clone)]
-pub struct Device {
-	pub id: i64,
-	pub store_id: i64,
-	pub name: String,
-	pub created_at: DateTime<Utc>,
-	pub revoked_at: Option<DateTime<Utc>>,
-}
-
-impl Device {
-	pub fn from_row(row: &Row) -> Device {
-		Device {
-			id: row.get("id"),
-			store_id: row.get("store_id"),
-			name: row.get("name"),
-			created_at: row.get("created_at"),
-			revoked_at: row.get("revoked_at"),
+			public_checkout: row.get("public_checkout"),
+			has_unlisted_link: row.get("has_unlisted_link"),
 		}
 	}
 }
@@ -179,7 +221,8 @@ pub struct Sale {
 	pub id: i64,
 	pub public_id: String,
 	pub store_id: i64,
-	pub device_name: Option<String>,
+	pub link: CheckoutLink,
+	pub cashier_name: Option<String>,
 	pub amount_sat: i64,
 	pub fiat_amount: Option<String>,
 	pub currency: Option<String>,
@@ -192,21 +235,16 @@ pub struct Sale {
 	pub expires_at: DateTime<Utc>,
 	pub paid_at: Option<DateTime<Utc>>,
 	pub lightning_invoice: Option<String>,
-	pub ark_invoice: Option<String>,
 	pub onchain_address: Option<String>,
 }
 
-/// Selects a sale joined with its device and its rails. Callers add the
-/// WHERE clause.
+/// Selects a sale joined with its rails. Callers add the WHERE clause.
 pub const SALE_SELECT: &str = "
-	SELECT s.id, s.public_id, s.store_id, d.name AS device_name, s.amount_sat, s.fiat_amount,
+	SELECT s.id, s.public_id, s.store_id, s.link, s.cashier_name, s.amount_sat, s.fiat_amount,
 		s.currency, s.btc_price, s.memo, s.state, s.paid_rail, s.received_sat, s.created_at,
-		s.expires_at, s.paid_at, ln.invoice AS lightning_invoice, ark.invoice AS ark_invoice,
-		oc.onchain_address
+		s.expires_at, s.paid_at, ln.invoice AS lightning_invoice, oc.onchain_address
 	FROM sale s
-	LEFT JOIN device d ON d.id = s.device_id
 	LEFT JOIN sale_payment ln ON ln.sale_id = s.id AND ln.rail = 'lightning'
-	LEFT JOIN sale_payment ark ON ark.sale_id = s.id AND ark.rail = 'ark'
 	LEFT JOIN sale_payment oc ON oc.sale_id = s.id AND oc.rail = 'onchain'
 ";
 
@@ -216,7 +254,8 @@ impl Sale {
 			id: row.get("id"),
 			public_id: row.get("public_id"),
 			store_id: row.get("store_id"),
-			device_name: row.get("device_name"),
+			link: row.get("link"),
+			cashier_name: row.get("cashier_name"),
 			amount_sat: row.get("amount_sat"),
 			fiat_amount: row.get("fiat_amount"),
 			currency: row.get("currency"),
@@ -229,7 +268,6 @@ impl Sale {
 			expires_at: row.get("expires_at"),
 			paid_at: row.get("paid_at"),
 			lightning_invoice: row.get("lightning_invoice"),
-			ark_invoice: row.get("ark_invoice"),
 			onchain_address: row.get("onchain_address"),
 		}
 	}
@@ -250,8 +288,6 @@ pub struct WatchedPayment {
 	pub received_sat: i64,
 	pub pending_sat: i64,
 	pub settled: bool,
-	pub claim_pubkey: String,
-	pub mailbox_id: String,
 }
 
 impl WatchedPayment {
@@ -269,8 +305,6 @@ impl WatchedPayment {
 			received_sat: row.get("received_sat"),
 			pending_sat: row.get("pending_sat"),
 			settled: row.get::<_, Option<DateTime<Utc>>>("settled_at").is_some(),
-			claim_pubkey: row.get("claim_pubkey"),
-			mailbox_id: row.get("mailbox_id"),
 		}
 	}
 }

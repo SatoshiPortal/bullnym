@@ -1,29 +1,30 @@
-//! Owner endpoints: registration, login and store management.
+//! Store registration, the owner login, and everything behind it: store
+//! settings, the unlisted cashier link, the sales history and the CSV.
 //!
-//! The owner is the Ark address that registered the store. It proves
-//! control by signing with that address's key.
+//! The owner is the Ark address that registered the nym. It proves control
+//! by signing with that address's key. The same login serves the nym and
+//! its store.
 
 use std::str::FromStr;
 use std::sync::Arc;
 
-use anyhow::Context;
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use bitcoin::secp256k1::schnorr;
-use chrono::{Duration, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, Duration, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::api::terminal::{CsvQuery, ListQuery, csv, list};
-use crate::api::{Owner, StoreView};
-use crate::database::{Device, STORE_COLUMNS, Store};
+use crate::api::{Owner, StoreView, public_url};
+use crate::database::{NYM_COLUMNS, Nym, STORE_COLUMNS, Store};
 use crate::error::{ApiResult, bad_request, conflict, not_found};
 use crate::money::currency_decimals;
 use crate::rails::onchain::StoreDescriptor;
-use crate::registration::Registration;
+use crate::registration::StoreRegistration;
+use crate::sales::{self, SaleView};
 use crate::token;
 
 
@@ -31,57 +32,113 @@ use crate::token;
 const REGISTRATION_CLOCK_SKEW_SECS: i64 = 600;
 const CHALLENGE_LIFETIME_MINS: i64 = 5;
 const SESSION_LIFETIME_HOURS: i64 = 24;
-const INVITE_LIFETIME_HOURS: i64 = 24;
+const MAX_STORE_NAME_CHARS: usize = 64;
 
-fn parse_signature(hex: &str) -> ApiResult<schnorr::Signature> {
+pub fn parse_signature(hex: &str) -> ApiResult<schnorr::Signature> {
 	schnorr::Signature::from_str(hex).map_err(|_| bad_request("the signature is not valid hex"))
 }
 
+/// Refuses a registration timestamp more than 10 minutes from the clock.
+pub fn check_timestamp(timestamp: u64) -> ApiResult<()> {
+	let skew = (Utc::now().timestamp() - timestamp as i64).abs();
+	if skew > REGISTRATION_CLOCK_SKEW_SECS {
+		return Err(bad_request("the registration timestamp is too far from the current time"));
+	}
+	Ok(())
+}
+
+fn check_store_name(name: &str) -> ApiResult<()> {
+	if name.is_empty() || name.chars().count() > MAX_STORE_NAME_CHARS {
+		return Err(bad_request("the store name must be 1 to 64 characters"));
+	}
+	Ok(())
+}
+
+/// How a store looks to its owner.
+#[derive(Debug, Serialize)]
+pub struct OwnerStoreView {
+	#[serde(flatten)]
+	pub store: StoreView,
+	/// Whether anyone can open the checkout at `checkout_url`.
+	pub public_checkout: bool,
+	pub checkout_url: String,
+	/// Whether an unlisted cashier link exists. Its URL is shown once, when
+	/// it is made.
+	pub unlisted_link: bool,
+}
+
+impl OwnerStoreView {
+	fn new(app: &App, store: &Store) -> OwnerStoreView {
+		OwnerStoreView {
+			store: StoreView::new(app, store),
+			public_checkout: store.public_checkout,
+			checkout_url: format!("{}/{}", public_url(app), store.nym),
+			unlisted_link: store.has_unlisted_link,
+		}
+	}
+}
+
 #[derive(Deserialize)]
-pub struct RegisterRequest {
-	registration: Registration,
+pub struct RegisterStoreRequest {
+	registration: StoreRegistration,
 	signature: String,
 }
 
-pub async fn register(
+/// `POST /api/v1/stores`: posd's store registration, tied to a nym.
+pub async fn register_store(
 	State(app): State<Arc<App>>,
-	Json(req): Json<RegisterRequest>,
+	Json(req): Json<RegisterStoreRequest>,
 ) -> ApiResult<Json<Value>> {
 	let reg = req.registration;
 	let signature = parse_signature(&req.signature)?;
 	let info = app.ark.ark_info().await;
-	let (ark_address, mailbox_id) = reg.verify(&signature, info.server_pubkey)
-		.map_err(|e| bad_request(e.to_string()))?;
-
-	let skew = (Utc::now().timestamp() - reg.timestamp as i64).abs();
-	if skew > REGISTRATION_CLOCK_SKEW_SECS {
-		return Err(bad_request("the registration timestamp is too far from the current time"));
-	}
+	let address = reg.verify(&signature, info.server_pubkey).map_err(|e| bad_request(e.to_string()))?;
+	check_timestamp(reg.timestamp)?;
 	let name = reg.name.trim();
-	if name.is_empty() || name.chars().count() > 64 {
-		return Err(bad_request("the store name must be 1 to 64 characters"));
-	}
+	check_store_name(name)?;
 	if currency_decimals(&reg.currency).is_none() {
 		return Err(bad_request(format!("unsupported currency: {}", reg.currency)));
 	}
-	StoreDescriptor::parse(&reg.onchain_descriptor).map_err(|e| bad_request(format!("{:#}", e)))?;
+	let descriptor = StoreDescriptor::parse(&reg.onchain_descriptor)
+		.map_err(|e| bad_request(format!("{:#}", e)))?;
+	let xpub = descriptor.account_key().map_err(|e| bad_request(format!("{:#}", e)))?;
 
-	let claim_pubkey = ark_address.policy().user_pubkey();
-	let conn = app.db.conn().await?;
-	let row = conn.query_opt(&format!("
-		INSERT INTO store (name, ark_address, claim_pubkey, mailbox_id, onchain_descriptor,
-			currency, onchain_min_sat, registration_signature)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (ark_address) DO NOTHING
-		RETURNING {}
-	", STORE_COLUMNS.replace("s.", "")), &[
-		&name, &ark_address.to_string(), &claim_pubkey.to_string(),
-		&mailbox_id.to_string(), &reg.onchain_descriptor, &reg.currency,
-		&(app.cfg.sales.default_onchain_min_sat as i64), &signature.to_string(),
+	let mut conn = app.db.conn().await?;
+	let tx = conn.transaction().await?;
+	// The nym must exist and be registered by this same address. Locking
+	// it serializes two registrations of a store for it.
+	let nym = tx.query_opt(&format!(
+		"SELECT {} FROM nym n WHERE n.name = $1 FOR UPDATE", NYM_COLUMNS,
+	), &[&reg.nym]).await?.map(|r| Nym::from_row(&r))
+		.ok_or_else(|| not_found("register the Lightning Address of this nym first"))?;
+	if nym.ark_address != address.to_string() {
+		return Err(bad_request("the store must use the Ark address its nym was registered with"));
+	}
+	let row = tx.query_opt("
+		INSERT INTO store (nym_id, name, ark_address, onchain_descriptor, onchain_xpub, currency,
+			onchain_min_sat, registration_timestamp, registration_signature)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT DO NOTHING
+		RETURNING id
+	", &[
+		&nym.id, &name, &nym.ark_address, &reg.onchain_descriptor, &xpub, &reg.currency,
+		&(app.cfg.sales.default_onchain_min_sat as i64), &(reg.timestamp as i64),
+		&signature.to_string(),
 	]).await?;
-	let store = row.map(|r| Store::from_row(&r))
-		.ok_or_else(|| conflict("a store is already registered for this Ark address"))?;
-	Ok(Json(json!({ "store": StoreView::new(&app, &store) })))
+	if row.is_none() {
+		let has = tx.query_opt("SELECT 1 FROM store WHERE nym_id = $1", &[&nym.id]).await?;
+		return Err(conflict(if has.is_some() {
+			"this nym already has a store"
+		} else {
+			"another store uses this on-chain account; use an account dedicated to this store"
+		}));
+	}
+	let store = tx.query_one(&format!(
+		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.nym_id = $1", STORE_COLUMNS,
+	), &[&nym.id]).await.map(|r| Store::from_row(&r))?;
+	tx.commit().await?;
+	tracing::info!("registered the store of nym {}", nym.name);
+	Ok(Json(json!({ "store": OwnerStoreView::new(&app, &store) })))
 }
 
 #[derive(Deserialize)]
@@ -93,9 +150,12 @@ pub async fn challenge(
 	State(app): State<Arc<App>>,
 	Json(req): Json<ChallengeRequest>,
 ) -> ApiResult<Json<Value>> {
+	if req.ark_address.is_empty() || req.ark_address.len() > 512 || req.ark_address.contains(['\n', '\r']) {
+		return Err(bad_request("not a valid Ark address"));
+	}
 	let expires_at = Utc::now() + Duration::minutes(CHALLENGE_LIFETIME_MINS);
 	let challenge = format!(
-		"scuttle-pos login v1\nark_address:{}\nnonce:{}\nexpires_at:{}",
+		"bullnym login v1\nark_address:{}\nnonce:{}\nexpires_at:{}",
 		req.ark_address, token::random_hex(16), expires_at.timestamp(),
 	);
 	let conn = app.db.conn().await?;
@@ -133,139 +193,156 @@ pub async fn login(
 	if used == 0 {
 		return Err(bad_request("the challenge is unknown, used or expired"));
 	}
-	let store_id: i64 = tx.query_opt("SELECT id FROM store WHERE ark_address = $1", &[&req.ark_address])
-		.await?.ok_or_else(|| not_found("no store is registered for this Ark address"))?
+	let nym_id: i64 = tx.query_opt("SELECT id FROM nym WHERE ark_address = $1", &[&req.ark_address])
+		.await?.ok_or_else(|| not_found("no nym is registered for this Ark address"))?
 		.get("id");
 	let session_token = token::new_token();
 	let expires_at = Utc::now() + Duration::hours(SESSION_LIFETIME_HOURS);
 	tx.execute(
-		"INSERT INTO owner_session (store_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-		&[&store_id, &token::hash(&session_token), &expires_at],
+		"INSERT INTO owner_session (nym_id, token_hash, expires_at) VALUES ($1, $2, $3)",
+		&[&nym_id, &token::hash(&session_token), &expires_at],
 	).await?;
 	tx.commit().await?;
 	Ok(Json(json!({ "token": session_token, "expires_at": expires_at })))
 }
 
-pub async fn get_store(State(app): State<Arc<App>>, owner: Owner) -> Json<StoreView> {
-	Json(StoreView::new(&app, &owner.store))
+pub async fn get_store(State(app): State<Arc<App>>, owner: Owner) -> ApiResult<Json<OwnerStoreView>> {
+	Ok(Json(OwnerStoreView::new(&app, owner.store()?)))
 }
 
+/// The settings an owner can change. Nothing else about a store can.
 #[derive(Deserialize)]
 pub struct UpdateStore {
 	name: Option<String>,
 	currency: Option<String>,
 	onchain_min_sat: Option<u64>,
-	/// An empty name removes the Lightning address.
-	lightning_address_name: Option<String>,
-}
-
-/// A Lightning address name: lowercase letters, digits, `.`, `-` and `_`.
-fn valid_lightning_name(name: &str) -> bool {
-	!name.is_empty() && name.len() <= 64
-		&& name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+	public_checkout: Option<bool>,
 }
 
 pub async fn update_store(
 	State(app): State<Arc<App>>,
 	owner: Owner,
 	Json(req): Json<UpdateStore>,
-) -> ApiResult<Json<StoreView>> {
+) -> ApiResult<Json<OwnerStoreView>> {
+	let store = owner.store()?;
 	if let Some(name) = &req.name {
-		if name.trim().is_empty() || name.trim().chars().count() > 64 {
-			return Err(bad_request("the store name must be 1 to 64 characters"));
-		}
+		check_store_name(name.trim())?;
 	}
 	if let Some(c) = &req.currency {
 		if currency_decimals(c).is_none() {
 			return Err(bad_request(format!("unsupported currency: {}", c)));
 		}
 	}
-	let ln_name = match req.lightning_address_name.as_deref() {
-		None => None,
-		Some("") => Some(None),
-		Some(n) if valid_lightning_name(n) => Some(Some(n.to_string())),
-		Some(_) => return Err(bad_request(
-			"a Lightning address name has only lowercase letters, digits, '.', '-' and '_'",
-		)),
-	};
-
 	let conn = app.db.conn().await?;
-	let row = conn.query_one(&format!("
-		UPDATE store s SET
+	conn.execute("
+		UPDATE store SET
 			name = coalesce($2, name),
 			currency = coalesce($3, currency),
 			onchain_min_sat = coalesce($4, onchain_min_sat),
-			lightning_address_name = CASE WHEN $5 THEN $6 ELSE lightning_address_name END,
+			public_checkout = coalesce($5, public_checkout),
 			updated_at = NOW()
 		WHERE id = $1
-		RETURNING {}
-	", STORE_COLUMNS), &[
-		&owner.store.id, &req.name.map(|n| n.trim().to_string()), &req.currency,
-		&req.onchain_min_sat.map(|v| v as i64), &ln_name.is_some(), &ln_name.flatten(),
-	]).await.map_err(|e| {
-		if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
-			conflict("that Lightning address name is taken")
-		} else {
-			e.into()
-		}
-	})?;
-	Ok(Json(StoreView::new(&app, &Store::from_row(&row))))
+	", &[
+		&store.id, &req.name.map(|n| n.trim().to_string()), &req.currency,
+		&req.onchain_min_sat.map(|v| v as i64), &req.public_checkout,
+	]).await?;
+	let store = reload_store(&app, store.id).await?;
+	Ok(Json(OwnerStoreView::new(&app, &store)))
 }
 
-pub async fn create_invite(State(app): State<Arc<App>>, owner: Owner) -> ApiResult<Json<Value>> {
-	let code = token::new_code();
-	let expires_at = Utc::now() + Duration::hours(INVITE_LIFETIME_HOURS);
+async fn reload_store(app: &App, store_id: i64) -> ApiResult<Store> {
 	let conn = app.db.conn().await?;
-	conn.execute(
-		"INSERT INTO invite (store_id, code_hash, expires_at) VALUES ($1, $2, $3)",
-		&[&owner.store.id, &token::hash(&code), &expires_at],
-	).await?;
-	let url = format!("{}/pair/{}", app.cfg.http.public_url.trim_end_matches('/'), code);
-	Ok(Json(json!({ "code": code, "url": url, "expires_at": expires_at })))
+	let row = conn.query_one(&format!(
+		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.id = $1", STORE_COLUMNS,
+	), &[&store_id]).await?;
+	Ok(Store::from_row(&row))
 }
 
-pub async fn list_devices(State(app): State<Arc<App>>, owner: Owner) -> ApiResult<Json<Value>> {
-	let conn = app.db.conn().await?;
-	let rows = conn.query("
-		SELECT id, store_id, name, created_at, revoked_at FROM device
-		WHERE store_id = $1 ORDER BY id
-	", &[&owner.store.id]).await?;
-	let devices = rows.iter().map(Device::from_row).map(|d| json!({
-		"id": d.id, "name": d.name, "created_at": d.created_at, "revoked_at": d.revoked_at,
-	})).collect::<Vec<_>>();
-	Ok(Json(json!({ "devices": devices })))
-}
-
-pub async fn revoke_device(
+/// `POST /api/v1/owner/store/unlisted-link`: makes a new unlisted cashier
+/// link. The previous one stops working at once. The URL is shown only
+/// here; only its hash is stored.
+pub async fn rotate_unlisted_link(
 	State(app): State<Arc<App>>,
 	owner: Owner,
-	Path(id): Path<i64>,
-) -> ApiResult<impl IntoResponse> {
+) -> ApiResult<Json<Value>> {
+	let store = owner.store()?;
+	let secret = token::new_link_secret();
 	let conn = app.db.conn().await?;
-	let n = conn.execute("
-		UPDATE device SET revoked_at = coalesce(revoked_at, NOW())
-		WHERE id = $1 AND store_id = $2
-	", &[&id, &owner.store.id]).await.context("revoke failed")?;
-	if n == 0 {
-		return Err(not_found("no such device"));
-	}
+	conn.execute("
+		UPDATE store SET unlisted_link_hash = $2, updated_at = NOW() WHERE id = $1
+	", &[&store.id, &token::hash(&secret)]).await?;
+	let url = format!("{}/c/{}", public_url(&app), secret);
+	Ok(Json(json!({ "url": url, "secret": secret })))
+}
+
+/// `DELETE /api/v1/owner/store/unlisted-link`.
+pub async fn remove_unlisted_link(
+	State(app): State<Arc<App>>,
+	owner: Owner,
+) -> ApiResult<impl IntoResponse> {
+	let store = owner.store()?;
+	let conn = app.db.conn().await?;
+	conn.execute("
+		UPDATE store SET unlisted_link_hash = NULL, updated_at = NOW() WHERE id = $1
+	", &[&store.id]).await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+pub struct ListQuery {
+	pub before: Option<String>,
+	pub limit: Option<i64>,
+}
+
+/// `GET /api/v1/owner/sales`: the history, owner only.
 pub async fn list_sales(
 	State(app): State<Arc<App>>,
 	owner: Owner,
 	Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
-	list(&app, &owner.store, q).await
+	let store = owner.store()?;
+	let conn = app.db.conn().await?;
+	let sales = sales::list_sales(&*conn, store.id, q.before.as_deref(), q.limit.unwrap_or(50)).await?;
+	let sales = sales.into_iter().map(SaleView::from).collect::<Vec<_>>();
+	Ok(Json(json!({ "sales": sales })))
 }
 
+#[derive(Deserialize)]
+pub struct CsvQuery {
+	pub from: Option<String>,
+	pub to: Option<String>,
+}
+
+/// `GET /api/v1/owner/sales.csv`: the CSV export, owner only.
 pub async fn sales_csv(
 	State(app): State<Arc<App>>,
 	owner: Owner,
 	Query(q): Query<CsvQuery>,
-) -> ApiResult<axum::response::Response> {
-	csv(&app, &owner.store, q).await
+) -> ApiResult<Response> {
+	let store = owner.store()?;
+	let from = q.from.as_deref().map(|d| parse_date(d, false)).transpose()?;
+	let to = q.to.as_deref().map(|d| parse_date(d, true)).transpose()?;
+	let conn = app.db.conn().await?;
+	let body = sales::sales_csv(&*conn, store.id, from, to).await?;
+	Ok((
+		[
+			(header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+			(header::CONTENT_DISPOSITION, "attachment; filename=\"sales.csv\""),
+		],
+		body,
+	).into_response())
+}
+
+/// An RFC 3339 time, or a date in UTC. A date as the end of a range
+/// includes that whole day.
+fn parse_date(s: &str, end: bool) -> ApiResult<DateTime<Utc>> {
+	if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+		return Ok(t.with_timezone(&Utc));
+	}
+	let day = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+		.ok_or_else(|| bad_request(format!("not a date: {}", s)))?;
+	let day = if end { day.succ_opt().ok_or_else(|| bad_request("date out of range"))? } else { day };
+	Ok(day.and_hms_opt(0, 0, 0).expect("midnight exists").and_utc())
 }
 
 #[cfg(test)]
@@ -273,11 +350,20 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn lightning_names() {
-		assert!(valid_lightning_name("cafe.uvita_1-2"));
-		assert!(!valid_lightning_name("Cafe"));
-		assert!(!valid_lightning_name(""));
-		assert!(!valid_lightning_name("a b"));
-		assert!(!valid_lightning_name("a@b"));
+	fn date_ranges() {
+		assert_eq!(parse_date("2026-11-20", false).unwrap().to_rfc3339(), "2026-11-20T00:00:00+00:00");
+		assert_eq!(parse_date("2026-11-20", true).unwrap().to_rfc3339(), "2026-11-21T00:00:00+00:00");
+		assert_eq!(parse_date("2026-11-20T10:00:00Z", true).unwrap().to_rfc3339(), "2026-11-20T10:00:00+00:00");
+		assert!(parse_date("20/11/2026", false).is_err());
+	}
+
+	#[test]
+	fn registration_clock() {
+		let now = Utc::now().timestamp() as u64;
+		assert!(check_timestamp(now).is_ok());
+		assert!(check_timestamp(now - 590).is_ok());
+		assert!(check_timestamp(now + 590).is_ok());
+		assert!(check_timestamp(now - 700).is_err());
+		assert!(check_timestamp(now + 700).is_err());
 	}
 }

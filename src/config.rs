@@ -42,8 +42,8 @@ impl Postgres {
 pub struct Http {
 	/// The address the service listens on.
 	pub listen: SocketAddr,
-	/// The public base URL, without a trailing slash. Pairing links and the
-	/// Lightning address use it.
+	/// The public base URL, without a trailing slash. Its host is the domain
+	/// of every Lightning Address, and cashier links start with it.
 	pub public_url: String,
 }
 
@@ -79,9 +79,6 @@ pub struct Sales {
 	/// The on-chain minimum for a new store, in sats.
 	#[serde(default = "default_onchain_min_sat")]
 	pub default_onchain_min_sat: u64,
-	/// The largest Lightning address payment, in sats.
-	#[serde(default = "default_lnurl_max_sat")]
-	pub lnurl_max_sat: u64,
 	/// How often the watcher checks open sales.
 	#[serde(default = "default_poll_interval_ms")]
 	pub poll_interval_ms: u64,
@@ -93,7 +90,6 @@ pub struct Sales {
 
 fn default_sale_expiry_secs() -> u64 { 600 }
 fn default_onchain_min_sat() -> u64 { 50_000 }
-fn default_lnurl_max_sat() -> u64 { 10_000_000 }
 fn default_poll_interval_ms() -> u64 { 2_000 }
 fn default_onchain_watch_secs() -> u64 { 7 * 24 * 3600 }
 
@@ -102,7 +98,6 @@ impl Default for Sales {
 		Sales {
 			expiry_secs: default_sale_expiry_secs(),
 			default_onchain_min_sat: default_onchain_min_sat(),
-			lnurl_max_sat: default_lnurl_max_sat(),
 			poll_interval_ms: default_poll_interval_ms(),
 			onchain_watch_secs: default_onchain_watch_secs(),
 		}
@@ -114,6 +109,44 @@ impl Sales {
 	pub fn poll_interval(&self) -> Duration { Duration::from_millis(self.poll_interval_ms) }
 }
 
+/// The Lightning Address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nyms {
+	/// Names that nobody can register, on top of the built-in list of route
+	/// and brand names.
+	#[serde(default)]
+	pub reserved: Vec<String>,
+	/// The smallest Lightning Address payment, in sats.
+	#[serde(default = "default_min_sendable_sat")]
+	pub min_sendable_sat: u64,
+	/// The largest Lightning Address payment, in sats.
+	#[serde(default = "default_max_sendable_sat")]
+	pub max_sendable_sat: u64,
+	/// How long a Lightning Address invoice stays payable. barkd cancels it
+	/// at expiry.
+	#[serde(default = "default_invoice_expiry_secs")]
+	pub invoice_expiry_secs: u64,
+}
+
+fn default_min_sendable_sat() -> u64 { 1 }
+fn default_max_sendable_sat() -> u64 { 10_000_000 }
+fn default_invoice_expiry_secs() -> u64 { 600 }
+
+impl Default for Nyms {
+	fn default() -> Self {
+		Nyms {
+			reserved: Vec::new(),
+			min_sendable_sat: default_min_sendable_sat(),
+			max_sendable_sat: default_max_sendable_sat(),
+			invoice_expiry_secs: default_invoice_expiry_secs(),
+		}
+	}
+}
+
+impl Nyms {
+	pub fn invoice_expiry(&self) -> Duration { Duration::from_secs(self.invoice_expiry_secs) }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
 	pub network: Network,
@@ -121,15 +154,28 @@ pub struct Config {
 	pub postgres: Postgres,
 	/// The Ark server's public gRPC address.
 	pub ark_server_url: String,
-	/// A read-only role on the Ark server's database, with `SELECT` on
-	/// `v_arkoor_receive_delivery`.
-	pub ark_server_postgres: Postgres,
 	pub barkd: Barkd,
 	/// The bitcoind that watches on-chain payments.
 	pub bitcoind: crate::rails::onchain::BitcoindConfig,
 	pub price: Price,
 	#[serde(default)]
+	pub nyms: Nyms,
+	#[serde(default)]
 	pub sales: Sales,
+	#[serde(default)]
+	pub startup: Startup,
+}
+
+/// What the service checks before it starts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Startup {
+	/// Starts even when barkd and the Ark server cannot put a forwarded
+	/// receive's destination in its invoice (S1), or the Ark server does not
+	/// report the delivery of Ark payments (S4). Store invoices then have
+	/// no Ark hint, and are paid over Lightning only. For local tests
+	/// against older Scuttle releases only; never set it in production.
+	#[serde(default)]
+	pub allow_missing_s1_s4: bool,
 }
 
 impl Config {

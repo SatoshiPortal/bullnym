@@ -1,24 +1,22 @@
-//! Serves the terminal PWA, embedded at build time (see `build.rs`).
+//! Serves the web app, embedded at build time (see `build.rs`).
+//!
+//! One page is the cashier screen and the public checkout: `/<nym>` for a
+//! store's public link and `/c/<secret>` for its unlisted link. `/owner`
+//! shows the owner's history, from a session token the owner's wallet
+//! hands over. Viewing a page allocates nothing.
 
-use std::sync::Arc;
-
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 use serde_json::json;
 
-use crate::App;
+use crate::nym;
 
 
 #[derive(RustEmbed)]
 #[folder = "$OUT_DIR/web-dist/"]
 struct WebDist;
-
-/// `GET /pair/<code>`: the PWA, which reads the code from the path.
-pub async fn index() -> Response {
-	serve_index()
-}
 
 fn serve_index() -> Response {
 	match WebDist::get("index.html") {
@@ -30,22 +28,18 @@ fn serve_index() -> Response {
 	}
 }
 
-/// The manifest of an install from a pairing link. Its `start_url` carries
-/// the code, so the installed app opens with it: on iOS the installed app
-/// does not share storage with the browser that opened the link.
-pub async fn pair_manifest(State(app): State<Arc<App>>, Path(code): Path<String>) -> Response {
-	if !code.bytes().all(|b| b.is_ascii_hexdigit()) || code.len() > 64 {
-		return StatusCode::NOT_FOUND.into_response();
-	}
-	let _ = app;
+/// The manifest of an install from a cashier link. Its `start_url` is the
+/// link, so the installed app opens on it: on iOS the installed app does
+/// not share storage with the browser that opened the link.
+fn manifest(start_url: String) -> Response {
 	let manifest = json!({
-		"name": "Scuttle POS",
-		"short_name": "POS",
-		"start_url": format!("/pair/{}", code),
+		"name": "Checkout",
+		"short_name": "Checkout",
+		"start_url": start_url,
 		"scope": "/",
 		"display": "standalone",
-		"background_color": "#ffffff",
-		"theme_color": "#ffffff",
+		"background_color": "#f5f0e8",
+		"theme_color": "#f5f0e8",
 		"icons": [
 			{ "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
 			{ "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
@@ -57,8 +51,24 @@ pub async fn pair_manifest(State(app): State<Arc<App>>, Path(code): Path<String>
 	).into_response()
 }
 
-/// Static assets. Unknown paths outside the API fall back to the PWA, so
-/// its client-side routes work on reload.
+/// `GET /<nym>/manifest.webmanifest`.
+pub async fn public_manifest(Path(name): Path<String>) -> Response {
+	if nym::check_form(&name).is_err() {
+		return StatusCode::NOT_FOUND.into_response();
+	}
+	manifest(format!("/{}", name))
+}
+
+/// `GET /c/<secret>/manifest.webmanifest`.
+pub async fn unlisted_manifest(Path(secret): Path<String>) -> Response {
+	if secret.is_empty() || secret.len() > 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+		return StatusCode::NOT_FOUND.into_response();
+	}
+	manifest(format!("/c/{}", secret))
+}
+
+/// Static assets. Unknown paths outside the API fall back to the web app,
+/// so its routes (`/<nym>`, `/c/<secret>`, `/owner`) work on reload.
 pub async fn asset(uri: Uri) -> Response {
 	let path = uri.path().trim_start_matches('/');
 	if path.starts_with("api/") || path.starts_with(".well-known/") {
