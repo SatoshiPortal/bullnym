@@ -1,6 +1,6 @@
 //! The HTTP API. The contract is in `docs/api.md`.
 //!
-//! - `/api/v1/nym`: the Lightning Address registration and lookup.
+//! - `/api/v1/nym`: the Lightning Address registration.
 //! - `/api/v1/stores`: posd's store registration.
 //! - `/api/v1/owner/...`: everything behind the owner login, including the
 //!   sales history and CSV.
@@ -35,12 +35,10 @@ use crate::token;
 pub fn router(app: Arc<App>) -> Router {
 	let api = Router::new()
 		.route("/nym", post(nym::register))
-		.route("/nym/{nym}", get(nym::lookup))
 		.route("/stores", post(owner::register_store))
 		.route("/owner/challenge", post(owner::challenge))
 		.route("/owner/login", post(owner::login))
 		.route("/owner/nym", get(nym::get_own).patch(nym::update_own))
-		.route("/owner/nym/payments", get(nym::list_payments))
 		.route("/owner/store", get(owner::get_store).patch(owner::update_store))
 		.route("/owner/store/cashier-pin", put(owner::set_cashier_pin))
 		.route("/owner/sales", get(owner::list_sales))

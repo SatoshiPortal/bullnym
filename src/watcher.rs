@@ -9,7 +9,9 @@
 //!
 //! On-chain payments go through the stages of [crate::stages]: seen in the
 //! mempool (in progress, not guaranteed), then paid at 1 confirmation,
-//! which is final as in posd.
+//! which is final as in posd. As in posd, an address stays watched for 7
+//! days after its sale was created: a payment beyond the amount of a paid
+//! sale counts in its received amount, and never changes its state.
 //!
 //! The rail that paid an invoice is recorded only on positive evidence
 //! from the Ark server: HTLCs it granted for a Lightning payment, or its
@@ -278,10 +280,12 @@ struct WatchedAddress {
 	warnings: Vec<String>,
 }
 
-/// The on-chain payments to follow: the address of a sale until it is
-/// paid, and the address of a sale that ended unpaid for 7 days after the
-/// sale was created, for late payments. Observation of a sale ends when it
-/// is paid, at 1 confirmation.
+/// The on-chain payments to follow, as in posd: every sale address for 7
+/// days after its sale was created, whatever the sale's state, so a late
+/// payment to an ended sale and an extra payment to a paid one are recorded
+/// on that sale; and the address of a sale still in progress until its
+/// payment confirms or goes. A paid sale stays paid whatever its address
+/// shows.
 async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
@@ -290,8 +294,8 @@ async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
 		WHERE p.rail = 'onchain' AND (
-			s.state IN ('open', 'in-progress')
-			OR (s.state IN ('expired', 'canceled') AND s.created_at > NOW() - make_interval(secs => $1))
+			s.created_at > NOW() - make_interval(secs => $1)
+			OR (s.state = 'in-progress' AND s.progress = 'onchain')
 		)
 		ORDER BY p.id
 	", &[&(app.cfg.sales.onchain_watch_secs as f64)]).await?;

@@ -113,7 +113,7 @@ pub struct Limits {
 	/// The most nyms the service holds.
 	#[serde(default = "d100000")]
 	pub max_nyms: u64,
-	/// Name lookups (nym lookup, LNURL metadata, checkout page data) per
+	/// Name lookups (LNURL metadata, checkout page data) per
 	/// source per minute.
 	#[serde(default = "d30")]
 	pub lookups_per_minute: u32,
@@ -136,10 +136,10 @@ pub struct Limits {
 	/// Owner login requests per source per minute.
 	#[serde(default = "d20")]
 	pub owner_per_minute: u32,
-	/// Cashier PIN checks per source per minute. Wrong PINs also back off
+	/// Cashier PIN checks per source per hour. Wrong PINs also back off
 	/// per source and per store (see the pin module).
 	#[serde(default = "d10")]
-	pub pin_checks_per_minute: u32,
+	pub pin_checks_per_hour: u32,
 	/// Open Lightning Address invoices per nym.
 	#[serde(default = "d20")]
 	pub max_open_invoices_per_nym: u32,
@@ -414,26 +414,30 @@ impl Protect {
 		Caller { ip, source: source_key(ip), bypass: self.allowlist.contains(ip) || certified }
 	}
 
-	fn limit_of(&self, surface: Surface) -> u32 {
+	/// The per-source limit of a surface, and its window: a minute, or an
+	/// hour for PIN checks.
+	fn limit_of(&self, surface: Surface) -> (u32, Duration) {
 		let l = &self.limits;
+		let minute = Duration::from_secs(60);
 		match surface {
-			Surface::Register => l.register_per_minute,
-			Surface::Lookup => l.lookups_per_minute,
-			Surface::Callback => l.callbacks_per_minute,
-			Surface::SaleCreate => l.sales_per_minute,
-			Surface::StatusRead => l.status_reads_per_minute,
-			Surface::Owner => l.owner_per_minute,
-			Surface::PinCheck => l.pin_checks_per_minute,
+			Surface::Register => (l.register_per_minute, minute),
+			Surface::Lookup => (l.lookups_per_minute, minute),
+			Surface::Callback => (l.callbacks_per_minute, minute),
+			Surface::SaleCreate => (l.sales_per_minute, minute),
+			Surface::StatusRead => (l.status_reads_per_minute, minute),
+			Surface::Owner => (l.owner_per_minute, minute),
+			Surface::PinCheck => (l.pin_checks_per_hour, Duration::from_secs(3600)),
 		}
 	}
 
-	/// The per-source limit of a surface, per minute, in memory.
+	/// The per-source limit of a surface, in memory.
 	pub fn check(&self, caller: &Caller, surface: Surface) -> ApiResult<()> {
 		if caller.bypass {
 			return Ok(());
 		}
 		let key = format!("{}:{}", surface.name(), caller.source);
-		if self.windows.check(&key, self.limit_of(surface), Duration::from_secs(60), Instant::now()) {
+		let (limit, window) = self.limit_of(surface);
+		if self.windows.check(&key, limit, window, Instant::now()) {
 			Ok(())
 		} else {
 			tracing::info!("rate limited: {} from {}", surface.name(), caller.source);
@@ -666,6 +670,13 @@ mod test {
 			assert!(p.check(&c, Surface::Register).is_ok());
 		}
 		assert!(p.check(&c, Surface::Register).is_err(), "5 registrations per minute");
+		// PIN checks: 10 per hour.
+		for _ in 0..10 {
+			assert!(p.check(&c, Surface::PinCheck).is_ok());
+		}
+		assert!(p.check(&c, Surface::PinCheck).is_err(), "10 PIN checks per hour");
+		assert_eq!(p.limit_of(Surface::PinCheck), (10, Duration::from_secs(3600)));
+		assert_eq!(p.limit_of(Surface::Owner).1, Duration::from_secs(60));
 		// Certification without a usable token refuses to start.
 		let bad = Certification { enabled: true, token: Some("short".into()), allowed_sources: vec![] };
 		assert!(Protect::new(Limits::default(), bad).is_err());

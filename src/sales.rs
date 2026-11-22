@@ -30,7 +30,6 @@ pub enum SaleAmount {
 /// A sale to create.
 #[derive(Debug, Clone)]
 pub struct NewSale {
-	pub cashier_name: Option<String>,
 	pub amount: SaleAmount,
 	pub memo: Option<String>,
 }
@@ -66,7 +65,6 @@ pub struct SaleView {
 	/// The sale ended unpaid and a payment came after: the owner sees it,
 	/// and it never pays another sale.
 	pub late_payment: bool,
-	pub cashier_name: Option<String>,
 }
 
 impl From<Sale> for SaleView {
@@ -97,7 +95,6 @@ impl From<Sale> for SaleView {
 			warnings: s.warnings,
 			notice: s.notice,
 			late_payment: s.state.ended_unpaid() && (s.received_sat > 0 || s.seen_sat > 0),
-			cashier_name: s.cashier_name,
 		}
 	}
 }
@@ -224,7 +221,6 @@ struct Reservation {
 async fn reserve_sale(
 	app: &App,
 	store: &Store,
-	cashier_name: &Option<String>,
 	memo: &Option<String>,
 	amount_sat: Amount,
 	fiat: &Option<(Decimal, Decimal)>,
@@ -254,12 +250,12 @@ async fn reserve_sale(
 
 	let public_id = token::random_hex(16);
 	let sale_id: i64 = tx.query_one("
-		INSERT INTO sale (public_id, store_id, cashier_name, amount_sat, fiat_amount,
-			currency, btc_price, memo, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + make_interval(secs => $9))
+		INSERT INTO sale (public_id, store_id, amount_sat, fiat_amount, currency, btc_price, memo,
+			expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + make_interval(secs => $8))
 		RETURNING id
 	", &[
-		&public_id, &store.id, cashier_name, &(amount_sat.to_sat() as i64),
+		&public_id, &store.id, &(amount_sat.to_sat() as i64),
 		&fiat.as_ref().map(|(f, _)| f.to_string()),
 		&fiat.as_ref().map(|_| store.currency.clone()),
 		&fiat.as_ref().map(|(_, p)| p.to_string()),
@@ -340,7 +336,7 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 
 	// The sale and its invoice slot are reserved first, under the caps.
 	// Each backend step then fills or releases its part.
-	let res = reserve_sale(app, store, &new.cashier_name, &memo, amount_sat, &fiat).await?;
+	let res = reserve_sale(app, store, &memo, amount_sat, &fiat).await?;
 
 	// The invoice names the owner's address as its Ark hint (S1), so one
 	// invoice serves Lightning and Ark payers.
@@ -464,7 +460,7 @@ pub async fn sales_csv(
 	", SALE_SELECT), &[&store_id, &from, &to]).await?;
 	let mut out = String::from(
 		"id,created_at,paid_at,state,paid_rail,amount_sat,received_sat,fiat_amount,currency,\
-		btc_price,memo,cashier_name,seen_sat,progress,warnings,notice,late_payment\n",
+		btc_price,memo,seen_sat,progress,warnings,notice,late_payment\n",
 	);
 	for row in rows {
 		let s = Sale::from_row(&row);
@@ -482,7 +478,6 @@ pub async fn sales_csv(
 			s.currency.unwrap_or_default(),
 			s.btc_price.unwrap_or_default(),
 			s.memo.unwrap_or_default(),
-			s.cashier_name.unwrap_or_default(),
 			s.seen_sat.to_string(),
 			progress.unwrap_or_default(),
 			s.warnings.join(" "),

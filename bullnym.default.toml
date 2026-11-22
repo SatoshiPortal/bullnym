@@ -109,7 +109,7 @@ register_per_minute = 5
 register_identities_per_hour = 10
 # The most nyms the service holds.
 max_nyms = 100000
-# Name lookups (nym lookup, LNURL metadata, public checkout data) per source
+# Name lookups (LNURL metadata, public checkout data) per source
 # per minute, and distinct names a source can look up per hour.
 lookups_per_minute = 30
 lookup_names_per_hour = 20
@@ -122,10 +122,10 @@ sales_per_minute = 60
 status_reads_per_minute = 600
 # Owner login requests per source per minute.
 owner_per_minute = 20
-# Cashier PIN checks per source per minute. Wrong PINs also back off per
+# Cashier PIN checks per source per hour. Wrong PINs also back off per
 # source and per store: 5 are free, then each locks further checks for twice
 # as long as the one before, up to 15 minutes.
-pin_checks_per_minute = 10
+pin_checks_per_hour = 10
 # Open Lightning Address invoices per nym, and open invoices of all nyms and
 # sales together. Each is a hold invoice on the Ark server.
 max_open_invoices_per_nym = 20

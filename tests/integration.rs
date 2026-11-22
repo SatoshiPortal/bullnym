@@ -60,7 +60,7 @@ async fn sale_paid_by_lightning() {
 
 	// 12,500 CRC at the test price is 20,000 sats, below the on-chain minimum.
 	let sale = store.new_sale(json!({
-		"fiat_amount": "12500", "memo": "2 coffees", "cashier_name": "Front till",
+		"fiat_amount": "12500", "memo": "2 coffees",
 	})).await;
 	assert_eq!(sale["state"], "open");
 	assert_eq!(sale["amount_sat"], 20_000);
@@ -93,7 +93,7 @@ async fn sale_paid_by_lightning() {
 	assert_eq!(status, StatusCode::UNAUTHORIZED);
 	let csv = owner_csv(&store).await;
 	assert!(csv.contains(id) && csv.contains("2 coffees") && csv.contains(",paid,lightning,"), "{}", csv);
-	assert!(csv.contains(",2 coffees,Front till,"), "{}", csv);
+	assert!(!csv.contains("cashier"), "no cashier name: {}", csv);
 }
 
 #[tokio::test]
@@ -177,23 +177,29 @@ async fn sale_paid_onchain_through_its_stages() {
 	let row = history["sales"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone();
 	assert_eq!((row["state"].clone(), row["received_sat"].clone()), (json!("paid"), json!(60_000)));
 
-	// Observation of the sale ends there: the block with the payment going
-	// away changes nothing, and neither does a later payment to the address.
+	// A paid sale stays paid: the block with the payment going away does
+	// not change its state.
 	let node = &store.svc.bitcoind;
 	let tip = rpc(node, None, "getbestblockhash", json!([])).await;
 	rpc(node, None, "invalidateblock", json!([tip])).await;
 	tokio::time::sleep(Duration::from_secs(6)).await;
 	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
-	assert_eq!((after["state"].clone(), after["received_sat"].clone()), (json!("paid"), json!(60_000)), "{}", after);
+	assert_eq!(after["state"], "paid", "{}", after);
 	rpc(node, None, "reconsiderblock", json!([tip])).await;
+	store.svc.wait_sale(id, SALE_TIMEOUT, |s| s["received_sat"] == 60_000, "counted again").await;
+
+	// As in posd, the address stays watched for 7 days: an extra payment
+	// counts on this sale, as an overpayment, and the sale stays paid.
 	ctx.bitcoind().fund_addr(&address, sat(10_000)).await;
 	ctx.generate_blocks(1).await;
-	tokio::time::sleep(Duration::from_secs(6)).await;
-	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
-	assert_eq!((after["state"].clone(), after["received_sat"].clone()), (json!("paid"), json!(60_000)), "{}", after);
+	let over = store.svc.wait_sale(id, SALE_TIMEOUT, |s| s["received_sat"] == 70_000, "overpaid").await;
+	assert_eq!((over["state"].clone(), over["paid_rail"].clone()), (json!("paid"), json!("onchain")));
+	let history = store.svc.ok(Method::GET, "/api/v1/owner/sales", Some(&store.owner.token), None).await;
+	let row = history["sales"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone();
+	assert_eq!(row["received_sat"], 70_000);
 
 	let csv = owner_csv(&store).await;
-	assert!(csv.contains(id) && csv.contains(",paid,onchain,60000,60000,"), "{}", csv);
+	assert!(csv.contains(id) && csv.contains(",paid,onchain,60000,70000,"), "{}", csv);
 	assert!(!csv.contains("final"), "{}", csv);
 }
 
@@ -216,22 +222,25 @@ async fn lightning_address_and_lud22() {
 	let invoice = reply["pr"].as_str().unwrap();
 	assert_eq!(invoice_hint(invoice), None, "the Lightning Address invoice has no hint");
 	store.lightning.external.pay_bolt11(invoice).await;
+	// The service records the payment, which reaches the owner through
+	// barkd. There is no API listing them.
 	let deadline = tokio::time::Instant::now() + SALE_TIMEOUT;
 	loop {
-		let payments = svc.ok(Method::GET, "/api/v1/owner/nym/payments", Some(&store.owner.token), None).await;
-		let p = &payments["payments"][0];
-		assert_eq!(p["amount_sat"], 21_000);
-		if p["state"] == "paid" {
+		let (state, amount) = lnurl_invoices(svc).await.into_iter().next().expect("an invoice");
+		assert_eq!(amount, 21_000);
+		if state == "paid" {
 			break;
 		}
-		assert!(tokio::time::Instant::now() < deadline, "Lightning Address payment not recorded: {}", p);
+		assert!(tokio::time::Instant::now() < deadline, "Lightning Address payment not recorded: {}", state);
 		tokio::time::sleep(Duration::from_millis(200)).await;
 	}
+	owner_restores(&ctx, &store, sat(15_000)).await;
+	let (status, _) = svc.call(Method::GET, "/api/v1/owner/nym/payments", Some(&store.owner.token), None).await;
+	assert_eq!(status, StatusCode::NOT_FOUND, "no payments list");
 
 	// LUD-22: each method answers with only the requested methods' static
 	// addresses, and creates no invoice.
-	let open_before = svc.ok(Method::GET, "/api/v1/owner/nym/payments", Some(&store.owner.token), None).await
-		["payments"].as_array().unwrap().len();
+	let open_before = lnurl_invoices(svc).await.len();
 	let ark = json!({ "address": store.owner.address.to_string() });
 	let sp = json!({ "address": common::silent_payment_address() });
 	let with = |m: &str| format!("{}?amount=5000000&payment_method={}", path, m);
@@ -240,9 +249,7 @@ async fn lightning_address_and_lud22() {
 	assert_eq!(svc.ok(Method::GET, &with("SCUTTLE,SP"), None, None).await,
 		json!({ "SCUTTLE": ark.clone(), "SP": sp.clone() }));
 	assert_eq!(svc.ok(Method::GET, &with("SP,SCUTTLE"), None, None).await, json!({ "SCUTTLE": ark, "SP": sp }));
-	let open_after = svc.ok(Method::GET, "/api/v1/owner/nym/payments", Some(&store.owner.token), None).await
-		["payments"].as_array().unwrap().len();
-	assert_eq!(open_before, open_after, "a LUD-22 method creates no invoice");
+	assert_eq!(open_before, lnurl_invoices(svc).await.len(), "a LUD-22 method creates no invoice");
 
 	// An unknown method is refused in the LNURL error shape. ARK is not an
 	// alias of SCUTTLE.
@@ -258,13 +265,18 @@ async fn lightning_address_and_lud22() {
 	let (status, _) = svc.call(Method::GET, "/.well-known/lnurlp/nobody", None, None).await;
 	assert_eq!(status, StatusCode::NOT_FOUND);
 
-	// Lookup.
-	let found = svc.ok(Method::GET, "/api/v1/nym/cafe", None, None).await;
-	assert_eq!((found["registered"].clone(), found["has_store"].clone()), (json!(true), json!(true)));
-	let reserved = svc.ok(Method::GET, "/api/v1/nym/api", None, None).await;
-	assert_eq!(reserved["available"], false);
-	let free = svc.ok(Method::GET, "/api/v1/nym/someone-else", None, None).await;
-	assert_eq!(free["available"], true);
+	// There is no public nym lookup.
+	let (status, _) = svc.call(Method::GET, "/api/v1/nym/cafe", None, None).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// The Lightning Address invoices the service recorded, newest first: their
+/// state and amount.
+async fn lnurl_invoices(svc: &Service) -> Vec<(String, i64)> {
+	let conn = svc.app.public.db.conn().await.unwrap();
+	conn.query("
+		SELECT state, amount_sat FROM lnurl_invoice WHERE payment_hash IS NOT NULL ORDER BY id DESC
+	", &[]).await.unwrap().iter().map(|r| (r.get(0), r.get(1))).collect()
 }
 
 #[tokio::test]
@@ -288,9 +300,9 @@ async fn cashier_link() {
 	assert_eq!(status, StatusCode::NOT_FOUND);
 
 	// The link creates, follows and cancels its sale, without a token.
-	let sale = store.new_sale(json!({ "amount_sat": 60_000, "cashier_name": "Back till" })).await;
+	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	let id = sale["id"].as_str().unwrap();
-	assert_eq!(sale["cashier_name"], "Back till");
+	assert!(sale.get("cashier_name").is_none(), "sales carry no cashier name: {}", sale);
 	svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
 	let canceled = svc.ok(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
 	assert_eq!(canceled["state"], "canceled");
@@ -736,21 +748,24 @@ async fn rate_limits_and_bypass() {
 		cfg.certification.allowed_sources = vec!["127.0.0.1".into()];
 	}).await;
 
+	// Name lookups: the store behind a link, here one that does not exist.
+	let lookup = "/api/v1/checkout/someone";
 	for _ in 0..3 {
-		svc.ok(Method::GET, "/api/v1/nym/someone", None, None).await;
+		let (status, _) = svc.call(Method::GET, lookup, None, None).await;
+		assert_eq!(status, StatusCode::NOT_FOUND);
 	}
-	let (status, _) = svc.call(Method::GET, "/api/v1/nym/someone", None, None).await;
+	let (status, _) = svc.call(Method::GET, lookup, None, None).await;
 	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 	// X-Forwarded-For is ignored without a trusted proxy.
 	let mut forwarded = HeaderMap::new();
 	forwarded.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
-	let (status, _) = svc.call_with(Method::GET, "/api/v1/nym/someone", None, None, forwarded).await;
+	let (status, _) = svc.call_with(Method::GET, lookup, None, None, forwarded).await;
 	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 	// The certification token skips the limits.
 	let mut certified = HeaderMap::new();
 	certified.insert("x-bullnym-certification-token", HeaderValue::from_static(token));
-	let (status, _) = svc.call_with(Method::GET, "/api/v1/nym/someone", None, None, certified).await;
-	assert_eq!(status, StatusCode::OK);
+	let (status, _) = svc.call_with(Method::GET, lookup, None, None, certified).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
 
 	// Registrations are limited before any signature check.
 	let body = json!({ "registration": {

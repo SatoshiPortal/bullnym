@@ -133,8 +133,6 @@ CREATE TABLE sale (
 	-- the sale.
 	public_id TEXT NOT NULL UNIQUE,
 	store_id BIGINT NOT NULL REFERENCES store(id),
-	-- A name typed on the cashier screen. The service never verifies it.
-	cashier_name TEXT,
 	-- At most 21,000,000 BTC, checked before the sale is reserved.
 	amount_sat BIGINT NOT NULL CHECK (amount_sat BETWEEN 1 AND 2100000000000000),
 	fiat_amount TEXT,

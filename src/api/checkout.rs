@@ -33,9 +33,6 @@ use crate::watcher;
 /// The longest a long-poll waits.
 const LONG_POLL: Duration = Duration::from_secs(25);
 
-/// The longest cashier name.
-const MAX_CASHIER_NAME_CHARS: usize = 64;
-
 /// The store of a nym.
 async fn store_of(app: &App, nym: &str) -> ApiResult<Store> {
 	let conn = app.public.db.conn().await?;
@@ -50,9 +47,6 @@ pub struct CreateSale {
 	fiat_amount: Option<String>,
 	amount_sat: Option<u64>,
 	memo: Option<String>,
-	/// A name typed on the cashier screen. It is shown in the history and
-	/// never verified.
-	cashier_name: Option<String>,
 }
 
 /// `GET /api/v1/checkout/<nym>`: the store behind its link. Viewing
@@ -98,14 +92,9 @@ pub async fn create_sale(
 		(None, Some(sat)) => SaleAmount::Sat(bitcoin::Amount::from_sat(sat)),
 		_ => return Err(bad_request("give exactly one of fiat_amount and amount_sat")),
 	};
-	let cashier_name = req.cashier_name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
-	if cashier_name.as_ref().is_some_and(|n| n.chars().count() > MAX_CASHIER_NAME_CHARS || n.contains(['\n', '\r'])) {
-		return Err(bad_request("the cashier name must be at most 64 characters on one line"));
-	}
 	// Open, unpaid sales are capped per store, counted and reserved in one
 	// transaction; sales that get paid free their place.
 	let sale = sales::create_sale(&app, &store, NewSale {
-		cashier_name,
 		amount,
 		memo: req.memo,
 	}).await?;

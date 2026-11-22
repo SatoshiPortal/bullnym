@@ -153,7 +153,7 @@ pub async fn test_config(
 	l.sales_per_minute = 1000;
 	l.status_reads_per_minute = 100_000;
 	l.owner_per_minute = 1000;
-	l.pin_checks_per_minute = 1000;
+	l.pin_checks_per_hour = 1000;
 	cfg
 }
 

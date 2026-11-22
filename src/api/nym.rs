@@ -1,19 +1,17 @@
-//! The Lightning Address: registration of the permanent nym, its lookup,
-//! and the owner's view of it.
+//! The Lightning Address: registration of the permanent nym, and the
+//! owner's view of it.
 
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::App;
 use crate::api::owner::{check_timestamp, parse_signature};
-use crate::api::{
-	Owner, StoreView, check_lookup, check_registration, lightning_address, public_url, store_of_nym,
-};
+use crate::api::{Owner, StoreView, check_registration, lightning_address};
 use crate::protect::{Caller, Surface};
 use crate::database::{NYM_COLUMNS, Nym};
 use crate::error::{ApiResult, bad_request, conflict};
@@ -110,38 +108,6 @@ pub async fn register(
 	Ok(Json(json!({ "nym": NymView::new(&app, &nym, None) })))
 }
 
-/// `GET /api/v1/nym/<nym>`: whether a nym is free, and what it serves.
-pub async fn lookup(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(name): Path<String>,
-) -> ApiResult<Json<Value>> {
-	check_lookup(&app, &caller, &name).await?;
-	if let Err(e) = nym::check(&name, &app.cfg.nyms.reserved) {
-		return Ok(Json(json!({
-			"nym": name, "registered": false, "available": false, "reason": e.to_string(),
-		})));
-	}
-	let conn = app.public.db.conn().await?;
-	let row = conn.query_opt(
-		&format!("SELECT {} FROM nym n WHERE n.name = $1", NYM_COLUMNS), &[&name],
-	).await?;
-	let Some(row) = row else {
-		return Ok(Json(json!({ "nym": name, "registered": false, "available": true })));
-	};
-	let nym = Nym::from_row(&row);
-	let store = store_of_nym(&*conn, nym.id).await?;
-	let checkout_url = store.as_ref().map(|_| format!("{}/{}", public_url(&app), nym.name));
-	Ok(Json(json!({
-		"nym": nym.name,
-		"registered": true,
-		"available": false,
-		"lightning_address": lightning_address(&app, &nym.name),
-		"has_store": store.is_some(),
-		"checkout_url": checkout_url,
-	})))
-}
-
 /// `GET /api/v1/owner/nym`.
 pub async fn get_own(State(app): State<Arc<App>>, owner: Owner) -> Json<Value> {
 	let store = owner.store.as_ref().map(|s| StoreView::new(&app, s));
@@ -175,39 +141,4 @@ pub async fn update_own(
 	let nym = Nym::from_row(&row);
 	let store = owner.store.as_ref().map(|s| StoreView::new(&app, s));
 	Ok(Json(json!({ "nym": NymView::new(&app, &nym, store) })))
-}
-
-#[derive(Deserialize)]
-pub struct PaymentsQuery {
-	before: Option<i64>,
-	limit: Option<i64>,
-}
-
-/// `GET /api/v1/owner/nym/payments`: the Lightning payments to the
-/// Lightning Address, newest first. Ark and Silent Payment payments do not
-/// pass through the service and appear only in the owner's wallet.
-pub async fn list_payments(
-	State(app): State<Arc<App>>,
-	owner: Owner,
-	Query(q): Query<PaymentsQuery>,
-) -> ApiResult<Json<Value>> {
-	let limit = q.limit.unwrap_or(50).clamp(1, 100);
-	let conn = app.public.db.conn().await?;
-	let rows = conn.query("
-		SELECT id, payment_hash, amount_sat, state, received_sat, created_at, expires_at, settled_at
-		FROM lnurl_invoice
-		WHERE nym_id = $1 AND payment_hash IS NOT NULL AND ($2::BIGINT IS NULL OR id < $2)
-		ORDER BY id DESC LIMIT $3
-	", &[&owner.nym.id, &q.before, &limit]).await?;
-	let payments = rows.iter().map(|r| json!({
-		"id": r.get::<_, i64>("id"),
-		"payment_hash": r.get::<_, String>("payment_hash"),
-		"amount_sat": r.get::<_, i64>("amount_sat"),
-		"state": r.get::<_, String>("state"),
-		"received_sat": r.get::<_, i64>("received_sat"),
-		"created_at": r.get::<_, DateTime<Utc>>("created_at"),
-		"expires_at": r.get::<_, DateTime<Utc>>("expires_at"),
-		"settled_at": r.get::<_, Option<DateTime<Utc>>>("settled_at"),
-	})).collect::<Vec<_>>();
-	Ok(Json(json!({ "payments": payments })))
 }
