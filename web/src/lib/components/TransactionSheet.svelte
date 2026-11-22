@@ -40,9 +40,7 @@
 							{/if}
 						</div>
 						<div class="mt-0.5 truncate text-xs text-[#776b5a] dark:text-[#b9aa91]">
-							{when(row)} &middot; {railLabel(row.paid_rail)}{row.cashier_name ? ` · ${row.cashier_name}` : ''}{row.memo
-								? ` · ${row.memo}`
-								: ''}
+							{when(row)} &middot; {railLabel(row.paid_rail)}{row.memo ? ` · ${row.memo}` : ''}
 						</div>
 						{#if row.state === 'in-progress' && row.warnings.length > 0}
 							<div class="mt-0.5 truncate text-xs font-semibold text-[#725315] dark:text-[#f0d38a]">

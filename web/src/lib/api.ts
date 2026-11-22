@@ -31,7 +31,6 @@ export interface Sale {
 	warnings: Warning[]
 	notice: 'payment-replaced' | 'payment-dropped' | null
 	late_payment: boolean
-	cashier_name: string | null
 }
 
 export interface Store {
@@ -58,7 +57,7 @@ export interface Rate {
 	fetched_at: string
 }
 
-export type NewSale = ({ fiat_amount: string } | { amount_sat: number }) & { memo?: string; cashier_name?: string }
+export type NewSale = ({ fiat_amount: string } | { amount_sat: number }) & { memo?: string }
 
 export class ApiError extends Error {
 	constructor(

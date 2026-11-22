@@ -41,9 +41,9 @@ describe('PosClient', () => {
 
 	it('creates a fiat sale with the contract body', async () => {
 		const { fetch, calls } = fakeFetch([json({ id: 's1' })])
-		await new PosClient({ fetch, link: PUBLIC }).createSale({ fiat_amount: '12.50', memo: 'coffee', cashier_name: 'Ana' })
+		await new PosClient({ fetch, link: PUBLIC }).createSale({ fiat_amount: '12.50', memo: 'coffee' })
 		expect(calls[0]!.url).toBe('/api/v1/checkout/cafe/sales')
-		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ fiat_amount: '12.50', memo: 'coffee', cashier_name: 'Ana' })
+		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ fiat_amount: '12.50', memo: 'coffee' })
 	})
 
 	it('long-polls with the known state', async () => {

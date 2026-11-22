@@ -75,12 +75,9 @@
 		creating = true
 		errorMsg = null
 		const note = memo.trim() || undefined
-		const cashier_name = session.cashierName.trim() || undefined
 		try {
 			const sale = await client().createSale(
-				unit === 'sat'
-					? { amount_sat: sats, memo: note, cashier_name }
-					: { fiat_amount: normalizeFiat(amount, precision), memo: note, cashier_name },
+				unit === 'sat' ? { amount_sat: sats, memo: note } : { fiat_amount: normalizeFiat(amount, precision), memo: note },
 			)
 			rememberSale(sale)
 			rememberLocalSale(sale.id)
@@ -104,11 +101,6 @@
 			<header class="mb-3 flex shrink-0 items-center justify-between gap-4 sm:mb-5">
 				<div class="min-w-0">
 					<h1 class="truncate font-display text-3xl uppercase tracking-display leading-none">{store?.name ?? 'Point of sale'}</h1>
-					{#if session.cashierName}
-						<p class="mt-0.5 truncate text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
-							{session.cashierName}
-						</p>
-					{/if}
 				</div>
 				<HeaderLinks />
 			</header>

@@ -67,7 +67,7 @@
 	{:else if sale}
 		<ReceiptView
 			merchantName={session.checkout?.store.name ?? ''}
-			posName={sale.cashier_name ?? 'Checkout'}
+			posName="Checkout"
 			receiptNumber={receiptNumber(sale.id)}
 			{dateLabel}
 			methodLabel={railLabel(sale.paid_rail)}

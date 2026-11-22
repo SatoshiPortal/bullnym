@@ -1,13 +1,11 @@
 <script lang="ts">
 	// After bullnym's SettingsScreen (nostr-pos's Settings look). The owner
-	// manages the store from the wallet, so this screen shows the setup and
-	// the cashier name of this device, which is never verified.
+	// manages the store from the wallet, so this screen shows the setup.
 	import { formatSats } from '$lib/money'
 	import { session } from '$lib/session.svelte'
 	import BullFooter from '$lib/components/BullFooter.svelte'
 
 	const store = $derived(session.checkout?.store ?? null)
-	let cashierName = $state(session.cashierName)
 </script>
 
 <main class="min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
@@ -22,18 +20,6 @@
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">Store</dt>
 				<dd class="text-right font-semibold">{store?.name ?? '—'}</dd>
-			</div>
-			<div class="flex items-center justify-between gap-4">
-				<dt class="text-[#776b5a] dark:text-[#b9aa91]">Cashier</dt>
-				<dd class="text-right font-semibold">
-					<input
-						class="min-h-10 w-40 rounded-md border border-[#d7c8b4] bg-[#fffaf0] px-3 text-right dark:border-[#3a342a] dark:bg-[#161512]"
-						bind:value={cashierName}
-						onchange={() => (session.cashierName = cashierName.trim())}
-						maxlength="64"
-						placeholder="Front till"
-					/>
-				</dd>
 			</div>
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">Currency</dt>

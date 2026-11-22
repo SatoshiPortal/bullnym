@@ -31,9 +31,8 @@ function writeLocal(key: string | null, value: string): void {
 	}
 }
 
-const state = $state<{ checkout: Checkout | null; cashierName: string }>({
+const state = $state<{ checkout: Checkout | null }>({
 	checkout: null,
-	cashierName: readLocal(linkKey('cashier-name')) ?? '',
 })
 
 export const session = {
@@ -45,14 +44,6 @@ export const session = {
 	},
 	set checkout(value: Checkout | null) {
 		state.checkout = value
-	},
-	/** A name typed on this device. It labels the sales made here and is never verified. */
-	get cashierName(): string {
-		return state.cashierName
-	},
-	set cashierName(value: string) {
-		state.cashierName = value
-		writeLocal(linkKey('cashier-name'), value)
 	},
 }
 
