@@ -25,9 +25,9 @@ use crate::rails::forward::ForwardStatus;
 use crate::stages::{self, FeePolicy, TxRecord, TxStatus};
 
 
-/// How long an invoice payment is watched after its sale or invoice
-/// expires. A payment made just before expiry can take a little while to
-/// deliver.
+/// How long an open sale waits past its expiry when a payment may be
+/// arriving, or barkd does not answer, before it expires. Its invoice stays
+/// watched after that until barkd gives its outcome.
 const DELIVERY_GRACE_SECS: f64 = 600.0;
 
 /// On-chain addresses are checked every this many ticks.
@@ -109,8 +109,11 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 	Ok(())
 }
 
-/// The invoices of recent sales.
-async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> {
+/// The sale invoices whose outcome barkd has not given yet. An invoice
+/// stays watched, whatever its age, until barkd says it was delivered or
+/// ended unpaid: a read error never ends the watch. A canceled sale's
+/// invoice was canceled in barkd first.
+pub async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> {
 	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, s.state, s.amount_sat,
@@ -118,11 +121,10 @@ async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> {
 			p.received_sat, p.pending_sat, p.settled_at
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
-		WHERE p.settled_at IS NULL AND p.rail <> 'onchain' AND s.state <> 'canceled' AND (
-			s.expires_at > NOW() - make_interval(secs => $1) OR s.state = 'in-progress'
-		)
+		WHERE p.settled_at IS NULL AND p.rail <> 'onchain' AND p.payment_hash IS NOT NULL
+			AND s.state <> 'canceled'
 		ORDER BY p.id
-	", &[&DELIVERY_GRACE_SECS]).await?;
+	", &[]).await?;
 	Ok(rows.iter().map(WatchedPayment::from_row).collect())
 }
 
@@ -518,9 +520,11 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 		if let Some(hash) = row.get::<_, Option<String>>("payment_hash") {
 			match cancel_invoice(&app.watch, &hash).await {
 				Ok(()) => {},
-				Err(CancelError::PaymentArriving) if !past_grace => continue,
-				// The invoice expires at the Ark server at the same time, so
-				// no new payment can start.
+				// A payment is arriving, or barkd did not answer: the sale
+				// waits, up to the delivery grace.
+				Err(_) if !past_grace => continue,
+				// The invoice stays watched until barkd says how it ended; a
+				// payment that still arrives shows as a late payment.
 				Err(e) => tracing::info!("expiring sale {} with its invoice open: {}", sale_id, e),
 			}
 		}
@@ -537,57 +541,75 @@ pub async fn expire_sale(conn: &impl GenericClient, sale_id: i64) -> anyhow::Res
 	", &[&sale_id]).await?)
 }
 
+/// What to do with an open Lightning Address invoice after asking barkd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LnurlStep {
+	/// Delivered to the owner: record it.
+	Paid(Amount),
+	/// Canceled or expired unpaid, as barkd says.
+	Expired,
+	/// Unpaid past its expiry: cancel it in barkd.
+	Cancel,
+	/// Nothing known for sure: keep watching.
+	Keep,
+}
+
+/// The next step for an open Lightning Address invoice. `status` is
+/// barkd's answer, `None` when barkd did not answer. Only barkd's explicit
+/// answer ends the watch: a read error never does, however old the invoice.
+pub fn lnurl_step(status: Option<ForwardStatus>, expired: bool) -> LnurlStep {
+	match status {
+		Some(ForwardStatus::Delivered(amount)) => LnurlStep::Paid(amount),
+		Some(ForwardStatus::Gone) => LnurlStep::Expired,
+		Some(ForwardStatus::Unpaid) if expired => LnurlStep::Cancel,
+		Some(_) | None => LnurlStep::Keep,
+	}
+}
+
 /// Records the Lightning payments to the Lightning Addresses, and cancels
-/// unpaid invoices at expiry.
+/// unpaid invoices at expiry. An invoice stays watched until barkd says how
+/// it ended.
 async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 	let rows = {
 		let conn = app.watch.db.conn().await?;
 		conn.query("
-			SELECT id, payment_hash, expires_at < NOW() AS expired,
-				expires_at < NOW() - make_interval(secs => $1) AS past_grace
-			FROM lnurl_invoice WHERE state = 'open' ORDER BY id
-		", &[&DELIVERY_GRACE_SECS]).await?
+			SELECT id, payment_hash, expires_at < NOW() AS expired
+			FROM lnurl_invoice WHERE state = 'open' AND payment_hash IS NOT NULL ORDER BY id
+		", &[]).await?
 	};
 	for row in rows {
 		let id: i64 = row.get("id");
 		let hash: String = row.get("payment_hash");
 		let expired: bool = row.get("expired");
-		let past_grace: bool = row.get("past_grace");
 		let status = match app.watch.forwarder.status(&hash).await {
-			Ok(s) => s,
-			Err(e) if past_grace => {
-				tracing::info!("closing Lightning Address invoice {} unanswered: {:#}", hash, e);
-				ForwardStatus::Gone
-			},
+			Ok(s) => Some(s),
 			Err(e) => {
 				tracing::warn!("check of Lightning Address invoice {} failed: {:#}", hash, e);
-				continue;
+				None
 			},
 		};
 		let conn = app.watch.db.conn().await?;
-		match status {
-			ForwardStatus::Delivered(amount) => {
+		match lnurl_step(status, expired) {
+			LnurlStep::Paid(amount) => {
 				conn.execute("
 					UPDATE lnurl_invoice SET state = 'paid', received_sat = $2, settled_at = NOW()
 					WHERE id = $1
 				", &[&id, &(amount.to_sat() as i64)]).await?;
 			},
-			ForwardStatus::Gone => {
+			LnurlStep::Expired => {
 				conn.execute("
 					UPDATE lnurl_invoice SET state = 'expired', settled_at = NOW() WHERE id = $1
 				", &[&id]).await?;
 			},
-			ForwardStatus::Unpaid if expired => {
-				match cancel_invoice(&app.watch, &hash).await {
-					Ok(()) => {
-						conn.execute("
-							UPDATE lnurl_invoice SET state = 'expired', settled_at = NOW() WHERE id = $1
-						", &[&id]).await?;
-					},
-					Err(e) => tracing::info!("Lightning Address invoice {} stays open: {}", hash, e),
-				}
+			LnurlStep::Cancel => match cancel_invoice(&app.watch, &hash).await {
+				Ok(()) => {
+					conn.execute("
+						UPDATE lnurl_invoice SET state = 'expired', settled_at = NOW() WHERE id = $1
+					", &[&id]).await?;
+				},
+				Err(e) => tracing::info!("Lightning Address invoice {} stays open: {}", hash, e),
 			},
-			_ => {},
+			LnurlStep::Keep => {},
 		}
 	}
 	Ok(())
@@ -623,6 +645,22 @@ mod test {
 		assert_eq!(next_state(Canceled, 1000, &obs(1000, true)), None);
 		assert_eq!(next_state(Paid, 1000, &obs(1000, true)), None);
 		assert_eq!(next_state(PaymentIssue, 1000, &obs(1000, true)), None);
+	}
+
+	#[test]
+	fn read_errors_never_end_a_lightning_address_invoice() {
+		let a = Amount::from_sat(21);
+		// No answer from barkd: keep watching, even long after expiry.
+		assert_eq!(lnurl_step(None, false), LnurlStep::Keep);
+		assert_eq!(lnurl_step(None, true), LnurlStep::Keep);
+		// Only explicit answers end it.
+		assert_eq!(lnurl_step(Some(ForwardStatus::Delivered(a)), true), LnurlStep::Paid(a));
+		assert_eq!(lnurl_step(Some(ForwardStatus::Gone), false), LnurlStep::Expired);
+		assert_eq!(lnurl_step(Some(ForwardStatus::Unpaid), true), LnurlStep::Cancel);
+		assert_eq!(lnurl_step(Some(ForwardStatus::Unpaid), false), LnurlStep::Keep);
+		for arriving in [ForwardStatus::Arriving, ForwardStatus::AwaitingDelivery, ForwardStatus::Unknown] {
+			assert_eq!(lnurl_step(Some(arriving), true), LnurlStep::Keep);
+		}
 	}
 
 	#[test]

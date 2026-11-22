@@ -545,6 +545,40 @@ async fn options_close_while_their_backend_is_down() {
 }
 
 #[tokio::test]
+async fn unknown_invoice_outcomes_stay_watched() {
+	let ctx = TestContext::new("bullnym/unknown_invoice_outcomes_stay_watched").await;
+	let store = store_setup(&ctx).await;
+	let svc = &store.svc;
+
+	// barkd stops answering, while a Lightning Address invoice and a sale
+	// invoice, long past their expiry and grace, have no known outcome.
+	store.forwarder.stop().await.unwrap();
+	svc.sql(&format!("
+		INSERT INTO lnurl_invoice (nym_id, payment_hash, invoice, amount_sat, expires_at)
+		SELECT id, '{}', 'lnbcrt1unknown', 1000, NOW() - INTERVAL '1 day' FROM nym WHERE name = 'cafe'
+	", "aa".repeat(32))).await.unwrap();
+	svc.sql("
+		INSERT INTO sale (public_id, store_id, amount_sat, state, expires_at, created_at)
+		SELECT 'unknown-outcome', id, 1000, 'expired', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'
+		FROM store
+	").await.unwrap();
+	svc.sql(&format!("
+		INSERT INTO sale_payment (sale_id, rail, payment_hash, invoice)
+		SELECT id, 'lightning', '{}', 'lnbcrt1unknown' FROM sale WHERE public_id = 'unknown-outcome'
+	", "bb".repeat(32))).await.unwrap();
+
+	// Many watcher passes fail to read barkd. Neither invoice is closed.
+	tokio::time::sleep(Duration::from_secs(10)).await;
+	let open = svc.sql(&format!(
+		"UPDATE lnurl_invoice SET state = state WHERE state = 'open' AND payment_hash = '{}'", "aa".repeat(32),
+	)).await.unwrap();
+	assert_eq!(open, 1, "a read error must not end the Lightning Address invoice");
+	let watched = bullnym::watcher::watched_payments(&svc.app).await.unwrap();
+	assert!(watched.iter().any(|p| p.sale_public_id == "unknown-outcome"),
+		"the sale invoice stays watched past its grace");
+}
+
+#[tokio::test]
 async fn rate_limits_and_bypass() {
 	let ctx = TestContext::new("bullnym/rate_limits_and_bypass").await;
 	let (srv, _lightning, forwarder) = common::ark_server(&ctx).await;
