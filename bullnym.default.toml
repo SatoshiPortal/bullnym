@@ -76,12 +76,12 @@ invoice_expiry_secs = 600
 # in progress stays open past it.
 expiry_secs = 600
 # The on-chain minimum of a new store, in sats, at most 2100000000000000. The
-# owner can change it per store. Below it, a sale offers no bitcoin address.
+# owner can change it per store. Below it, Bitcoin cannot be added to a sale.
 default_onchain_min_sat = 50000
 # How often the watcher checks open sales, in milliseconds. On-chain
 # addresses are checked every fifth time.
 poll_interval_ms = 2000
-# Each sale that offers Bitcoin takes the store's next address, and no address
+# Each sale Bitcoin is added to takes the store's next address, and no address
 # is handed out twice, even to two stores with the same descriptor. The
 # owner's wallet scans the store account up to the store's next index, which
 # the owner's store view shows. A sale is paid at 1 confirmation, for good.

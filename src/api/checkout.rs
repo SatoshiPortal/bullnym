@@ -3,9 +3,10 @@
 //! A store has one link, `/<nym>`, always on and open to anyone. Any device
 //! with it acts as a cashier: there is no pairing, no device token and no
 //! login. The link can create a sale, and whoever holds a sale's
-//! unguessable id can follow it and cancel it while it is open. The link
-//! cannot list the store's sales or export them: the history and the CSV
-//! are behind the owner login. The cashier screen keeps the ids of the
+//! unguessable id can follow it, add Bitcoin to it and cancel it while it
+//! is open. A sale has only its Lightning invoice until Bitcoin is added.
+//! The link cannot list the store's sales or export them: the history and
+//! the CSV are behind the owner login. The cashier screen keeps the ids of the
 //! sales it created, and shows them only after the service checked the
 //! owner's cashier PIN (see [crate::pin]).
 
@@ -221,6 +222,18 @@ pub async fn get_sale(
 		}
 		let _ = tokio::time::timeout(deadline - now, changes.changed()).await;
 	}
+}
+
+/// `POST /api/v1/sales/<id>/onchain`: adds a Bitcoin address to an open
+/// sale, at the merchant's request. A second call returns the same address.
+pub async fn add_onchain(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(id): Path<String>,
+) -> ApiResult<Json<SaleView>> {
+	app.protect.check(&caller, Surface::SaleCreate)?;
+	let sale = sales::add_onchain(&app, &id).await?;
+	Ok(Json(sale.into()))
 }
 
 /// `POST /api/v1/sales/<id>/cancel`: cancels a sale that is still open. A

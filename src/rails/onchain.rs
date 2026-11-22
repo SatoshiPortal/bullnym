@@ -319,8 +319,8 @@ mod test {
 			.to_string().starts_with("bcrt1"));
 
 		// Accepted, but no address can be derived, not even the first: a
-		// bare script has no address form. A sale then offers no on-chain
-		// payment (posd refused the whole sale) and the index stays free.
+		// bare script has no address form. Adding Bitcoin to a sale then
+		// fails (posd refused the whole sale) and the index stays free.
 		let bare = ok(format!("pk({}/0/*)", tpub));
 		assert!(bare.address(0, Network::Regtest).is_err());
 		let bare = ok(format!("multi(1,{}/0/*)", tpub));

@@ -65,13 +65,14 @@ async fn sale_paid_by_lightning() {
 	assert_eq!(sale["state"], "open");
 	assert_eq!(sale["amount_sat"], 20_000);
 	assert_eq!(sale["fiat_amount"], "12500.00");
-	assert_eq!(sale["onchain_address"], Value::Null);
-	let pr = sale["payment_request"].as_str().unwrap();
-	assert!(pr.starts_with("bitcoin:?lightning="), "{}", pr);
-	assert!(!pr.contains("ark-lightning"), "one invoice only: {}", pr);
+	// The sale has its Lightning QR only: no Bitcoin unless the merchant
+	// asks, and no QR with both.
+	assert_eq!((sale["onchain_address"].clone(), sale["onchain_request"].clone()), (Value::Null, Value::Null));
+	assert!(sale.get("payment_request").is_none());
+	let invoice = sale["lightning_invoice"].as_str().unwrap();
+	assert_eq!(sale["lightning_request"], format!("lightning:{}", invoice));
 	// The one invoice names the owner's registered address as its Ark hint
 	// (S1). Without S1, barkd leaves the hint out.
-	let invoice = sale["lightning_invoice"].as_str().unwrap();
 	if common::s1_s4() {
 		assert_eq!(invoice_hint(invoice), Some(store.owner.address.to_string()));
 	} else {
@@ -107,14 +108,17 @@ async fn sale_paid_by_ark() {
 
 	let sale = store.new_sale(json!({ "amount_sat": 30_000 })).await;
 	let id = sale["id"].as_str().unwrap();
-	let kind = pay(&payer, sale["payment_request"].as_str().unwrap()).await;
-	// Paid only once the Ark server reports the coins delivered (S4).
+	// The Scuttle wallet pays the Lightning QR text over Ark.
+	let qr = sale["lightning_request"].as_str().unwrap();
+	assert!(qr.starts_with("lightning:"), "{}", qr);
+	let kind = pay(&payer, qr).await;
+	// Paid once barkd settles the receive (S4).
 	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
 	assert_eq!(paid["paid_rail"], "ark", "payer chose {}", kind);
 	assert_eq!(paid["received_sat"], 30_000);
 
 	// The invoice is settled: the sale cannot be paid twice.
-	let again = payer.parse_payment_request(sale["payment_request"].as_str().unwrap()).await.unwrap();
+	let again = payer.parse_payment_request(qr).await.unwrap();
 	let option = again.default_option().expect("an option").clone();
 	assert!(payer.send_payment(&option.method, None, None::<String>, true).await.is_err(),
 		"the server must refuse to pay a settled invoice twice");
@@ -133,7 +137,7 @@ async fn payer_with_hints_off_pays_lightning() {
 
 	let sale = store.new_sale(json!({ "amount_sat": 25_000 })).await;
 	let id = sale["id"].as_str().unwrap();
-	pay(&payer, sale["payment_request"].as_str().unwrap()).await;
+	pay(&payer, sale["lightning_request"].as_str().unwrap()).await;
 	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
 	assert_eq!(paid["paid_rail"], "lightning");
 }
@@ -143,14 +147,22 @@ async fn sale_paid_onchain_through_its_stages() {
 	let ctx = TestContext::new("bullnym/sale_paid_onchain_through_its_stages").await;
 	let store = store_setup(&ctx).await;
 
-	// At or above the 50,000-sat minimum, the sale offers an address.
+	// At or above the 50,000-sat minimum, the merchant can add Bitcoin. The
+	// sale has none until then.
 	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	let id = sale["id"].as_str().unwrap();
-	let address = sale["onchain_address"].as_str().expect("an on-chain address").to_string();
-	assert!(sale["payment_request"].as_str().unwrap()
-		.starts_with(&format!("bitcoin:{}?amount=0.0006&lightning=", address)));
-	let second = store.new_sale(json!({ "amount_sat": 60_000 })).await;
-	assert_ne!(second["onchain_address"].as_str().unwrap(), address, "each open sale has its own address");
+	assert_eq!(sale["onchain_address"], Value::Null);
+	let with_btc = store.add_onchain(&sale).await;
+	let address = with_btc["onchain_address"].as_str().expect("an on-chain address").to_string();
+	// Two QRs, never one with both.
+	assert_eq!(with_btc["onchain_request"], format!("bitcoin:{}?amount=0.0006", address));
+	assert_eq!(with_btc["lightning_request"], sale["lightning_request"], "the invoice stays");
+	// Adding it again gives the same address: a sale takes one index.
+	assert_eq!(store.add_onchain(&sale).await["onchain_address"], address);
+	let owner = Some(store.owner.token.as_str());
+	assert_eq!(store.svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 1);
+	let second = store.add_onchain(&store.new_sale(json!({ "amount_sat": 60_000 })).await).await;
+	assert_ne!(second["onchain_address"].as_str().unwrap(), address, "each sale has its own address");
 
 	// Seen in the mempool: in progress, not guaranteed, and nothing counted.
 	ctx.bitcoind().fund_addr(&address, sat(60_000)).await;
@@ -299,18 +311,29 @@ async fn cashier_link() {
 	let (status, _) = svc.call(Method::GET, "/api/v1/checkout/nobody", None, None).await;
 	assert_eq!(status, StatusCode::NOT_FOUND);
 
-	// The link creates, follows and cancels its sale, without a token.
+	// The link creates, follows and cancels its sale, without a token. A
+	// sale takes no address unless Bitcoin is added to it.
 	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	let id = sale["id"].as_str().unwrap();
 	assert!(sale.get("cashier_name").is_none(), "sales carry no cashier name: {}", sale);
+	assert_eq!(svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 0);
 	svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
+	let onchain = |id: &str| format!("/api/v1/sales/{}/onchain", id);
 	let canceled = svc.ok(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
 	assert_eq!(canceled["state"], "canceled");
 	let (status, _) = svc.call(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
 	assert_eq!(status, StatusCode::CONFLICT);
+	let (status, _) = svc.call(Method::POST, &onchain(id), None, None).await;
+	assert_eq!(status, StatusCode::CONFLICT, "Bitcoin is added to an open sale only");
 	let (status, _) = svc.call(Method::GET, "/api/v1/sales/0123456789abcdef0123456789abcdef", None, None).await;
 	assert_eq!(status, StatusCode::NOT_FOUND);
-	store.new_sale(json!({ "amount_sat": 1000 })).await;
+	let (status, _) = svc.call(Method::POST, &onchain("0123456789abcdef0123456789abcdef"), None, None).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+	// Below the store's on-chain minimum, Bitcoin is refused.
+	let small = store.new_sale(json!({ "amount_sat": 1000 })).await;
+	let (status, body) = svc.call(Method::POST, &onchain(small["id"].as_str().unwrap()), None, None).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+	assert_eq!(svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 0);
 
 	// Amounts past 21,000,000 BTC, or a fiat amount of 10^15 or more, are
 	// refused before a sale, an invoice or an address is allocated.
@@ -522,7 +545,7 @@ async fn unconfirmed_payment_warnings_and_safeguards() {
 		cfg.sales.low_fee_floor_sat_vb = 1000.0;
 		cfg.sales.expiry_secs = 20;
 	}).await;
-	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
+	let sale = store.add_onchain(&store.new_sale(json!({ "amount_sat": 60_000 })).await).await;
 	let id = sale["id"].as_str().unwrap();
 	let address = sale["onchain_address"].as_str().unwrap().to_string();
 
@@ -564,7 +587,7 @@ async fn unconfirmed_payment_warnings_and_safeguards() {
 async fn replaced_payment_returns_the_sale_to_open() {
 	let ctx = TestContext::new("bullnym/replaced_payment_returns_the_sale_to_open").await;
 	let store = store_setup(&ctx).await;
-	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
+	let sale = store.add_onchain(&store.new_sale(json!({ "amount_sat": 60_000 })).await).await;
 	let id = sale["id"].as_str().unwrap();
 	let address = sale["onchain_address"].as_str().unwrap().to_string();
 
@@ -598,15 +621,15 @@ async fn late_payment_and_new_address_per_sale() {
 	let owner = Some(store.owner.token.as_str());
 	assert_eq!(store.svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 0);
 
-	// Each sale that offers Bitcoin takes the next address, as in posd.
-	let a = store.new_sale(json!({ "amount_sat": 2000 })).await;
-	let b = store.new_sale(json!({ "amount_sat": 2000 })).await;
+	// Each sale Bitcoin is added to takes the next address, as in posd.
+	let a = store.add_onchain(&store.new_sale(json!({ "amount_sat": 2000 })).await).await;
+	let b = store.add_onchain(&store.new_sale(json!({ "amount_sat": 2000 })).await).await;
 	let addr_a = a["onchain_address"].as_str().unwrap().to_string();
 	let addr_b = b["onchain_address"].as_str().unwrap().to_string();
 	assert_ne!(addr_a, addr_b);
-	// Below the on-chain minimum, a sale takes no address.
-	let small = store.new_sale(json!({ "amount_sat": 500 })).await;
-	assert_eq!(small["onchain_address"], Value::Null);
+	// A sale without Bitcoin takes no address.
+	let plain = store.new_sale(json!({ "amount_sat": 2000 })).await;
+	assert_eq!(plain["onchain_address"], Value::Null);
 
 	let b_id = b["id"].as_str().unwrap();
 	store.svc.wait_sale_state(b_id, "expired", SALE_TIMEOUT).await;
@@ -624,7 +647,7 @@ async fn late_payment_and_new_address_per_sale() {
 	assert_eq!(row["late_payment"], true, "the owner sees the late payment");
 
 	// An address is never handed out again, even after its sale ended.
-	let c = store.new_sale(json!({ "amount_sat": 2000 })).await;
+	let c = store.add_onchain(&store.new_sale(json!({ "amount_sat": 2000 })).await).await;
 	let addr_c = c["onchain_address"].as_str().unwrap();
 	assert!(addr_c != addr_a && addr_c != addr_b);
 	// The owner's store view gives the next index, for the wallet's scan.
@@ -637,23 +660,27 @@ async fn options_close_while_their_backend_is_down() {
 	let store = store_setup(&ctx).await;
 	let svc = &store.svc;
 
+	let open = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	store.forwarder.stop().await.unwrap();
 	// The health probes close the invoice option after three failures.
+	// A sale needs its invoice, so new sales are refused with one fixed
+	// message.
 	let deadline = tokio::time::Instant::now() + SALE_TIMEOUT;
 	loop {
-		let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
-		if sale["lightning_invoice"].is_null() {
-			assert!(sale["onchain_address"].is_string(), "the on-chain option stays: {}", sale);
+		let (status, body) = svc.call(Method::POST, "/api/v1/checkout/cafe/sales", None,
+			Some(json!({ "amount_sat": 60_000 }))).await;
+		if status == StatusCode::SERVICE_UNAVAILABLE {
+			assert_eq!(body["error"], UNAVAILABLE_MESSAGE);
 			break;
 		}
+		assert!(status.is_success(), "{} {}", status, body);
 		assert!(tokio::time::Instant::now() < deadline, "the invoice option never closed");
 		tokio::time::sleep(Duration::from_secs(1)).await;
 	}
-	// Below the on-chain minimum no option is left: one fixed message.
-	let (status, body) = svc.call(Method::POST, "/api/v1/checkout/cafe/sales", None,
-		Some(json!({ "amount_sat": 1000 }))).await;
-	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-	assert_eq!(body["error"], UNAVAILABLE_MESSAGE);
+	// The on-chain option has its own backend: Bitcoin can still be added
+	// to an open sale.
+	let added = store.add_onchain(&open).await;
+	assert!(added["onchain_address"].is_string(), "{}", added);
 	let (status, body) = svc.call(Method::GET, "/api/v1/lnurlp/cafe/callback?amount=1000000", None, None).await;
 	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 	assert_eq!((body["status"].clone(), body["reason"].clone()), (json!("ERROR"), json!(UNAVAILABLE_MESSAGE)));
@@ -859,12 +886,26 @@ async fn stores_sharing_a_descriptor_never_share_an_address() {
 		tokens.insert(nym, common::login(&svc, &wallet, &address).await);
 	}
 
-	// Ordinary checkouts at both stores, all at once.
+	// Ordinary checkouts at both stores, all at once, then Bitcoin added to
+	// every sale, all at once.
 	let http = reqwest::Client::new();
 	let mut set = tokio::task::JoinSet::new();
 	for i in 0..12 {
 		let nym = if i % 2 == 0 { "alpha" } else { "beta" };
 		let req = http.post(format!("{}/api/v1/checkout/{}/sales", svc.url, nym)).json(&json!({ "amount_sat": 2000 }));
+		set.spawn(async move {
+			let resp = req.send().await.unwrap();
+			assert!(resp.status().is_success(), "{}", resp.status());
+			(nym, resp.json::<Value>().await.unwrap())
+		});
+	}
+	let mut created = Vec::new();
+	while let Some(r) = set.join_next().await {
+		created.push(r.unwrap());
+	}
+	let mut set = tokio::task::JoinSet::new();
+	for (nym, sale) in created {
+		let req = http.post(format!("{}/api/v1/sales/{}/onchain", svc.url, sale["id"].as_str().unwrap()));
 		set.spawn(async move {
 			let resp = req.send().await.unwrap();
 			assert!(resp.status().is_success(), "{}", resp.status());
@@ -914,55 +955,60 @@ async fn stores_sharing_a_descriptor_never_share_an_address() {
 	assert_eq!(with_payment, 1);
 }
 
-/// The full payment request of a sale, as its QR code shows it, and its
-/// invoice alone, as a payer copies it, paid by the Scuttle wallet library.
-/// The test prints what the payer did with each (`QR_OUTCOME`,
-/// `COPIED_INVOICE_OUTCOME`).
+/// The two QR codes of a sale, Lightning and Bitcoin, and its invoice
+/// alone, as a payer copies it, read by the Scuttle wallet library. The test
+/// prints what the payer did with each (`LIGHTNING_QR_OUTCOME`,
+/// `BITCOIN_QR_OUTCOME`, `COPIED_INVOICE_OUTCOME`).
 #[tokio::test]
-async fn full_qr_and_copied_invoice() {
-	let ctx = TestContext::new("bullnym/full_qr_and_copied_invoice").await;
+async fn qr_codes_and_copied_invoice() {
+	let ctx = TestContext::new("bullnym/qr_codes_and_copied_invoice").await;
 	let store = store_setup(&ctx).await;
 	let payer = ctx.bark_sdk("payer", &store.srv).boarded(sat(300_000))
 		.cfg(|cfg| cfg.lightning_ark_address_hints = true)
 		.create().await;
+	let rail = if common::s1_s4() { "ark" } else { "lightning" };
 
-	// A sale above the on-chain minimum: the QR code carries the address,
-	// the amount and the invoice.
+	// The Lightning QR: `lightning:<invoice>`. With S1 the Scuttle wallet
+	// pays it over Ark.
 	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	let id = sale["id"].as_str().unwrap();
-	let qr = sale["payment_request"].as_str().unwrap();
-	assert!(qr.starts_with("bitcoin:bcrt1") && qr.contains("&lightning="), "{}", qr);
+	let qr = sale["lightning_request"].as_str().unwrap();
+	assert!(qr.starts_with("lightning:") && !qr.contains("bitcoin:"), "{}", qr);
+	let kind = pay(&payer, qr).await;
+	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+	eprintln!("LIGHTNING_QR_OUTCOME the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
+	assert_eq!(paid["paid_rail"], rail);
+
+	// The Bitcoin QR, once Bitcoin is added: `bitcoin:<address>?amount=`.
+	let sale = store.add_onchain(&store.new_sale(json!({ "amount_sat": 60_000 })).await).await;
+	let id = sale["id"].as_str().unwrap();
+	let qr = sale["onchain_request"].as_str().unwrap();
+	assert!(qr.starts_with("bitcoin:bcrt1") && qr.ends_with("?amount=0.0006"), "{}", qr);
 	match payer.parse_payment_request(qr).await {
 		Ok(req) => {
-			let option = req.default_option().expect("an option").clone();
-			let kind = option.method.type_str().to_string();
-			payer.send_payment(&option.method, None, None::<String>, true).await.unwrap();
-			let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
-			eprintln!("QR_OUTCOME parsed; the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
+			let kinds = req.options.iter().map(|o| o.method.type_str().to_string()).collect::<Vec<_>>();
+			eprintln!("BITCOIN_QR_OUTCOME parsed, with the options {:?}", kinds);
 		},
 		Err(e) => {
 			let e = format!("{:#}", e);
-			eprintln!("QR_OUTCOME the payer refused the QR code: {}", e);
+			eprintln!("BITCOIN_QR_OUTCOME the payer refused the QR code: {}", e);
 			assert!(e.contains("No valid payment option found"), "{}", e);
-			store.svc.ok(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
 		},
 	}
 
-	// The invoice alone, copied from a sale of the same amount.
-	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
-	let id = sale["id"].as_str().unwrap();
+	// The invoice alone, copied from that sale, which still has it.
 	let kind = pay(&payer, sale["lightning_invoice"].as_str().unwrap()).await;
 	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
 	eprintln!("COPIED_INVOICE_OUTCOME the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
-	let rail = if common::s1_s4() { "ark" } else { "lightning" };
 	assert_eq!(paid["paid_rail"], rail);
 }
 
 /// A manual demo, not run by default. It starts a full stack, prints the
 /// store's checkout link and the owner's token, and pays every sale created
-/// on it from a Scuttle wallet. Run it with
+/// on it from a Scuttle wallet, over its Lightning QR. Run it with
 /// `cargo nextest run --test integration --run-ignored only demo`
-/// and open the link in a browser. DEMO_SECS sets how long it runs.
+/// and open the link in a browser. DEMO_SECS sets how long it runs, and
+/// DEMO_PAY_DELAY_SECS how long a sale waits before it is paid (4 s).
 #[tokio::test]
 #[ignore]
 async fn demo() {
@@ -977,6 +1023,7 @@ async fn demo() {
 	eprintln!("DEMO_OWNER_TOKEN {}", store.owner.token);
 
 	let secs = std::env::var("DEMO_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(900);
+	let delay = std::env::var("DEMO_PAY_DELAY_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
 	let mut paid = std::collections::HashSet::new();
 	while tokio::time::Instant::now() < deadline {
@@ -985,8 +1032,8 @@ async fn demo() {
 			let id = sale["id"].as_str().unwrap().to_string();
 			if sale["state"] == "open" && paid.insert(id.clone()) {
 				// Give the screen time to show the QR code.
-				tokio::time::sleep(Duration::from_secs(4)).await;
-				let kind = pay(&payer, sale["payment_request"].as_str().unwrap()).await;
+				tokio::time::sleep(Duration::from_secs(delay)).await;
+				let kind = pay(&payer, sale["lightning_request"].as_str().unwrap()).await;
 				eprintln!("DEMO paid sale {} by {}", id, kind);
 			}
 		}

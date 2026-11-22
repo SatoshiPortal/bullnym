@@ -13,11 +13,12 @@
 //! days after its sale was created: a payment beyond the amount of a paid
 //! sale counts in its received amount, and never changes its state.
 //!
-//! The rail that paid an invoice is recorded only on positive evidence
-//! from the Ark server: HTLCs it granted for a Lightning payment, or its
-//! report that an Ark payment was delivered. Without one the sale keeps
-//! its state, and an Ark payment that is not delivered keeps its sale in
-//! progress with no deadline.
+//! barkd is the one source of truth for an invoice: a sale is paid when
+//! barkd reports the forwarded receive settled, and an Ark payment barkd
+//! shows awaiting delivery keeps its sale in progress, with no deadline.
+//! The Ark server only labels a settled invoice's rail: Lightning if it
+//! granted HTLCs, Ark if not. The label never holds back the paid state;
+//! when the server cannot be read, the rail stays unknown.
 
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
@@ -50,21 +51,22 @@ pub struct Observation {
 	pub settled: bool,
 	/// An Ark transfer paid the invoice and is not delivered yet.
 	pub awaiting_delivery: bool,
-	/// The invoice was paid by an Ark transfer rather than over Lightning.
-	pub via_ark: bool,
+	/// Whether an Ark transfer rather than a Lightning payment paid the
+	/// invoice. `None` when the Ark server could not say.
+	pub via_ark: Option<bool>,
 }
 
 impl Observation {
-	pub fn invoice(received: Amount, settled: bool, awaiting_delivery: bool, via_ark: bool) -> Observation {
+	pub fn invoice(received: Amount, settled: bool, awaiting_delivery: bool, via_ark: Option<bool>) -> Observation {
 		Observation { received, settled, awaiting_delivery, via_ark }
 	}
 
-	/// The rail that paid, for a sale this observation pays.
-	pub fn paid_rail(&self, rail: Rail) -> Rail {
+	/// The rail that paid, for a sale this observation pays. `None` when it
+	/// is not known.
+	pub fn paid_rail(&self, rail: Rail) -> Option<Rail> {
 		match rail {
-			Rail::Onchain => Rail::Onchain,
-			_ if self.via_ark => Rail::Ark,
-			_ => Rail::Lightning,
+			Rail::Onchain => Some(Rail::Onchain),
+			_ => self.via_ark.map(|ark| if ark { Rail::Ark } else { Rail::Lightning }),
 		}
 	}
 }
@@ -143,65 +145,41 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 			let hash = p.payment_hash.as_deref().context("invoice payment without hash")?;
 			Ok(match app.watch.forwarder.status(hash).await? {
 				ForwardStatus::Unpaid | ForwardStatus::Arriving | ForwardStatus::Unknown => None,
-				// Settled by the Ark server, not yet in the owner's mailbox.
-				// barkd records the delivery on its own schedule; the Ark
-				// server's report of it (S4) is the same guarantee, so the
-				// service asks the server too.
-				ForwardStatus::AwaitingDelivery => {
-					let delivered = match app.ark.receive(hash).await {
-						Ok(r) => r.delivered.filter(|d| *d).map(|_| r.amount),
+				// Settled by an Ark transfer, not yet in the owner's mailbox
+				// as barkd sees it: in progress until barkd settles it.
+				ForwardStatus::AwaitingDelivery => awaiting_delivery(p.sale_state),
+				// barkd settled it: paid. The Ark server only labels the rail.
+				ForwardStatus::Delivered(amount) => {
+					let via_ark = match app.ark.receive(hash).await {
+						Ok(r) => Some(via_ark(&r)),
 						Err(e) => {
-							tracing::debug!("delivery check of invoice {} failed: {:#}", hash, e);
+							tracing::warn!("invoice {} is paid; the Ark server could not say how: {:#}", hash, e);
 							None
 						},
 					};
-					awaiting_delivery(delivered, p.sale_state)
-				},
-				ForwardStatus::Delivered(amount) => match app.ark.receive(hash).await {
-					Ok(r) => match paid_by(&r) {
-						Some(via_ark) => Some(Observation::invoice(amount, true, false, via_ark)),
-						None => {
-							tracing::info!("invoice {} is delivered; waiting for the Ark server to say how \
-								it was paid", hash);
-							None
-						},
-					},
-					Err(e) => {
-						tracing::warn!("could not tell how invoice {} was paid: {:#}", hash, e);
-						None
-					},
+					Some(Observation::invoice(amount, true, false, via_ark))
 				},
 				// Canceled or expired unpaid: stop checking it.
-				ForwardStatus::Gone => Some(Observation::invoice(Amount::ZERO, true, false, false)),
+				ForwardStatus::Gone => Some(Observation::invoice(Amount::ZERO, true, false, None)),
 			})
 		},
 		Rail::Onchain => Ok(None),
 	}
 }
 
-/// How a delivered invoice was paid, from the Ark server's positive
-/// evidence: `Some(false)` for Lightning (it granted HTLCs, which only a
-/// Lightning payment gets), `Some(true)` for Ark (it reports the transfer
-/// delivered). `None` when the answer shows neither: the sale waits.
-pub fn paid_by(r: &crate::ark::ServerReceive) -> Option<bool> {
-	if r.has_htlcs {
-		Some(false)
-	} else if r.delivered == Some(true) {
-		Some(true)
-	} else {
-		None
-	}
+/// The rail of an invoice barkd settled, from the Ark server's view: only
+/// a Lightning payment gets HTLCs, so an invoice without them was paid by
+/// an Ark transfer.
+pub fn via_ark(r: &crate::ark::ServerReceive) -> bool {
+	!r.has_htlcs
 }
 
 /// What an invoice that barkd shows awaiting delivery means for its sale:
-/// paid once the Ark server reports the transfer delivered, in progress
-/// before. `delivered` is the delivered amount, when the server reports
-/// it.
-pub fn awaiting_delivery(delivered: Option<Amount>, state: SaleState) -> Option<Observation> {
-	match delivered {
-		Some(amount) => Some(Observation::invoice(amount, true, false, true)),
-		None if state == SaleState::InProgress => None,
-		None => Some(Observation::invoice(Amount::ZERO, false, true, true)),
+/// in progress, until barkd settles it.
+pub fn awaiting_delivery(state: SaleState) -> Option<Observation> {
+	match state {
+		SaleState::InProgress => None,
+		_ => Some(Observation::invoice(Amount::ZERO, false, true, Some(true))),
 	}
 }
 
@@ -263,7 +241,8 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 	tx.commit().await?;
 
 	if next == Some(SaleState::Paid) {
-		tracing::info!("sale {} paid by {}", p.sale_public_id, obs.paid_rail(p.rail).as_str());
+		let rail = obs.paid_rail(p.rail).map_or("an unknown rail", |r| r.as_str());
+		tracing::info!("sale {} paid by {}", p.sale_public_id, rail);
 		sale_ended(&app.watch, p.sale_id).await;
 	}
 	Ok(next.is_some())
@@ -636,7 +615,7 @@ mod test {
 	use super::*;
 
 	fn obs(received: u64, settled: bool) -> Observation {
-		Observation::invoice(Amount::from_sat(received), settled, false, false)
+		Observation::invoice(Amount::from_sat(received), settled, false, Some(false))
 	}
 
 	#[test]
@@ -648,13 +627,13 @@ mod test {
 		assert_eq!(next_state(Open, 1000, &obs(0, true)), None, "canceled unpaid");
 		// An Ark payment settled by the server but not delivered is in
 		// progress, never paid.
-		let awaiting = Observation::invoice(Amount::ZERO, false, true, true);
+		let awaiting = Observation::invoice(Amount::ZERO, false, true, Some(true));
 		assert_eq!(next_state(Open, 1000, &awaiting), Some(InProgress));
 		assert_eq!(next_state(InProgress, 1000, &awaiting), None);
-		let delivered = Observation::invoice(Amount::from_sat(1000), true, false, true);
+		let delivered = Observation::invoice(Amount::from_sat(1000), true, false, Some(true));
 		assert_eq!(next_state(InProgress, 1000, &delivered), Some(Paid));
-		assert_eq!(delivered.paid_rail(Rail::Lightning), Rail::Ark);
-		assert_eq!(obs(1000, true).paid_rail(Rail::Lightning), Rail::Lightning);
+		assert_eq!(delivered.paid_rail(Rail::Lightning), Some(Rail::Ark));
+		assert_eq!(obs(1000, true).paid_rail(Rail::Lightning), Some(Rail::Lightning));
 		// A payment after the sale ended does not change it: it is a late
 		// payment.
 		assert_eq!(next_state(Expired, 1000, &obs(1000, true)), None);
@@ -663,16 +642,22 @@ mod test {
 	}
 
 	#[test]
-	fn the_paying_rail_needs_positive_evidence() {
+	fn barkd_settles_and_the_server_only_labels_the_rail() {
+		use SaleState::*;
 		use crate::ark::ServerReceive;
 		let r = |has_htlcs, delivered| ServerReceive { has_htlcs, delivered, amount: Amount::from_sat(1000) };
-		assert_eq!(paid_by(&r(true, None)), Some(false), "HTLCs: Lightning");
-		assert_eq!(paid_by(&r(true, Some(false))), Some(false));
-		assert_eq!(paid_by(&r(false, Some(true))), Some(true), "delivered by Ark");
-		// Neither HTLCs nor a delivery report: nothing is inferred, whatever
-		// the sale's state, and the sale waits.
-		assert_eq!(paid_by(&r(false, None)), None);
-		assert_eq!(paid_by(&r(false, Some(false))), None);
+		assert!(!via_ark(&r(true, None)), "HTLCs: Lightning");
+		// The server's delivery report plays no part.
+		assert!(via_ark(&r(false, None)));
+		assert!(via_ark(&r(false, Some(false))));
+		assert!(via_ark(&r(false, Some(true))));
+		// The server could not be read: paid all the same, the rail unknown,
+		// never taken from the sale's state.
+		let unknown = Observation::invoice(Amount::from_sat(1000), true, false, None);
+		for state in [Open, InProgress] {
+			assert_eq!(next_state(state, 1000, &unknown), Some(Paid));
+		}
+		assert_eq!(unknown.paid_rail(Rail::Lightning), None);
 	}
 
 	#[test]
@@ -694,13 +679,11 @@ mod test {
 	#[test]
 	fn ark_payment_awaiting_delivery() {
 		use SaleState::*;
-		// Not delivered yet: in progress, and nothing new once it is.
-		let o = awaiting_delivery(None, Open).unwrap();
+		// barkd shows it awaiting delivery: in progress, with nothing new
+		// until barkd settles it, however long that takes.
+		let o = awaiting_delivery(Open).unwrap();
+		assert!(!o.settled);
 		assert_eq!(next_state(Open, 1000, &o), Some(InProgress));
-		assert_eq!(awaiting_delivery(None, InProgress), None);
-		// The Ark server reports it delivered: paid by Ark.
-		let o = awaiting_delivery(Some(Amount::from_sat(1000)), InProgress).unwrap();
-		assert_eq!(next_state(InProgress, 1000, &o), Some(Paid));
-		assert_eq!(o.paid_rail(Rail::Lightning), Rail::Ark);
+		assert_eq!(awaiting_delivery(InProgress), None);
 	}
 }

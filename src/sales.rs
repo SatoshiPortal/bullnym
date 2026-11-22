@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio_postgres::GenericClient;
 
 use crate::App;
-use crate::database::{Rail, SALE_SELECT, Sale, SaleState, Store};
+use crate::database::{Rail, SALE_SELECT, STORE_COLUMNS, Sale, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, not_found};
 use crate::money::{Decimal, MAX_FIAT_INTEGER, MAX_SAT, currency_decimals};
 use crate::rails::onchain::StoreDescriptor;
@@ -46,7 +46,13 @@ pub struct SaleView {
 	pub currency: Option<String>,
 	pub btc_price: Option<String>,
 	pub memo: Option<String>,
-	pub payment_request: String,
+	/// The Lightning QR: `lightning:<invoice>`. A Lightning wallet pays it
+	/// over Lightning, a Scuttle wallet with address hints on pays it over
+	/// Ark through the invoice's route hint.
+	pub lightning_request: Option<String>,
+	/// The Bitcoin QR: `bitcoin:<address>?amount=<btc>`, once the merchant
+	/// added Bitcoin to the sale. No QR carries both.
+	pub onchain_request: Option<String>,
 	pub lightning_invoice: Option<String>,
 	pub onchain_address: Option<String>,
 	pub paid_at: Option<DateTime<Utc>>,
@@ -69,11 +75,7 @@ pub struct SaleView {
 
 impl From<Sale> for SaleView {
 	fn from(s: Sale) -> SaleView {
-		let payment_request = payment_request(
-			s.onchain_address.as_deref(),
-			Amount::from_sat(s.amount_sat as u64),
-			s.lightning_invoice.as_deref(),
-		);
+		let amount = Amount::from_sat(s.amount_sat as u64);
 		SaleView {
 			id: s.public_id,
 			created_at: s.created_at,
@@ -84,7 +86,8 @@ impl From<Sale> for SaleView {
 			currency: s.currency,
 			btc_price: s.btc_price,
 			memo: s.memo,
-			payment_request,
+			lightning_request: s.lightning_invoice.as_deref().map(lightning_request),
+			onchain_request: s.onchain_address.as_deref().map(|a| onchain_request(a, amount)),
 			lightning_invoice: s.lightning_invoice,
 			onchain_address: s.onchain_address,
 			paid_at: s.paid_at,
@@ -99,27 +102,17 @@ impl From<Sale> for SaleView {
 	}
 }
 
-/// The BIP 321 URI of a sale. The address and amount are only present when
-/// the sale offers on-chain. The one invoice serves every Lightning wallet,
-/// and a Scuttle wallet pays it over Ark through its route hint.
-pub fn payment_request(
-	onchain_address: Option<&str>,
-	amount: Amount,
-	lightning: Option<&str>,
-) -> String {
-	let mut params = Vec::new();
-	if onchain_address.is_some() {
-		params.push(format!("amount={}", btc_amount(amount)));
-	}
-	if let Some(inv) = lightning {
-		params.push(format!("lightning={}", inv));
-	}
-	let mut uri = format!("bitcoin:{}", onchain_address.unwrap_or(""));
-	if !params.is_empty() {
-		uri.push('?');
-		uri.push_str(&params.join("&"));
-	}
-	uri
+/// The Lightning QR of a sale: its invoice as a `lightning:` URI. The one
+/// invoice serves every Lightning wallet, and a Scuttle wallet pays it over
+/// Ark through its route hint.
+pub fn lightning_request(invoice: &str) -> String {
+	format!("lightning:{}", invoice)
+}
+
+/// The Bitcoin QR of a sale: a BIP 321 URI with the address and the amount,
+/// and nothing else. A QR never combines Lightning and Bitcoin.
+pub fn onchain_request(address: &str, amount: Amount) -> String {
+	format!("bitcoin:{}?amount={}", address, btc_amount(amount))
 }
 
 /// A BIP 321 amount: bitcoin, without trailing zeros.
@@ -277,9 +270,9 @@ async fn reserve_sale(
 const MAX_ADDRESS_SKIPS: u32 = 1_000;
 
 /// Hands out the store's next on-chain address, as posd does: each sale
-/// that offers Bitcoin takes the next derivation index, so no address is
+/// Bitcoin is added to takes the next derivation index, so no address is
 /// handed out twice. The index is taken only if the address is watched;
-/// otherwise the sale offers no on-chain payment and the index stays free.
+/// otherwise adding Bitcoin fails and the index stays free.
 ///
 /// Two stores may register the same descriptor. An address another sale
 /// already has, from any store, is skipped and its index used up, so every
@@ -317,11 +310,11 @@ async fn next_address(
 	anyhow::bail!("{} addresses in a row of store {} belong to other sales", MAX_ADDRESS_SKIPS + 1, store.id)
 }
 
-/// Creates a sale with all the rails it offers: one invoice for Lightning
-/// and Ark payers, and an address above the store's on-chain minimum. A
-/// rail whose backend fails is left out; with no rail left, the sale is
-/// refused with the fixed "unavailable" message. An invoice without the
-/// store's Ark hint refuses the sale, as in posd, with its own message.
+/// Creates a sale with its one invoice, for Lightning and Ark payers. A
+/// sale never gets a Bitcoin address by default: the merchant adds one with
+/// [add_onchain]. Without an invoice the sale is refused with the fixed
+/// "unavailable" message. An invoice without the store's Ark hint refuses
+/// the sale, as in posd, with its own message.
 pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sale> {
 	let memo = new.memo.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
 	if memo.as_ref().is_some_and(|m| m.chars().count() > MAX_MEMO_CHARS) {
@@ -376,38 +369,62 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 		None => false,
 	};
 
-	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 && app.protect.health.onchain() {
-		let mut conn = app.public.db.conn().await?;
-		let mut tx = conn.transaction().await?;
-		let taken = match next_address(app, &mut tx, store).await {
-			// The address column is unique: should another sale have the
-			// address after all, this sale offers no on-chain payment.
-			Ok((index, address)) => tx.execute("
-				INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
-				VALUES ($1, 'onchain', $2, $3)
-			", &[&res.sale_id, &index, &address.to_string()]).await.map_err(anyhow::Error::from),
-			Err(e) => Err(e),
-		};
-		match taken {
-			Ok(_) => {
-				tx.commit().await?;
-				true
-			},
-			Err(e) => {
-				tracing::warn!("sale without an on-chain address: {:#}", e);
-				false
-			},
-		}
-	} else {
-		false
-	};
-
-	if !invoice && !onchain {
+	if !invoice {
 		release_sale(app, res.sale_id).await?;
 		return Err(ApiError::Upstream(anyhow::anyhow!("no payment rail is available for the sale")));
 	}
 	let conn = app.public.db.conn().await?;
 	Ok(get_sale_by_id(&*conn, res.sale_id).await?)
+}
+
+/// Adds a Bitcoin address to an open sale, when the merchant asks for it:
+/// the sale must be open, at or above the store's on-chain minimum, and
+/// bitcoind healthy. The address is the store's next one (see
+/// [next_address]). A second call returns the same address: a sale never
+/// takes a second index. The invoice stays payable, and either rail pays
+/// the sale.
+pub async fn add_onchain(app: &App, public_id: &str) -> ApiResult<Sale> {
+	let mut conn = app.public.db.conn().await?;
+	let mut tx = conn.transaction().await?;
+	// Locking the sale serializes two calls for it.
+	let row = tx.query_opt("
+		SELECT id, store_id, state, amount_sat, expires_at <= NOW() AS past_expiry
+		FROM sale WHERE public_id = $1 FOR UPDATE
+	", &[&public_id]).await?.ok_or_else(|| not_found("no such sale"))?;
+	let sale_id: i64 = row.get("id");
+	let has_address = tx.query_opt(
+		"SELECT 1 FROM sale_payment WHERE sale_id = $1 AND rail = 'onchain'", &[&sale_id],
+	).await?.is_some();
+	if !has_address {
+		let state: SaleState = row.get("state");
+		if state != SaleState::Open || row.get::<_, bool>("past_expiry") {
+			let state = if state == SaleState::Open { SaleState::Expired } else { state };
+			return Err(crate::error::conflict(format!("the sale is {}", state)));
+		}
+		let store = tx.query_one(&format!(
+			"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.id = $1", STORE_COLUMNS,
+		), &[&row.get::<_, i64>("store_id")]).await.map(|r| Store::from_row(&r))?;
+		if row.get::<_, i64>("amount_sat") < store.onchain_min_sat {
+			return Err(bad_request(format!(
+				"this store takes Bitcoin from {} sats", store.onchain_min_sat,
+			)));
+		}
+		if !app.protect.health.onchain() {
+			return Err(ApiError::Upstream(anyhow::anyhow!("bitcoind is unhealthy")));
+		}
+		let (index, address) = next_address(app, &mut tx, &store).await.map_err(ApiError::Upstream)?;
+		// The address column is unique: should another sale have the address
+		// after all, this call fails and the sale keeps its invoice only.
+		tx.execute("
+			INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
+			VALUES ($1, 'onchain', $2, $3)
+		", &[&sale_id, &index, &address.to_string()]).await
+			.map_err(|e| ApiError::Upstream(anyhow::Error::from(e).context("the address is taken")))?;
+		tracing::info!("sale {} takes on-chain index {} of store {}", public_id, index, store.id);
+	}
+	let sale = get_sale_by_id(&tx, sale_id).await?;
+	tx.commit().await?;
+	Ok(sale)
 }
 
 /// Deletes a reserved sale that nobody saw, with its rails.
@@ -506,22 +523,11 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn builds_payment_requests() {
-		assert_eq!(
-			payment_request(Some("bc1qaddr"), Amount::from_sat(35_000), Some("lnbc1a")),
-			"bitcoin:bc1qaddr?amount=0.00035&lightning=lnbc1a",
-		);
-		assert_eq!(
-			payment_request(None, Amount::from_sat(1_000), Some("lnbc1a")),
-			"bitcoin:?lightning=lnbc1a",
-		);
-		// One invoice only: no second Ark invoice.
-		assert!(!payment_request(None, Amount::from_sat(1_000), Some("lnbc1a")).contains("ark-lightning"));
-		// On-chain only, when the invoice rail is unavailable.
-		assert_eq!(
-			payment_request(Some("bc1qaddr"), Amount::from_sat(100_000_000), None),
-			"bitcoin:bc1qaddr?amount=1",
-		);
+	fn lightning_and_bitcoin_requests_are_apart() {
+		assert_eq!(lightning_request("lnbc1a"), "lightning:lnbc1a");
+		assert_eq!(onchain_request("bc1qaddr", Amount::from_sat(35_000)), "bitcoin:bc1qaddr?amount=0.00035");
+		assert_eq!(onchain_request("bc1qaddr", Amount::from_sat(100_000_000)), "bitcoin:bc1qaddr?amount=1");
+		assert!(!onchain_request("bc1qaddr", Amount::from_sat(1)).contains("lightning"));
 		assert_eq!(btc_amount(Amount::from_sat(100_000_000)), "1");
 		assert_eq!(btc_amount(Amount::from_sat(1)), "0.00000001");
 	}

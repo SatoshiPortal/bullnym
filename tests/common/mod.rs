@@ -394,6 +394,12 @@ impl Store {
 	pub async fn new_sale(&self, body: Value) -> Value {
 		self.svc.ok(Method::POST, &format!("/api/v1/checkout/{}/sales", self.nym), None, Some(body)).await
 	}
+
+	/// Adds Bitcoin to a sale, as the merchant does after the confirmation.
+	pub async fn add_onchain(&self, sale: &Value) -> Value {
+		let id = sale["id"].as_str().unwrap();
+		self.svc.ok(Method::POST, &format!("/api/v1/sales/{}/onchain", id), None, None).await
+	}
 }
 
 /// Calls bitcoind's JSON-RPC.

@@ -6,8 +6,8 @@
 //!   sales history and CSV.
 //! - `/api/v1/checkout/<nym>/...`: the store's cashier link, which is also
 //!   its public checkout. It needs no token.
-//! - `/api/v1/sales/<id>`: following and canceling one sale, for whoever
-//!   holds its unguessable id.
+//! - `/api/v1/sales/<id>`: following one sale, adding Bitcoin to it and
+//!   canceling it, for whoever holds its unguessable id.
 //! - LNURL: `/.well-known/lnurlp/<nym>` and its callback.
 
 mod checkout;
@@ -48,6 +48,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/checkout/{nym}/sales", post(checkout::create_sale))
 		.route("/checkout/{nym}/pin", post(checkout::check_pin))
 		.route("/sales/{id}", get(checkout::get_sale))
+		.route("/sales/{id}/onchain", post(checkout::add_onchain))
 		.route("/sales/{id}/cancel", post(checkout::cancel_sale))
 		.route("/lnurlp/{nym}/callback", get(lnurl::callback))
 		.fallback(|| async { ApiError::NotFound("no such endpoint".into()) });
