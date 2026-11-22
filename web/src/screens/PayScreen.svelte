@@ -1,18 +1,21 @@
 <script lang="ts">
-	// After bullnym's PayScreen and PayFlow: the amount, one QR code for every
-	// rail, and the payment state, kept current with the service's long-poll.
-	// A payment seen but not counted yet shows an amber "in progress" panel
-	// that says it is not guaranteed, with its warnings. Only a paid sale is
-	// green.
+	// After bullnym's PayScreen and PayFlow: the amount, the Lightning QR
+	// code, and the payment state, kept current with the service's long-poll.
+	// Bitcoin is offered only when the merchant asks for it, after a
+	// confirmation; the screen then shows one QR at a time, with a switch. No
+	// QR combines Lightning and Bitcoin. A payment seen but not counted yet
+	// shows an amber "in progress" panel that says it is not guaranteed, with
+	// its warnings. Only a paid sale is green.
 	import { untrack } from 'svelte'
 	import { ApiError, type Sale } from '$lib/api'
 	import { formatFiat, formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
 	import { countdown, isLive, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
 	import { cachedSale, rememberSale } from '$lib/sale-cache'
-	import { client } from '$lib/session.svelte'
+	import { client, session } from '$lib/session.svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
 	import Button from '$lib/components/Button.svelte'
+	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte'
 	import CopyRow from '$lib/components/CopyRow.svelte'
 	import HeaderLinks from '$lib/components/HeaderLinks.svelte'
 	import QrCard from '$lib/components/QrCard.svelte'
@@ -28,6 +31,11 @@
 	let offline = $state(false)
 	let canceling = $state(false)
 	let nowMs = $state(Date.now())
+	// Which QR shows: Lightning, or Bitcoin once it was added.
+	let shown = $state<'lightning' | 'bitcoin'>('lightning')
+	let confirmingBitcoin = $state(false)
+	let addingBitcoin = $state(false)
+	let bitcoinError = $state<string | null>(null)
 
 	// Long-poll until the sale leaves its live states. Each request returns
 	// when the state changes or after the server's wait limit.
@@ -87,6 +95,30 @@
 	const progress = $derived(sale ? progressText(sale) : null)
 	const notice = $derived(sale ? noticeText(sale) : null)
 	const missing = $derived(sale ? missingSats(sale) : 0)
+	const onchainMin = $derived(session.checkout?.store.onchain_min_sat ?? null)
+	const bitcoinAllowed = $derived(sale !== null && onchainMin !== null && sale.amount_sat >= onchainMin)
+	const qrValue = $derived(
+		sale ? (shown === 'bitcoin' && sale.onchain_request ? sale.onchain_request : sale.lightning_request) : null,
+	)
+
+	/** Adds Bitcoin to the sale, after the merchant confirmed. */
+	async function addBitcoin() {
+		if (!sale || addingBitcoin) return
+		addingBitcoin = true
+		bitcoinError = null
+		try {
+			const next = await client().addOnchain(sale.id)
+			rememberSale(next)
+			sale = next
+			shown = 'bitcoin'
+		} catch (e) {
+			if (e instanceof ApiError && e.status === 503) bitcoinError = 'Bitcoin is not available right now. Try again in a moment.'
+			else bitcoinError = e instanceof Error ? e.message : 'Could not add Bitcoin'
+		} finally {
+			addingBitcoin = false
+			confirmingBitcoin = false
+		}
+	}
 
 	function newSale() {
 		router.go('/')
@@ -202,21 +234,63 @@
 						</p>
 					{/if}
 
-					<QrCard value={sale.payment_request} label="Payment code for Lightning, Ark and bitcoin" />
+					{#if sale.onchain_request}
+						<div class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]" role="tablist" aria-label="Payment code">
+							{#each [['lightning', 'Lightning'], ['bitcoin', 'Bitcoin']] as [value, label] (value)}
+								<button
+									type="button"
+									role="tab"
+									aria-selected={shown === value}
+									class={`min-h-9 rounded-md px-4 font-semibold transition ${
+										shown === value
+											? 'bg-[#fffaf0] text-[#1f513a] shadow-sm dark:bg-[#161512] dark:text-[#8bc8a4]'
+											: 'text-[#5f5547] dark:text-[#c9bca7]'
+									}`}
+									onclick={() => (shown = value as 'lightning' | 'bitcoin')}
+								>
+									{label}
+								</button>
+							{/each}
+						</div>
+					{/if}
+
+					{#if qrValue}
+						<QrCard
+							value={qrValue}
+							label={shown === 'bitcoin' && sale.onchain_request ? 'Bitcoin payment code' : 'Lightning payment code'}
+						/>
+					{/if}
 
 					<div class="flex w-full flex-col gap-2">
-						{#if sale.lightning_invoice}
+						{#if shown === 'bitcoin' && sale.onchain_address}
+							<CopyRow label="Bitcoin address" value={sale.onchain_address} />
+						{:else if sale.lightning_invoice}
 							<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
 						{/if}
-						{#if sale.onchain_address}
-							<CopyRow label="Bitcoin address" value={sale.onchain_address} />
-						{/if}
 					</div>
-					{#if !sale.onchain_address}
-						<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">On-chain payment is not offered for this amount.</p>
+					{#if bitcoinError}
+						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{bitcoinError}</p>
+					{/if}
+					{#if !sale.onchain_request && sale.state === 'open'}
+						{#if bitcoinAllowed}
+							<Button variant="secondary" onclick={() => (confirmingBitcoin = true)}>Bitcoin</Button>
+						{:else if onchainMin !== null}
+							<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
+								Bitcoin on-chain is offered from {formatSats(onchainMin)}.
+							</p>
+						{/if}
 					{/if}
 				</div>
 			{/if}
 		</section>
 	</div>
+	{#if confirmingBitcoin}
+		<ConfirmDialog
+			title="Bitcoin on-chain"
+			text="On-chain Bitcoin payments can take up to 60 minutes to confirm. Don't consider the payment complete until it is confirmed."
+			busy={addingBitcoin}
+			onconfirm={addBitcoin}
+			oncancel={() => (confirmingBitcoin = false)}
+		/>
+	{/if}
 </main>

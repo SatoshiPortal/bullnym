@@ -1,7 +1,7 @@
 <script lang="ts">
 	// Ported from bullnym, which ported nostr-pos's QrCard: the same
-	// qrcode-to-data-URL approach and card chrome. The QR encodes the full
-	// BIP 321 URI, so one code serves every rail.
+	// qrcode-to-data-URL approach and card chrome. A QR encodes one rail:
+	// the Lightning request or the Bitcoin request, never both.
 	import QRCode from 'qrcode'
 	import { Copy } from 'lucide-svelte'
 	import Button from './Button.svelte'

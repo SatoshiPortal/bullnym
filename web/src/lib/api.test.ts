@@ -53,6 +53,14 @@ describe('PosClient', () => {
 		expect(calls[0]!.url).toBe('/api/v1/sales/s1?wait=open')
 	})
 
+	it('adds Bitcoin to a sale', async () => {
+		const { fetch, calls } = fakeFetch([json({ id: 's1', onchain_request: 'bitcoin:bc1q?amount=0.0006' })])
+		const sale = await new PosClient({ fetch, link: PUBLIC }).addOnchain('s1')
+		expect(sale.onchain_request).toBe('bitcoin:bc1q?amount=0.0006')
+		expect(calls[0]!.url).toBe('/api/v1/sales/s1/onchain')
+		expect(calls[0]!.init.method).toBe('POST')
+	})
+
 	it('cancels a sale', async () => {
 		const { fetch, calls } = fakeFetch([json({ id: 's1', state: 'canceled' })])
 		await new PosClient({ fetch, link: PUBLIC }).cancelSale('s1')

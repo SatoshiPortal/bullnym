@@ -17,7 +17,10 @@ export interface Sale {
 	currency: string | null
 	btc_price: string | null
 	memo: string | null
-	payment_request: string
+	/** The Lightning QR: `lightning:<invoice>`. */
+	lightning_request: string | null
+	/** The Bitcoin QR: `bitcoin:<address>?amount=<btc>`, once Bitcoin was added. */
+	onchain_request: string | null
 	lightning_invoice: string | null
 	onchain_address: string | null
 	paid_at: string | null
@@ -126,6 +129,11 @@ export class PosClient {
 	waitSale(id: string, state: SaleState, signal?: AbortSignal): Promise<Sale> {
 		const path = `/api/v1/sales/${encodeURIComponent(id)}?wait=${encodeURIComponent(state)}`
 		return this.json('GET', path, undefined, { timeoutMs: WAIT_TIMEOUT_MS, signal })
+	}
+
+	/** Adds Bitcoin to an open sale. A second call returns the same address. */
+	addOnchain(id: string): Promise<Sale> {
+		return this.json('POST', `/api/v1/sales/${encodeURIComponent(id)}/onchain`)
 	}
 
 	cancelSale(id: string): Promise<Sale> {
