@@ -40,7 +40,7 @@ impl Postgres {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Http {
-	/// The address posd listens on.
+	/// The address the service listens on.
 	pub listen: SocketAddr,
 	/// The public base URL, without a trailing slash. Pairing links and the
 	/// Lightning address use it.
@@ -133,14 +133,14 @@ pub struct Config {
 }
 
 impl Config {
-	/// Loads a config file, then applies `POSD__` environment variables, for
-	/// example `POSD__POSTGRES__HOST`.
+	/// Loads a config file, then applies `BULLNYM__` environment variables, for
+	/// example `BULLNYM__POSTGRES__HOST`.
 	pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
 		let mut builder = config::Config::builder();
 		if let Some(path) = path {
 			builder = builder.add_source(config::File::from(path));
 		}
-		builder.add_source(config::Environment::with_prefix("POSD").separator("__"))
+		builder.add_source(config::Environment::with_prefix("BULLNYM").separator("__"))
 			.build().context("failed to read the config")?
 			.try_deserialize().context("the config is not valid")
 	}

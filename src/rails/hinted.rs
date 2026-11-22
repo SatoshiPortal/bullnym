@@ -44,7 +44,7 @@ impl ArkServer {
 		let conn = ServerConnection::builder()
 			.address(&cfg.ark_server_url)
 			.network(cfg.network)
-			.user_agent(format!("posd/{}", env!("CARGO_PKG_VERSION")))
+			.user_agent(format!("bullnym/{}", env!("CARGO_PKG_VERSION")))
 			.connect().await
 			.context("failed to connect to the Ark server")?;
 		if !conn.expiry_payouts().await {

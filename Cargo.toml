@@ -1,0 +1,57 @@
+[package]
+name = "bullnym"
+version = "0.1.0"
+license = "MIT"
+description = "Lightning Address and store service that pays an Ark wallet by Lightning, Ark and on-chain"
+edition = "2024"
+rust-version = "1.90"
+
+[workspace]
+
+[lib]
+name = "bullnym"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bullnym"
+path = "src/bin/bullnym/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[dependencies]
+# Scuttle crates, pinned to a release tag (see README.md).
+ark-lib = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6" }
+bark-server-rpc = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6" }
+bark-bitcoin-ext = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6" }
+
+anyhow = { version = "1.0", features = ["backtrace"] }
+axum = { version = "0.8.4", features = ["macros", "tokio", "http1", "query", "json"], default-features = false }
+bb8 = "0.9.0"
+bb8-postgres = "0.9.0"
+bdk_wallet = "=3.2.0"
+bitcoin = { version = "0.32.7", features = ["serde", "rand", "rand-std"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.4.18", features = ["derive", "env"] }
+config = "0.15.6"
+lightning-invoice = { version = "0.34.0", features = ["std", "serde"] }
+postgres-types = { version = "0.2.9", features = ["derive", "with-chrono-0_4"] }
+refinery = { version = "0.8.14", default-features = false, features = ["tokio-postgres"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rust-embed = { version = "8.5", features = ["mime-guess", "interpolate-folder-path"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.12"
+tokio = { version = "1.35", default-features = false, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+tokio-postgres = "0.7.12"
+tracing = { version = "0.1.43", features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3.22", features = ["std", "registry", "ansi", "fmt", "env-filter"] }
+url = "2.5"
+
+[dev-dependencies]
+# The integration tests run a real Ark server, barkd, bitcoind and
+# lightningd through the Scuttle testing crate. See README.md.
+ark-testing = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6" }
+bark-wallet = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6", features = ["sqlite"] }
+bip39 = { version = "2.0.0", features = ["rand"] }

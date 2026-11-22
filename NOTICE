@@ -1,0 +1,18 @@
+bullnym
+=======
+
+This service started from posd, the point-of-sale service written by Lee
+Salminen for Scuttle (the pos branch of Bitcoin-Jungle/scuttle, commit
+48fc3ade1). The first commit of this repository is his code, unchanged:
+the service, its API documentation, the terminal web app, the signet
+deployment scripts and the integration tests. The store registration and
+owner login, the sale engine, the rate lock, the QR code, the history and
+CSV export, the on-chain watch-only wallet and the web app design are his
+work.
+
+posd was released under the MIT license, as part of Scuttle. Its copyright
+notice is kept in LICENSE.
+
+The protections against floods and address exhaustion, the reserved names
+and the LUD-22 negotiation shape come from the Liquid Bullnym service
+(BullishNode/bullnym).

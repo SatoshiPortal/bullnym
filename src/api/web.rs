@@ -26,7 +26,7 @@ fn serve_index() -> Response {
 			[(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")],
 			file.data,
 		).into_response(),
-		None => (StatusCode::NOT_FOUND, "posd was built without the terminal").into_response(),
+		None => (StatusCode::NOT_FOUND, "bullnym was built without the web app").into_response(),
 	}
 }
 

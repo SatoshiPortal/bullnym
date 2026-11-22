@@ -41,14 +41,14 @@ fn generate_migrations(dir: &str, out_file: &str) {
 	fs::write(out, code).expect("failed to write migrations module");
 }
 
-/// Stages the terminal PWA to embed in posd.
+/// Stages the terminal PWA to embed in the service.
 ///
 /// rust-embed needs the folder to exist at compile time, so the staging
-/// directory is always created. It is filled from POS_WEB_DIST, or else from
-/// web/dist when the PWA was built in place. Without either, posd serves no
+/// directory is always created. It is filled from BULLNYM_WEB_DIST, or else from
+/// web/dist when the PWA was built in place. Without either, the service serves no
 /// terminal.
 fn stage_web_dist() {
-	println!("cargo:rerun-if-env-changed=POS_WEB_DIST");
+	println!("cargo:rerun-if-env-changed=BULLNYM_WEB_DIST");
 
 	let staging = PathBuf::from(env::var("OUT_DIR").unwrap()).join("web-dist");
 	if staging.exists() {
@@ -56,7 +56,7 @@ fn stage_web_dist() {
 	}
 	fs::create_dir_all(&staging).expect("failed to create the web staging directory");
 
-	let dist = match env::var("POS_WEB_DIST") {
+	let dist = match env::var("BULLNYM_WEB_DIST") {
 		Ok(dist) => PathBuf::from(dist),
 		Err(_) => PathBuf::from("web/dist"),
 	};
