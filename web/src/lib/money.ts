@@ -1,4 +1,4 @@
-// Currency formatting, ported from bullnym (pwa/lib/money.ts). posd sends
+// Currency formatting, ported from bullnym (pwa/lib/money.ts). The service sends
 // fiat amounts and prices as decimal strings in major units.
 
 /**
@@ -62,7 +62,7 @@ export function fiatToSats(fiatAmount: string, btcPrice: string): number {
 }
 
 /**
- * The fiat amount as posd expects it: a decimal string with exactly the
+ * The fiat amount as the service expects it: a decimal string with exactly the
  * currency's minor digits, for example ("12.5", 2) → "12.50".
  */
 export function normalizeFiat(amount: string, precision: number): string {

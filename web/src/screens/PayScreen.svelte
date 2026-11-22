@@ -1,11 +1,14 @@
 <script lang="ts">
 	// After bullnym's PayScreen and PayFlow: the amount, one QR code for every
-	// rail, and the payment state, kept current with posd's long-poll.
+	// rail, and the payment state, kept current with the service's long-poll.
+	// A payment seen but not counted yet shows an amber "in progress" panel
+	// that says it is not guaranteed, with its warnings. Only a paid sale is
+	// green.
 	import { untrack } from 'svelte'
 	import { ApiError, type Sale } from '$lib/api'
 	import { formatFiat, formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { countdown, isLive, railLabel, saleAmountLabel } from '$lib/sale'
+	import { countdown, isLive, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
 	import { cachedSale, rememberSale } from '$lib/sale-cache'
 	import { client } from '$lib/session.svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
@@ -81,6 +84,9 @@
 
 	const amountLabel = $derived(sale ? saleAmountLabel(sale, (a, c) => formatFiat(a, c)) : '')
 	const remaining = $derived(sale ? countdown(sale.expires_at, nowMs) : null)
+	const progress = $derived(sale ? progressText(sale) : null)
+	const notice = $derived(sale ? noticeText(sale) : null)
+	const missing = $derived(sale ? missingSats(sale) : 0)
 
 	function newSale() {
 		router.go('/')
@@ -99,7 +105,7 @@
 			newSale()
 		} catch (e) {
 			// A payment arrived first; the long-poll shows it.
-			if (!(e instanceof ApiError && e.status === 409)) newSale()
+			if (!(e instanceof ApiError && (e.status === 409 || e.status === 503))) newSale()
 		} finally {
 			canceling = false
 		}
@@ -143,6 +149,24 @@
 						</p>
 					{/if}
 				</div>
+			{:else if sale.state === 'payment-issue'}
+				<TerminalPanel
+					icon="!"
+					tone="err"
+					title="Payment issue"
+					detail="A confirmed bitcoin payment for this sale was undone by a chain reorganization. It is not counted until it confirms again. The owner sees it in the history."
+					actionLabel="New Sale"
+					onaction={newSale}
+				/>
+			{:else if sale.state === 'expired' && sale.late_payment}
+				<TerminalPanel
+					icon="!"
+					tone="warn"
+					title="Late payment"
+					detail="A payment arrived after this sale expired. It is not attached to another sale; the owner sees it in the history."
+					actionLabel="New Sale"
+					onaction={newSale}
+				/>
 			{:else if sale.state === 'expired'}
 				<TerminalPanel icon="×" tone="err" title="Expired" detail="This sale expired without payment. Returning..." />
 			{:else if sale.state === 'canceled'}
@@ -151,11 +175,16 @@
 				<div class="mx-auto flex max-w-md flex-col items-center gap-5 py-6 text-center">
 					<p class="font-display text-7xl tabular-nums tracking-display leading-none">{amountLabel}</p>
 					<BullSpinner size={72} label="Payment in progress" />
-					<div class="rounded-md bg-[#fff0c7] px-5 py-4 text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]">
-						<p class="font-semibold">The bitcoin payment is in the mempool.</p>
-						<p class="mt-1 text-sm">
-							The sale is paid at 1 confirmation, which usually takes 10 to 60 minutes. You can start a new sale; this one
-							stays in history and completes on its own.
+					<div class="rounded-md bg-[#fff0c7] px-5 py-4 text-left text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]" role="status">
+						<p class="font-semibold">{progress?.title}. Not paid yet.</p>
+						<ul class="mt-2 space-y-1.5 text-sm">
+							{#each progress?.lines ?? [] as line (line)}
+								<li>{line}</li>
+							{/each}
+						</ul>
+						<p class="mt-2 text-sm">
+							Handing over goods before the sale shows paid is the store's own risk. You can start a new sale; this one completes on
+							its own and stays in the owner's history.
 						</p>
 					</div>
 					<Button variant="secondary" onclick={newSale}>New Sale</Button>
@@ -176,10 +205,23 @@
 						{/if}
 					</div>
 
+					{#if notice}
+						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28] dark:bg-[#3a211e] dark:text-[#e8a49e]" role="alert">
+							{notice} The sale is open again.
+						</p>
+					{/if}
+					{#if missing > 0}
+						<p class="w-full rounded-md bg-[#fff0c7] px-4 py-3 text-sm font-semibold text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]">
+							A bitcoin payment is in sight, {formatSats(missing)} short of the amount.
+						</p>
+					{/if}
+
 					<QrCard value={sale.payment_request} label="Payment code for Lightning, Ark and bitcoin" />
 
 					<div class="flex w-full flex-col gap-2">
-						<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
+						{#if sale.lightning_invoice}
+							<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
+						{/if}
 						{#if sale.onchain_address}
 							<CopyRow label="Bitcoin address" value={sale.onchain_address} />
 						{/if}

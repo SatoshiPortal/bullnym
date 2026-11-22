@@ -7,7 +7,7 @@
 	import { ApiError, type Sale } from '$lib/api'
 	import { formatFiat, formatSats, shortId } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { railLabel, receiptNumber, saleAmountLabel, stateLabel } from '$lib/sale'
+	import { railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
 	import { cachedSale, rememberSale } from '$lib/sale-cache'
 	import { client, session } from '$lib/session.svelte'
 	import Button from '$lib/components/Button.svelte'
@@ -66,12 +66,12 @@
 		<p class="py-20 text-center">Receipt not found.</p>
 	{:else if sale}
 		<ReceiptView
-			merchantName={session.terminal?.store.name ?? ''}
-			posName={sale.device_name ?? 'Lightning address'}
+			merchantName={session.store?.name ?? ''}
+			posName={sale.cashier_name ?? (sale.link === 'unlisted' ? 'Cashier' : 'Checkout')}
 			receiptNumber={receiptNumber(sale.id)}
 			{dateLabel}
 			methodLabel={railLabel(sale.paid_rail)}
-			statusLabel={stateLabel(sale.state)}
+			statusLabel={stageLabel(sale)}
 			amountSatsLabel={formatSats(sale.state === 'paid' ? sale.received_sat : sale.amount_sat)}
 			amountFiatLabel={saleAmountLabel(sale, (a, c) => formatFiat(a, c))}
 			note={sale.memo ?? undefined}
@@ -83,7 +83,7 @@
 					isPaid ? 'bg-[#d9f3df] text-[#14522d]' : 'bg-[#fff0c7] text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]'
 				}`}
 			>
-				<p class="font-display text-5xl uppercase tracking-display leading-none">{stateLabel(sale.state)}</p>
+				<p class="font-display text-5xl uppercase tracking-display leading-none">{stageLabel(sale)}</p>
 				<p class="mt-1 text-sm">{isPaid ? 'Receipt ready.' : 'Start a new sale.'}</p>
 			</div>
 		</div>

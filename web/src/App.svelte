@@ -1,40 +1,39 @@
 <script lang="ts">
-	// Terminal shell. "/pair/<code>" activates the device; once it has a
-	// token, the app is hash-routed like bullnym's POS.
+	// The cashier screen and the public checkout are one page: "/<nym>" for a
+	// store's public link and "/c/<secret>" for its unlisted link. Any device
+	// with the link takes payments; there is no pairing and no device token.
+	// Inside a link, the app is hash-routed like bullnym's POS. "/owner" is
+	// the owner's history, behind the owner login.
 	import { ApiError } from '$lib/api'
 	import { router } from '$lib/router.svelte'
-	import { client, pairingCodeFromPath, session } from '$lib/session.svelte'
+	import { client, session } from '$lib/session.svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
 	import HistoryScreen from './screens/HistoryScreen.svelte'
 	import KeypadScreen from './screens/KeypadScreen.svelte'
-	import PairScreen from './screens/PairScreen.svelte'
+	import LandingScreen from './screens/LandingScreen.svelte'
+	import OwnerScreen from './screens/OwnerScreen.svelte'
 	import PayScreen from './screens/PayScreen.svelte'
 	import ReceiptScreen from './screens/ReceiptScreen.svelte'
 	import SettingsScreen from './screens/SettingsScreen.svelte'
-	import UnpairedScreen from './screens/UnpairedScreen.svelte'
 
-	const pairingCode = pairingCodeFromPath(location.pathname)
-
-	// An installed app always opens at its start_url, which carries the
-	// pairing code. A device that is already paired ignores the code.
-	if (session.token && pairingCode) history.replaceState(null, '', `/${location.hash || '#/'}`)
+	const isOwner = /^\/owner\/?$/.test(location.pathname)
 
 	let loadError = $state<string | null>(null)
 
 	$effect(() => {
-		const token = session.token
-		if (!token) return
+		if (!session.link) return
 		let current = true
 		loadError = null
 		client()
-			.terminal()
-			.then((t) => {
-				if (current) session.terminal = t
+			.store()
+			.then((s) => {
+				if (current) session.store = s
 			})
 			.catch((e) => {
-				if (current && !(e instanceof ApiError && e.isUnauthorized)) {
-					loadError = e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the terminal.'
-				}
+				if (!current) return
+				if (e instanceof ApiError && e.isNotFound) loadError = 'This checkout link does not work. Ask the owner for the current link.'
+				else if (e instanceof ApiError && e.status === 0) loadError = 'The server is not reachable.'
+				else loadError = 'Could not load the store.'
 			})
 		return () => {
 			current = false
@@ -45,13 +44,11 @@
 	const receiptId = $derived(router.match('/receipt/:id')?.id)
 </script>
 
-{#if !session.token}
-	{#if pairingCode}
-		<PairScreen code={pairingCode} />
-	{:else}
-		<UnpairedScreen />
-	{/if}
-{:else if !session.terminal}
+{#if isOwner}
+	<OwnerScreen />
+{:else if !session.link}
+	<LandingScreen />
+{:else if !session.store}
 	<main class="grid min-h-screen place-items-center bg-[#f5f0e8] px-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
 		{#if loadError}
 			<div class="text-center">

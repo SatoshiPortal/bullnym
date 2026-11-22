@@ -1,5 +1,9 @@
-// Presentation of a Sale: labels, tones and the receipt number.
-import type { PaidRail, Sale, SaleState } from './api'
+// Presentation of a Sale: labels, tones, warnings and the receipt number.
+//
+// A payment the service has seen but cannot count yet is "in progress":
+// amber, with plain words that it is not guaranteed. It is never shown
+// green; only a paid sale is.
+import type { PaidRail, Sale, SaleState, Warning } from './api'
 
 export function railLabel(rail: PaidRail | null): string {
 	switch (rail) {
@@ -22,6 +26,8 @@ export function stateLabel(state: SaleState): string {
 			return 'In progress'
 		case 'paid':
 			return 'Paid'
+		case 'payment-issue':
+			return 'Payment issue'
 		case 'expired':
 			return 'Expired'
 		case 'canceled':
@@ -29,17 +35,97 @@ export function stateLabel(state: SaleState): string {
 	}
 }
 
-/** Left-border tone for a history row, as in nostr-pos's TransactionSheet. */
-export function stateBorderTone(state: SaleState): string {
-	switch (state) {
-		case 'paid':
-			return 'border-[#1f513a]'
+/** The stage of a sale, as the cashier, the payer and the owner see it. */
+export function stageLabel(sale: Sale): string {
+	switch (sale.state) {
 		case 'in-progress':
-		case 'open':
-			return 'border-[#c99a2e]'
+			return sale.progress === 'ark' ? 'In progress' : 'In progress, not guaranteed'
+		case 'paid':
+			return sale.final ? 'Paid · final' : 'Paid'
+		case 'expired':
+		case 'canceled':
+			return sale.late_payment ? `${stateLabel(sale.state)} · late payment` : stateLabel(sale.state)
 		default:
+			return stateLabel(sale.state)
+	}
+}
+
+export type Tone = 'ok' | 'warn' | 'err'
+
+/** Green only for a paid sale. In progress is amber, never green. */
+export function stageTone(sale: Sale): Tone {
+	switch (sale.state) {
+		case 'paid':
+			return 'ok'
+		case 'open':
+		case 'in-progress':
+			return 'warn'
+		default:
+			return sale.late_payment ? 'warn' : 'err'
+	}
+}
+
+/** Left-border tone for a history row, as in nostr-pos's TransactionSheet. */
+export function stateBorderTone(sale: Sale): string {
+	switch (stageTone(sale)) {
+		case 'ok':
+			return 'border-[#1f513a]'
+		case 'warn':
+			return 'border-[#c99a2e]'
+		case 'err':
 			return 'border-[#a9362f]'
 	}
+}
+
+/** The always-on warning while an on-chain payment is unconfirmed. */
+export const NOT_GUARANTEED =
+	"Payment seen, not confirmed yet. It isn't guaranteed until 1 confirmation, which usually takes 10 to 60 minutes."
+
+/** The extra warnings, in plain words. */
+export function warningText(w: Warning): string {
+	switch (w) {
+		case 'not-guaranteed':
+			return NOT_GUARANTEED
+		case 'low-fee':
+			return 'The fee is low: it may take hours to confirm, or drop out.'
+		case 'unconfirmed-parents':
+			return 'It spends coins that are not confirmed either: if they are replaced, this payment disappears too.'
+		case 'replaced':
+			return 'A payment to this sale was replaced by one that does not pay it.'
+	}
+}
+
+/** What the in-progress panel says. */
+export function progressText(sale: Sale): { title: string; lines: string[] } {
+	if (sale.progress === 'ark') {
+		return {
+			title: 'Ark payment in progress',
+			lines: [
+				'The Ark server accepted the payment and is delivering it to the wallet. The sale is paid once it is delivered; it completes on its own.',
+			],
+		}
+	}
+	const lines = sale.warnings.map(warningText)
+	if (!sale.warnings.includes('not-guaranteed')) lines.unshift(NOT_GUARANTEED)
+	return { title: 'Bitcoin payment seen', lines }
+}
+
+export function noticeText(sale: Sale): string | null {
+	switch (sale.notice) {
+		case 'payment-replaced':
+			return 'Payment replaced: the payer replaced it with a transaction that does not pay this sale.'
+		case 'payment-dropped':
+			return 'Payment dropped: it left the mempool without confirming.'
+		default:
+			return null
+	}
+}
+
+/** The sats still missing from an open sale with a partial payment in sight. */
+export function missingSats(sale: Sale): number {
+	if (sale.state !== 'open') return 0
+	const inSight = sale.received_sat + sale.seen_sat
+	return inSight > 0 && inSight < sale.amount_sat ? sale.amount_sat - inSight : 0
 }
 
 /** The sale is still waiting for its payment. */

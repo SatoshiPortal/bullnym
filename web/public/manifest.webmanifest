@@ -1,6 +1,6 @@
 {
-	"name": "Point of sale",
-	"short_name": "POS",
+	"name": "Checkout",
+	"short_name": "Checkout",
 	"start_url": "/",
 	"scope": "/",
 	"display": "standalone",

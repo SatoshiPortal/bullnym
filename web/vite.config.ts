@@ -4,12 +4,13 @@ import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 import { resolve } from 'node:path'
 
-// posd embeds dist/ and serves it at the site root. The SPA handles both
-// "/" and "/pair/<code>", so assets use root-absolute URLs.
+// bullnym embeds dist/ and serves it at the site root. The SPA handles "/",
+// "/<nym>", "/c/<secret>" and "/owner", so assets use root-absolute URLs.
 //
-// posd serves the manifests itself: "/manifest.webmanifest" for a paired
-// terminal and "/pair/<code>/manifest.webmanifest" for an install link, so
-// the plugin must not emit one.
+// The service serves the manifests of the cashier links itself
+// ("/<nym>/manifest.webmanifest" and "/c/<secret>/manifest.webmanifest"),
+// and public/manifest.webmanifest is the default, so the plugin must not
+// emit one.
 export default defineConfig({
 	base: '/',
 	plugins: [
@@ -37,11 +38,8 @@ export default defineConfig({
 	server: {
 		proxy: {
 			'/api': 'http://127.0.0.1:3080',
-			'/pair': {
-				target: 'http://127.0.0.1:3080',
-				bypass: (req) => (req.url?.endsWith('.webmanifest') ? undefined : '/index.html'),
-			},
-			'/manifest.webmanifest': 'http://127.0.0.1:3080',
+			'/.well-known': 'http://127.0.0.1:3080',
+			'^/.+/manifest\\.webmanifest$': 'http://127.0.0.1:3080',
 		},
 	},
 })

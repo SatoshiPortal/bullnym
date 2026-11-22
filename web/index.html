@@ -9,15 +9,18 @@
 		<meta name="apple-mobile-web-app-status-bar-style" content="default" />
 		<link rel="icon" type="image/png" href="/icons/icon-192.png" />
 		<link rel="apple-touch-icon" href="/icons/icon-192.png" />
-		<title>Point of sale</title>
+		<title>Checkout</title>
 		<script>
-			// An install link must install with its own manifest, whose
-			// start_url carries the pairing code. posd serves both manifests.
+			// A cashier link installs with its own manifest, whose start_url is
+			// the link. The service serves the manifests of both kinds of link.
 			;(function () {
-				var match = location.pathname.match(/^\/pair\/([^/]+)\/?$/)
+				var unlisted = location.pathname.match(/^\/c\/([0-9a-fA-F]+)\/?$/)
+				var pub = location.pathname.match(/^\/([a-z0-9-]+)\/?$/)
 				var link = document.createElement('link')
 				link.rel = 'manifest'
-				link.href = match ? '/pair/' + match[1] + '/manifest.webmanifest' : '/manifest.webmanifest'
+				if (unlisted) link.href = '/c/' + unlisted[1] + '/manifest.webmanifest'
+				else if (pub && pub[1] !== 'owner') link.href = '/' + pub[1] + '/manifest.webmanifest'
+				else link.href = '/manifest.webmanifest'
 				document.head.appendChild(link)
 			})()
 		</script>

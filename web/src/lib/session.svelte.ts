@@ -1,59 +1,80 @@
-// The device token lives in the installed app's own storage. On iOS a
-// home-screen app does not share storage with Safari, so the app pairs
-// after install, from the start_url that carries the code.
-import { PosClient, type Terminal } from './api'
+// The cashier link this page serves, the store behind it, and the cashier
+// name typed on this device. There is no device token: the link is all a
+// cashier needs. The name is never verified; it only labels the sales made
+// here.
+import { CashierClient, linkFromPath, type Link, type Store } from './api'
 
-const TOKEN_KEY = 'scuttle-pos:token'
+function storageKey(link: Link, what: string): string {
+	return `bullnym:${link.kind === 'public' ? `nym:${link.nym}` : `link:${link.secret}`}:${what}`
+}
 
-function readToken(): string | null {
+function read(key: string): string | null {
 	try {
-		return localStorage.getItem(TOKEN_KEY)
+		return localStorage.getItem(key)
 	} catch {
 		return null
 	}
 }
 
-const state = $state<{ token: string | null; terminal: Terminal | null }>({
-	token: readToken(),
-	terminal: null,
+function write(key: string, value: string | null): void {
+	try {
+		if (value === null) localStorage.removeItem(key)
+		else localStorage.setItem(key, value)
+	} catch {
+		/* storage unavailable: it lasts for this page only */
+	}
+}
+
+const link = linkFromPath(location.pathname)
+
+const state = $state<{ store: Store | null; cashierName: string }>({
+	store: null,
+	cashierName: link ? (read(storageKey(link, 'cashier-name')) ?? '') : '',
 })
 
 export const session = {
-	get token(): string | null {
-		return state.token
+	get link(): Link | null {
+		return link
 	},
-	get terminal(): Terminal | null {
-		return state.terminal
+	get store(): Store | null {
+		return state.store
 	},
-	set terminal(value: Terminal | null) {
-		state.terminal = value
+	set store(value: Store | null) {
+		state.store = value
 	},
-	signIn(token: string): void {
-		try {
-			localStorage.setItem(TOKEN_KEY, token)
-		} catch {
-			/* storage unavailable: the token lasts for this page only */
-		}
-		state.token = token
+	get cashierName(): string {
+		return state.cashierName
 	},
-	signOut(): void {
-		try {
-			localStorage.removeItem(TOKEN_KEY)
-		} catch {
-			/* storage unavailable */
-		}
-		state.token = null
-		state.terminal = null
+	set cashierName(value: string) {
+		state.cashierName = value
+		if (link) write(storageKey(link, 'cashier-name'), value.trim() || null)
 	},
 }
 
-/** A client with the current device token. A 401 unpairs this device. */
-export function client(): PosClient {
-	return new PosClient({ token: state.token, onUnauthorized: () => session.signOut() })
+/** A client for this page's cashier link. */
+export function client(): CashierClient {
+	if (!link) throw new Error('no cashier link')
+	return new CashierClient(link)
 }
 
-/** The pairing code in "/pair/<code>", or null. */
-export function pairingCodeFromPath(pathname: string): string | null {
-	const match = pathname.match(/^\/pair\/([^/]+)\/?$/)
-	return match ? decodeURIComponent(match[1]!) : null
+/**
+ * The sales this device created on this link, newest first. It is a
+ * convenience of this screen, never the record: the owner's history is.
+ */
+const LOCAL_HISTORY_MAX = 50
+
+export function localSaleIds(): string[] {
+	if (!link) return []
+	try {
+		const ids = JSON.parse(read(storageKey(link, 'sales')) ?? '[]')
+		return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : []
+	} catch {
+		return []
+	}
+}
+
+export function rememberLocalSale(id: string): void {
+	if (!link) return
+	const ids = [id, ...localSaleIds().filter((x) => x !== id)].slice(0, LOCAL_HISTORY_MAX)
+	write(storageKey(link, 'sales'), JSON.stringify(ids))
 }
