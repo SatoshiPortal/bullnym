@@ -168,19 +168,82 @@ async fn resolve_amount(
 	Ok((amount_sat, fiat))
 }
 
-/// Whether a new sale may have an invoice: barkd and the Ark server are
-/// healthy, the cap on open invoices is not reached, and the public
-/// invoice budget has room.
-async fn invoice_admission(app: &App) -> anyhow::Result<()> {
-	if !app.protect.health.invoices() {
-		anyhow::bail!("barkd or the Ark server is unhealthy");
+/// The advisory lock under which the caps on open sales and open invoices
+/// are counted and a new sale or invoice is reserved, so parallel requests
+/// cannot pass a cap together.
+pub const CAPS_LOCK: &str = "bullnym:open-caps";
+
+/// Takes the caps lock for the rest of `tx`.
+pub async fn lock_caps(tx: &tokio_postgres::Transaction<'_>) -> Result<(), tokio_postgres::Error> {
+	tx.execute("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)", &[&CAPS_LOCK]).await?;
+	Ok(())
+}
+
+/// A new sale, reserved under the caps before any backend call: the sale
+/// row, and the slot of its invoice when it may have one.
+struct Reservation {
+	sale_id: i64,
+	invoice_slot: Option<i64>,
+}
+
+/// Reserves a sale in one transaction with the count of the caps: the
+/// store's open sales, and whether the sale may have an invoice (barkd and
+/// the Ark server healthy, the cap on open invoices not reached, room in
+/// the public invoice budget).
+async fn reserve_sale(
+	app: &App,
+	store: &Store,
+	cashier_name: &Option<String>,
+	memo: &Option<String>,
+	amount_sat: Amount,
+	fiat: &Option<(Decimal, Decimal)>,
+) -> ApiResult<Reservation> {
+	let mut conn = app.public.db.conn().await?;
+	let tx = conn.transaction().await?;
+	lock_caps(&tx).await?;
+	let open_sales: i64 = tx.query_one(
+		"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&store.id],
+	).await?.get(0);
+	if open_sales >= app.protect.limits.max_open_sales_per_store as i64 {
+		tracing::info!("store {} has {} open sales, its cap", store.id, open_sales);
+		return Err(ApiError::TooManyRequests);
 	}
-	let conn = app.public.db.conn().await?;
-	let open = crate::api::open_invoices(&*conn).await.map_err(|e| anyhow::anyhow!("{}", e))?;
-	if open >= app.protect.limits.max_open_invoices as i64 {
-		anyhow::bail!("the open invoice cap is reached");
-	}
-	app.protect.take_public_invoice().map_err(|e| anyhow::anyhow!("{}", e))
+	let invoice_ok = if !app.protect.health.invoices() {
+		tracing::info!("sale without an invoice: barkd or the Ark server is unhealthy");
+		false
+	} else if crate::api::open_invoices(&tx).await? >= app.protect.limits.max_open_invoices as i64 {
+		tracing::info!("sale without an invoice: the open invoice cap is reached");
+		false
+	} else if app.protect.take_public_invoice().is_err() {
+		tracing::info!("sale without an invoice: the public invoice budget is spent");
+		false
+	} else {
+		true
+	};
+
+	let public_id = token::random_hex(16);
+	let sale_id: i64 = tx.query_one("
+		INSERT INTO sale (public_id, store_id, cashier_name, amount_sat, fiat_amount,
+			currency, btc_price, memo, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + make_interval(secs => $9))
+		RETURNING id
+	", &[
+		&public_id, &store.id, cashier_name, &(amount_sat.to_sat() as i64),
+		&fiat.as_ref().map(|(f, _)| f.to_string()),
+		&fiat.as_ref().map(|_| store.currency.clone()),
+		&fiat.as_ref().map(|(_, p)| p.to_string()),
+		memo, &(app.cfg.sales.expiry().as_secs() as f64),
+	]).await?.get("id");
+	// The invoice slot counts against the cap on open invoices from now on.
+	let invoice_slot = if invoice_ok {
+		Some(tx.query_one("
+			INSERT INTO sale_payment (sale_id, rail) VALUES ($1, 'lightning') RETURNING id
+		", &[&sale_id]).await?.get::<_, i64>("id"))
+	} else {
+		None
+	};
+	tx.commit().await?;
+	Ok(Reservation { sale_id, invoice_slot })
 }
 
 /// Hands out the store's next on-chain address, as posd does: each sale
@@ -222,75 +285,62 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 	let expiry = app.cfg.sales.expiry();
 	let description = Some(memo.clone().unwrap_or_else(|| store.name.clone()));
 
-	// The invoice is created first: it needs the network, and an invoice
-	// left over from a failed insert just expires. It names the owner's
-	// address as its Ark hint (S1), so one invoice serves Lightning and Ark
-	// payers.
-	let invoice = match invoice_admission(app).await {
-		Ok(()) => match app.public.forwarder.create_invoice(
+	// The sale and its invoice slot are reserved first, under the caps.
+	// Each backend step then fills or releases its part.
+	let res = reserve_sale(app, store, &new.cashier_name, &memo, amount_sat, &fiat).await?;
+
+	// The invoice names the owner's address as its Ark hint (S1), so one
+	// invoice serves Lightning and Ark payers.
+	let invoice = match res.invoice_slot {
+		Some(slot) => match app.public.forwarder.create_invoice(
 			amount_sat, &ark_address, description, expiry, true,
 		).await {
-			Ok(i) => Some(i),
+			Ok(invoice) => {
+				let conn = app.public.db.conn().await?;
+				conn.execute("
+					UPDATE sale_payment SET payment_hash = $2, invoice = $3 WHERE id = $1
+				", &[&slot, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
+				true
+			},
 			Err(e) => {
 				tracing::warn!("sale without an invoice: {:#}", e);
-				None
+				let conn = app.public.db.conn().await?;
+				conn.execute("DELETE FROM sale_payment WHERE id = $1", &[&slot]).await?;
+				false
 			},
 		},
-		Err(e) => {
-			tracing::info!("sale without an invoice: {:#}", e);
-			None
-		},
+		None => false,
 	};
 
-	let mut conn = app.public.db.conn().await?;
-	let mut tx = conn.transaction().await?;
-
 	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 && app.protect.health.onchain() {
+		let mut conn = app.public.db.conn().await?;
+		let mut tx = conn.transaction().await?;
 		match next_address(app, &mut tx, store).await {
-			Ok(a) => Some(a),
+			Ok((index, address)) => {
+				tx.execute("
+					INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
+					VALUES ($1, 'onchain', $2, $3)
+				", &[&res.sale_id, &index, &address.to_string()]).await?;
+				tx.commit().await?;
+				true
+			},
 			Err(e) => {
 				tracing::warn!("sale without an on-chain address: {:#}", e);
-				None
+				false
 			},
 		}
 	} else {
-		None
+		false
 	};
-	if invoice.is_none() && onchain.is_none() {
+
+	let conn = app.public.db.conn().await?;
+	if !invoice && !onchain {
+		// Nobody saw this sale: release it.
+		conn.execute("DELETE FROM sale_payment WHERE sale_id = $1", &[&res.sale_id]).await?;
+		conn.execute("DELETE FROM sale WHERE id = $1", &[&res.sale_id]).await?;
 		return Err(ApiError::Upstream(anyhow::anyhow!("no payment rail is available for the sale")));
 	}
-
-	let public_id = token::random_hex(16);
-	let row = tx.query_one("
-		INSERT INTO sale (public_id, store_id, cashier_name, amount_sat, fiat_amount,
-			currency, btc_price, memo, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + make_interval(secs => $9))
-		RETURNING id
-	", &[
-		&public_id, &store.id, &new.cashier_name, &(amount_sat.to_sat() as i64),
-		&fiat.as_ref().map(|(f, _)| f.to_string()),
-		&fiat.as_ref().map(|_| store.currency.clone()),
-		&fiat.as_ref().map(|(_, p)| p.to_string()),
-		&memo, &(expiry.as_secs() as f64),
-	]).await?;
-	let sale_id = row.get::<_, i64>("id");
-
-	if let Some(invoice) = &invoice {
-		tx.execute("
-			INSERT INTO sale_payment (sale_id, rail, payment_hash, invoice)
-			VALUES ($1, 'lightning', $2, $3)
-		", &[&sale_id, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
-	}
-	if let Some((index, address)) = &onchain {
-		tx.execute("
-			INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
-			VALUES ($1, 'onchain', $2, $3)
-		", &[&sale_id, index, &address.to_string()]).await?;
-	}
-
-	let sale = get_sale_by_id(&tx, sale_id).await?;
-	tx.commit().await?;
-	Ok(sale)
+	Ok(get_sale_by_id(&*conn, res.sale_id).await?)
 }
 
 pub async fn get_sale_by_id(conn: &impl GenericClient, id: i64) -> anyhow::Result<Sale> {

@@ -30,6 +30,7 @@ use crate::api::{check_lookup, lightning_address, open_invoices, public_url};
 use crate::database::{NYM_COLUMNS, Nym};
 use crate::error::{ApiError, UNAVAILABLE_MESSAGE};
 use crate::protect::{self, Caller, Surface};
+use crate::sales::lock_caps;
 
 
 /// The LUD-22 methods this service offers.
@@ -236,36 +237,51 @@ pub fn static_reply(method: Method, nym: &Nym) -> Option<Value> {
 /// registered Ark address. The service records it, watches barkd for its
 /// payment and cancels it at expiry.
 async fn lightning_invoice(app: &App, nym: &Nym, amount: Amount) -> Result<String, ApiError> {
+	let address = ark::Address::from_str(&nym.ark_address)
+		.map_err(|e| ApiError::Internal(anyhow::anyhow!("nym {} has an invalid address: {}", nym.name, e)))?;
+	let expiry = app.cfg.nyms.invoice_expiry();
+
 	// Open invoices are capped per nym and in total, so the service cannot
-	// be used to flood the Ark server with hold invoices.
-	{
-		let conn = app.public.db.conn().await?;
-		let of_nym: i64 = conn.query_one(
+	// be used to flood the Ark server with hold invoices. The invoice is
+	// reserved in the same transaction as the count, so parallel callbacks
+	// cannot pass a cap together.
+	let slot: i64 = {
+		let mut conn = app.public.db.conn().await?;
+		let tx = conn.transaction().await?;
+		lock_caps(&tx).await?;
+		let of_nym: i64 = tx.query_one(
 			"SELECT count(*) FROM lnurl_invoice WHERE nym_id = $1 AND state = 'open'", &[&nym.id],
 		).await?.get(0);
 		if of_nym >= app.protect.limits.max_open_invoices_per_nym as i64 {
 			return Err(ApiError::TooManyRequests);
 		}
-		if open_invoices(&*conn).await? >= app.protect.limits.max_open_invoices as i64 {
+		if open_invoices(&tx).await? >= app.protect.limits.max_open_invoices as i64 {
 			return Err(ApiError::Upstream(anyhow::anyhow!("the open invoice cap is reached")));
 		}
-	}
-	app.protect.take_public_invoice()?;
-	let address = ark::Address::from_str(&nym.ark_address)
-		.map_err(|e| ApiError::Internal(anyhow::anyhow!("nym {} has an invalid address: {}", nym.name, e)))?;
-	let expiry = app.cfg.nyms.invoice_expiry();
+		app.protect.take_public_invoice()?;
+		let slot = tx.query_one("
+			INSERT INTO lnurl_invoice (nym_id, amount_sat, expires_at)
+			VALUES ($1, $2, NOW() + make_interval(secs => $3))
+			RETURNING id
+		", &[&nym.id, &(amount.to_sat() as i64), &(expiry.as_secs() as f64)]).await?.get("id");
+		tx.commit().await?;
+		slot
+	};
+
 	let description = Some(format!("Payment to {}", nym.shown_name()));
-	let invoice = app.public.forwarder.create_invoice(amount, &address, description, expiry, false).await
-		.map_err(ApiError::Upstream)?;
 	let conn = app.public.db.conn().await?;
-	conn.execute("
-		INSERT INTO lnurl_invoice (nym_id, payment_hash, invoice, amount_sat, expires_at)
-		VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5))
-	", &[
-		&nym.id, &invoice.payment_hash().to_string(), &invoice.to_string(),
-		&(amount.to_sat() as i64), &(expiry.as_secs() as f64),
-	]).await?;
-	Ok(invoice.to_string())
+	match app.public.forwarder.create_invoice(amount, &address, description, expiry, false).await {
+		Ok(invoice) => {
+			conn.execute("
+				UPDATE lnurl_invoice SET payment_hash = $2, invoice = $3 WHERE id = $1
+			", &[&slot, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
+			Ok(invoice.to_string())
+		},
+		Err(e) => {
+			conn.execute("DELETE FROM lnurl_invoice WHERE id = $1", &[&slot]).await?;
+			Err(ApiError::Upstream(e))
+		},
+	}
 }
 
 #[cfg(test)]

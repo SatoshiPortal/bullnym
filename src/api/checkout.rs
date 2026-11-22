@@ -97,18 +97,8 @@ pub async fn create_sale(
 	if cashier_name.as_ref().is_some_and(|n| n.chars().count() > MAX_CASHIER_NAME_CHARS || n.contains(['\n', '\r'])) {
 		return Err(bad_request("the cashier name must be at most 64 characters on one line"));
 	}
-	// Open, unpaid sales are capped per store; sales that get paid free
-	// their place.
-	let open: i64 = {
-		let conn = app.public.db.conn().await?;
-		conn.query_one(
-			"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&store.id],
-		).await?.get(0)
-	};
-	if open >= app.protect.limits.max_open_sales_per_store as i64 {
-		tracing::info!("store {} has {} open sales, its cap", store.id, open);
-		return Err(ApiError::TooManyRequests);
-	}
+	// Open, unpaid sales are capped per store, counted and reserved in one
+	// transaction; sales that get paid free their place.
 	let sale = sales::create_sale(&app, &store, NewSale {
 		cashier_name,
 		amount,

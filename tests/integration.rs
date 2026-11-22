@@ -578,6 +578,44 @@ async fn unknown_invoice_outcomes_stay_watched() {
 		"the sale invoice stays watched past its grace");
 }
 
+/// Sends `n` requests at once and counts the ones that succeed.
+async fn parallel_successes(n: usize, request: impl Fn() -> reqwest::RequestBuilder) -> (usize, Vec<StatusCode>) {
+	let mut set = tokio::task::JoinSet::new();
+	for _ in 0..n {
+		let req = request();
+		set.spawn(async move { req.send().await.unwrap().status() });
+	}
+	let mut statuses = Vec::new();
+	while let Some(status) = set.join_next().await {
+		statuses.push(status.unwrap());
+	}
+	(statuses.iter().filter(|s| s.is_success()).count(), statuses)
+}
+
+#[tokio::test]
+async fn caps_hold_under_parallel_requests() {
+	let ctx = TestContext::new("bullnym/caps_hold_under_parallel_requests").await;
+	let store = store_setup_with(&ctx, |cfg| {
+		cfg.limits.max_open_invoices_per_nym = 3;
+		cfg.limits.max_open_sales_per_store = 4;
+	}).await;
+	let http = reqwest::Client::new();
+
+	// Twelve Lightning Address callbacks at once: exactly the cap of open
+	// invoices of the nym gets one.
+	let url = format!("{}/api/v1/lnurlp/cafe/callback?amount=1000000", store.svc.url);
+	let (ok, statuses) = parallel_successes(12, || http.get(&url)).await;
+	assert_eq!(ok, 3, "open invoices per nym: {:?}", statuses);
+	assert!(statuses.iter().all(|s| s.is_success() || *s == StatusCode::TOO_MANY_REQUESTS), "{:?}", statuses);
+
+	// Twelve sales at once: exactly the cap of open sales of the store.
+	let url = format!("{}/api/v1/checkout/cafe/sales", store.svc.url);
+	let (ok, statuses) = parallel_successes(12, || http.post(&url).json(&json!({ "amount_sat": 1000 }))).await;
+	assert_eq!(ok, 4, "open sales per store: {:?}", statuses);
+	let history = store.svc.ok(Method::GET, "/api/v1/owner/sales", Some(&store.owner.token), None).await;
+	assert_eq!(history["sales"].as_array().unwrap().len(), 4);
+}
+
 #[tokio::test]
 async fn rate_limits_and_bypass() {
 	let ctx = TestContext::new("bullnym/rate_limits_and_bypass").await;

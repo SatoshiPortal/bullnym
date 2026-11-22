@@ -572,6 +572,12 @@ pub fn lnurl_step(status: Option<ForwardStatus>, expired: bool) -> LnurlStep {
 async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 	let rows = {
 		let conn = app.watch.db.conn().await?;
+		// A reservation that never got its invoice, because the process
+		// stopped in between, was never shown to a payer.
+		conn.execute("
+			DELETE FROM lnurl_invoice
+			WHERE payment_hash IS NULL AND expires_at < NOW() - make_interval(secs => $1)
+		", &[&DELIVERY_GRACE_SECS]).await?;
 		conn.query("
 			SELECT id, payment_hash, expires_at < NOW() AS expired
 			FROM lnurl_invoice WHERE state = 'open' AND payment_hash IS NOT NULL ORDER BY id

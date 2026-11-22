@@ -95,12 +95,13 @@ CREATE TABLE owner_session (
 
 -- An invoice of a Lightning Address payment. Ark and Silent Payment
 -- payments to a Lightning Address are not recorded: they reach the owner's
--- wallet without the service.
+-- wallet without the service. A row is reserved under the caps before barkd
+-- makes the invoice, so its payment hash and invoice come after.
 CREATE TABLE lnurl_invoice (
 	id BIGSERIAL PRIMARY KEY,
 	nym_id BIGINT NOT NULL REFERENCES nym(id),
-	payment_hash TEXT NOT NULL UNIQUE,
-	invoice TEXT NOT NULL,
+	payment_hash TEXT UNIQUE,
+	invoice TEXT,
 	amount_sat BIGINT NOT NULL,
 	-- open, paid or expired.
 	state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'paid', 'expired')),
@@ -170,7 +171,9 @@ CREATE TABLE name_access_event (
 CREATE INDEX name_access_event_idx ON name_access_event (source_key, created_at);
 
 -- One row per payment rail offered for a sale: the invoice, which
--- Lightning and Ark payers both pay, and the on-chain address.
+-- Lightning and Ark payers both pay, and the on-chain address. The invoice
+-- row is reserved under the caps before barkd makes the invoice, so its
+-- payment hash and invoice come after.
 CREATE TABLE sale_payment (
 	id BIGSERIAL PRIMARY KEY,
 	sale_id BIGINT NOT NULL REFERENCES sale(id),

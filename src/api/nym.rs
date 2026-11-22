@@ -195,7 +195,7 @@ pub async fn list_payments(
 	let rows = conn.query("
 		SELECT id, payment_hash, amount_sat, state, received_sat, created_at, expires_at, settled_at
 		FROM lnurl_invoice
-		WHERE nym_id = $1 AND ($2::BIGINT IS NULL OR id < $2)
+		WHERE nym_id = $1 AND payment_hash IS NOT NULL AND ($2::BIGINT IS NULL OR id < $2)
 		ORDER BY id DESC LIMIT $3
 	", &[&owner.nym.id, &q.before, &limit]).await?;
 	let payments = rows.iter().map(|r| json!({
