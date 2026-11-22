@@ -21,6 +21,8 @@ pub enum ApiError {
 	NotFound(String),
 	#[error("{0}")]
 	Conflict(String),
+	#[error("too many requests; try again later")]
+	TooManyRequests,
 	/// A backend failed or is unhealthy: the payment option is withdrawn,
 	/// with one fixed message.
 	#[error("{}", UNAVAILABLE_MESSAGE)]
@@ -62,6 +64,7 @@ impl IntoResponse for ApiError {
 			ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
 			ApiError::NotFound(_) => StatusCode::NOT_FOUND,
 			ApiError::Conflict(_) => StatusCode::CONFLICT,
+			ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
 			ApiError::Upstream(e) => {
 				tracing::warn!("backend unavailable: {:#}", e);
 				StatusCode::SERVICE_UNAVAILABLE

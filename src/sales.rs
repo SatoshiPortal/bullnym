@@ -171,6 +171,21 @@ async fn resolve_amount(
 	Ok((amount_sat, fiat))
 }
 
+/// Whether a new sale may have an invoice: barkd and the Ark server are
+/// healthy, the cap on open invoices is not reached, and the public
+/// invoice budget has room.
+async fn invoice_admission(app: &App) -> anyhow::Result<()> {
+	if !app.protect.health.invoices() {
+		anyhow::bail!("barkd or the Ark server is unhealthy");
+	}
+	let conn = app.public.db.conn().await?;
+	let open = crate::api::open_invoices(&*conn).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+	if open >= app.protect.limits.max_open_invoices as i64 {
+		anyhow::bail!("the open invoice cap is reached");
+	}
+	app.protect.take_public_invoice().map_err(|e| anyhow::anyhow!("{}", e))
+}
+
 /// Whether a new address at `next_index` stays within `gap_limit` of the
 /// last address that received anything, so a wallet scanning with that gap
 /// limit sees it.
@@ -201,7 +216,7 @@ async fn allocate_address(
 			.require_network(app.cfg.network)?;
 		// The chain has the last word: an address that ever received
 		// anything is never handed out again.
-		if app.chain.has_received(&address).await? {
+		if app.public.chain.has_received(&address).await? {
 			tx.execute("UPDATE onchain_address SET ever_received = TRUE WHERE id = $1", &[&id]).await?;
 			continue;
 		}
@@ -223,7 +238,7 @@ async fn allocate_address(
 	}
 	let desc = StoreDescriptor::parse(&store.onchain_descriptor).context("store has an invalid descriptor")?;
 	let address = desc.address(u32::try_from(next).context("on-chain index overflow")?, app.cfg.network)?;
-	app.chain.watch(&address).await?;
+	app.public.chain.watch(&address).await?;
 	let id: i64 = tx.query_one("
 		INSERT INTO onchain_address (store_id, derivation_index, address) VALUES ($1, $2, $3)
 		RETURNING id
@@ -254,22 +269,28 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 	// left over from a failed insert just expires. It names the owner's
 	// address as its Ark hint (S1), so one invoice serves Lightning and Ark
 	// payers.
-	let invoice = match app.forwarder.create_invoice(
-		amount_sat, &ark_address, description, expiry, true,
-	).await {
-		Ok(i) => Some(i),
+	let invoice = match invoice_admission(app).await {
+		Ok(()) => match app.public.forwarder.create_invoice(
+			amount_sat, &ark_address, description, expiry, true,
+		).await {
+			Ok(i) => Some(i),
+			Err(e) => {
+				tracing::warn!("sale without an invoice: {:#}", e);
+				None
+			},
+		},
 		Err(e) => {
-			tracing::warn!("sale without an invoice: {:#}", e);
+			tracing::info!("sale without an invoice: {:#}", e);
 			None
 		},
 	};
 
-	let mut conn = app.db.conn().await?;
+	let mut conn = app.public.db.conn().await?;
 	let tx = conn.transaction().await?;
 
 	// Each on-chain sale gets its own address, so two open sales never
 	// share one.
-	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 {
+	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 && app.protect.health.onchain() {
 		match allocate_address(app, &tx, store).await {
 			Ok(a) => a,
 			Err(e) => {

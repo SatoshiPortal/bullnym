@@ -55,15 +55,14 @@ async fn inner_main() -> anyhow::Result<()> {
 async fn start(cfg: Config) -> anyhow::Result<()> {
 	let listen = cfg.http.listen;
 	let app = bullnym::App::new(cfg).await?;
-	tokio::spawn(bullnym::watcher::run(app.clone()));
+	bullnym::spawn_background(app.clone());
 
 	let listener = tokio::net::TcpListener::bind(listen).await
 		.with_context(|| format!("failed to listen on {}", listen))?;
 	tracing::info!("bullnym listening on {}", listen);
-	axum::serve(listener, bullnym::api::router(app))
-		.with_graceful_shutdown(async {
-			let _ = tokio::signal::ctrl_c().await;
-		})
-		.await?;
+	tokio::select! {
+		res = bullnym::serve(listener, app) => res?,
+		_ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+	}
 	Ok(())
 }

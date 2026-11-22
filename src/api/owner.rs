@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::api::{Owner, StoreView, public_url};
+use crate::api::{Owner, StoreView, check_registration, public_url};
+use crate::protect::{Caller, Surface};
 use crate::database::{NYM_COLUMNS, Nym, STORE_COLUMNS, Store};
 use crate::error::{ApiResult, bad_request, conflict, not_found};
 use crate::money::currency_decimals;
@@ -87,8 +88,10 @@ pub struct RegisterStoreRequest {
 /// `POST /api/v1/stores`: posd's store registration, tied to a nym.
 pub async fn register_store(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Json(req): Json<RegisterStoreRequest>,
 ) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::Register)?;
 	let reg = req.registration;
 	let signature = parse_signature(&req.signature)?;
 	let info = app.ark.ark_info().await;
@@ -102,8 +105,9 @@ pub async fn register_store(
 	let descriptor = StoreDescriptor::parse(&reg.onchain_descriptor)
 		.map_err(|e| bad_request(format!("{:#}", e)))?;
 	let xpub = descriptor.account_key().map_err(|e| bad_request(format!("{:#}", e)))?;
+	check_registration(&app, &caller, &reg.ark_address).await?;
 
-	let mut conn = app.db.conn().await?;
+	let mut conn = app.public.db.conn().await?;
 	let tx = conn.transaction().await?;
 	// The nym must exist and be registered by this same address. Locking
 	// it serializes two registrations of a store for it.
@@ -148,8 +152,10 @@ pub struct ChallengeRequest {
 
 pub async fn challenge(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Json(req): Json<ChallengeRequest>,
 ) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::Owner)?;
 	if req.ark_address.is_empty() || req.ark_address.len() > 512 || req.ark_address.contains(['\n', '\r']) {
 		return Err(bad_request("not a valid Ark address"));
 	}
@@ -158,7 +164,7 @@ pub async fn challenge(
 		"bullnym login v1\nark_address:{}\nnonce:{}\nexpires_at:{}",
 		req.ark_address, token::random_hex(16), expires_at.timestamp(),
 	);
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	conn.execute(
 		"INSERT INTO owner_challenge (ark_address, challenge, expires_at) VALUES ($1, $2, $3)",
 		&[&req.ark_address, &challenge, &expires_at],
@@ -175,8 +181,10 @@ pub struct LoginRequest {
 
 pub async fn login(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Json(req): Json<LoginRequest>,
 ) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::Owner)?;
 	let address = ark::Address::from_str(&req.ark_address)
 		.map_err(|_| bad_request("not a valid Ark address"))?;
 	let signature = parse_signature(&req.signature)?;
@@ -184,7 +192,7 @@ pub async fn login(
 		return Err(bad_request("the signature does not verify for this address"));
 	}
 
-	let mut conn = app.db.conn().await?;
+	let mut conn = app.public.db.conn().await?;
 	let tx = conn.transaction().await?;
 	let used = tx.execute("
 		UPDATE owner_challenge SET used_at = NOW()
@@ -233,7 +241,7 @@ pub async fn update_store(
 			return Err(bad_request(format!("unsupported currency: {}", c)));
 		}
 	}
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	conn.execute("
 		UPDATE store SET
 			name = coalesce($2, name),
@@ -251,7 +259,7 @@ pub async fn update_store(
 }
 
 async fn reload_store(app: &App, store_id: i64) -> ApiResult<Store> {
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let row = conn.query_one(&format!(
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.id = $1", STORE_COLUMNS,
 	), &[&store_id]).await?;
@@ -267,7 +275,7 @@ pub async fn rotate_unlisted_link(
 ) -> ApiResult<Json<Value>> {
 	let store = owner.store()?;
 	let secret = token::new_link_secret();
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	conn.execute("
 		UPDATE store SET unlisted_link_hash = $2, updated_at = NOW() WHERE id = $1
 	", &[&store.id, &token::hash(&secret)]).await?;
@@ -281,7 +289,7 @@ pub async fn remove_unlisted_link(
 	owner: Owner,
 ) -> ApiResult<impl IntoResponse> {
 	let store = owner.store()?;
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	conn.execute("
 		UPDATE store SET unlisted_link_hash = NULL, updated_at = NOW() WHERE id = $1
 	", &[&store.id]).await?;
@@ -301,7 +309,7 @@ pub async fn list_sales(
 	Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Value>> {
 	let store = owner.store()?;
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let sales = sales::list_sales(&*conn, store.id, q.before.as_deref(), q.limit.unwrap_or(50)).await?;
 	let sales = sales.into_iter().map(SaleView::from).collect::<Vec<_>>();
 	Ok(Json(json!({ "sales": sales })))
@@ -322,7 +330,7 @@ pub async fn sales_csv(
 	let store = owner.store()?;
 	let from = q.from.as_deref().map(|d| parse_date(d, false)).transpose()?;
 	let to = q.to.as_deref().map(|d| parse_date(d, true)).transpose()?;
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let body = sales::sales_csv(&*conn, store.id, from, to).await?;
 	Ok((
 		[

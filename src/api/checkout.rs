@@ -20,7 +20,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::api::StoreView;
+use crate::api::{StoreView, check_lookup};
+use crate::protect::{Caller, Surface};
 use crate::database::{CheckoutLink, STORE_COLUMNS, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, conflict, not_found};
 use crate::money::Decimal;
@@ -41,7 +42,7 @@ struct Checkout {
 }
 
 async fn by_nym(app: &App, nym: &str) -> ApiResult<Checkout> {
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let row = conn.query_opt(&format!(
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE n.name = $1", STORE_COLUMNS,
 	), &[&nym]).await?;
@@ -51,7 +52,7 @@ async fn by_nym(app: &App, nym: &str) -> ApiResult<Checkout> {
 }
 
 async fn by_secret(app: &App, secret: &str) -> ApiResult<Checkout> {
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let row = conn.query_opt(&format!(
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.unlisted_link_hash = $1",
 		STORE_COLUMNS,
@@ -84,7 +85,8 @@ pub struct CreateSale {
 	cashier_name: Option<String>,
 }
 
-async fn create_sale(app: &App, c: Checkout, req: CreateSale) -> ApiResult<Json<SaleView>> {
+async fn create_sale(app: &App, caller: &Caller, c: Checkout, req: CreateSale) -> ApiResult<Json<SaleView>> {
+	app.protect.check(caller, Surface::SaleCreate)?;
 	let amount = match (req.fiat_amount, req.amount_sat) {
 		(Some(fiat), None) => SaleAmount::Fiat(fiat.parse::<Decimal>()
 			.map_err(|e| bad_request(e.to_string()))?),
@@ -95,6 +97,18 @@ async fn create_sale(app: &App, c: Checkout, req: CreateSale) -> ApiResult<Json<
 	if cashier_name.as_ref().is_some_and(|n| n.chars().count() > MAX_CASHIER_NAME_CHARS || n.contains(['\n', '\r'])) {
 		return Err(bad_request("the cashier name must be at most 64 characters on one line"));
 	}
+	// Open, unpaid sales are capped per store; sales that get paid free
+	// their place.
+	let open: i64 = {
+		let conn = app.public.db.conn().await?;
+		conn.query_one(
+			"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&c.store.id],
+		).await?.get(0)
+	};
+	if open >= app.protect.limits.max_open_sales_per_store as i64 {
+		tracing::info!("store {} has {} open sales, its cap", c.store.id, open);
+		return Err(ApiError::TooManyRequests);
+	}
 	let sale = sales::create_sale(app, &c.store, NewSale {
 		link: c.link,
 		cashier_name,
@@ -104,38 +118,62 @@ async fn create_sale(app: &App, c: Checkout, req: CreateSale) -> ApiResult<Json<
 	Ok(Json(sale.into()))
 }
 
-pub async fn public_store(State(app): State<Arc<App>>, Path(nym): Path<String>) -> ApiResult<Json<Value>> {
+/// `GET /api/v1/checkout/<nym>`: the store behind a public link. Viewing
+/// allocates nothing.
+pub async fn public_store(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(nym): Path<String>,
+) -> ApiResult<Json<Value>> {
+	check_lookup(&app, &caller, &nym).await?;
 	Ok(store_view(&app, &by_nym(&app, &nym).await?))
 }
 
-pub async fn public_rate(State(app): State<Arc<App>>, Path(nym): Path<String>) -> ApiResult<Json<Value>> {
+pub async fn public_rate(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(nym): Path<String>,
+) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::StatusRead)?;
 	rate(&app, &by_nym(&app, &nym).await?).await
 }
 
 pub async fn public_create_sale(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Path(nym): Path<String>,
 	Json(req): Json<CreateSale>,
 ) -> ApiResult<Json<SaleView>> {
 	let c = by_nym(&app, &nym).await?;
-	create_sale(&app, c, req).await
+	create_sale(&app, &caller, c, req).await
 }
 
-pub async fn unlisted_store(State(app): State<Arc<App>>, Path(secret): Path<String>) -> ApiResult<Json<Value>> {
+pub async fn unlisted_store(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(secret): Path<String>,
+) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::StatusRead)?;
 	Ok(store_view(&app, &by_secret(&app, &secret).await?))
 }
 
-pub async fn unlisted_rate(State(app): State<Arc<App>>, Path(secret): Path<String>) -> ApiResult<Json<Value>> {
+pub async fn unlisted_rate(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(secret): Path<String>,
+) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::StatusRead)?;
 	rate(&app, &by_secret(&app, &secret).await?).await
 }
 
 pub async fn unlisted_create_sale(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Path(secret): Path<String>,
 	Json(req): Json<CreateSale>,
 ) -> ApiResult<Json<SaleView>> {
 	let c = by_secret(&app, &secret).await?;
-	create_sale(&app, c, req).await
+	create_sale(&app, &caller, c, req).await
 }
 
 #[derive(Deserialize)]
@@ -148,9 +186,11 @@ pub struct WaitQuery {
 /// 25 seconds.
 pub async fn get_sale(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Path(id): Path<String>,
 	Query(q): Query<WaitQuery>,
 ) -> ApiResult<Json<SaleView>> {
+	app.protect.check(&caller, Surface::StatusRead)?;
 	let wait = q.wait.map(|w| w.parse::<SaleState>().map_err(|e| bad_request(e.to_string())))
 		.transpose()?;
 	let deadline = tokio::time::Instant::now() + LONG_POLL;
@@ -159,7 +199,7 @@ pub async fn get_sale(
 		// wait is not missed.
 		let mut changes = app.sale_changes.subscribe();
 		let sale = {
-			let conn = app.db.conn().await?;
+			let conn = app.public.db.conn().await?;
 			sales::get_sale(&*conn, &id).await?
 		};
 		let done = match wait {
@@ -178,10 +218,12 @@ pub async fn get_sale(
 /// sale with a payment in progress cannot be canceled.
 pub async fn cancel_sale(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Path(id): Path<String>,
 ) -> ApiResult<Json<SaleView>> {
+	app.protect.check(&caller, Surface::SaleCreate)?;
 	let sale = {
-		let conn = app.db.conn().await?;
+		let conn = app.public.db.conn().await?;
 		sales::get_sale(&*conn, &id).await?
 	};
 	if sale.state != SaleState::Open {
@@ -189,8 +231,8 @@ pub async fn cancel_sale(
 	}
 	// The invoice is canceled first. barkd refuses once a payment is
 	// arriving, and the sale then stays open for it.
-	if let Some(hash) = watcher::invoice_hash(&app, sale.id).await? {
-		match watcher::cancel_invoice(&app, &hash).await {
+	if let Some(hash) = watcher::invoice_hash(&app.public, sale.id).await? {
+		match watcher::cancel_invoice(&app.public, &hash).await {
 			Ok(()) => {},
 			Err(watcher::CancelError::PaymentArriving) => {
 				return Err(conflict("a payment is arriving for this sale"));
@@ -199,7 +241,7 @@ pub async fn cancel_sale(
 		}
 	}
 	let sale = {
-		let conn = app.db.conn().await?;
+		let conn = app.public.db.conn().await?;
 		let n = conn.execute("
 			UPDATE sale SET state = 'canceled', updated_at = NOW()
 			WHERE public_id = $1 AND state = 'open'
@@ -210,7 +252,7 @@ pub async fn cancel_sale(
 		}
 		sale
 	};
-	watcher::sale_ended(&app, sale.id).await;
+	watcher::sale_ended(&app.public, sale.id).await;
 	app.notify_sale_change();
 	Ok(Json(sale.into()))
 }

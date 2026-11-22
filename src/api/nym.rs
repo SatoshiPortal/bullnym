@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 
 use crate::App;
 use crate::api::owner::{check_timestamp, parse_signature};
-use crate::api::{Owner, StoreView, lightning_address, public_url, store_of_nym};
+use crate::api::{
+	Owner, StoreView, check_lookup, check_registration, lightning_address, public_url, store_of_nym,
+};
+use crate::protect::{Caller, Surface};
 use crate::database::{NYM_COLUMNS, Nym};
 use crate::error::{ApiResult, bad_request, conflict};
 use crate::registration::NymRegistration;
@@ -58,8 +61,12 @@ impl NymView {
 /// name.
 pub async fn register(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<Value>> {
+	// The cheap per-source limit comes before the signature check, so a
+	// flood cannot spend the service's CPU.
+	app.protect.check(&caller, Surface::Register)?;
 	let reg = req.registration;
 	let signature = parse_signature(&req.signature)?;
 	nym::check(&reg.nym, &app.cfg.nyms.reserved).map_err(|e| bad_request(e.to_string()))?;
@@ -68,8 +75,13 @@ pub async fn register(
 	check_timestamp(reg.timestamp)?;
 	silent_payment::check(&reg.silent_payment_address, app.cfg.network)
 		.map_err(|e| bad_request(format!("the Silent Payment address is not valid: {}", e)))?;
+	check_registration(&app, &caller, &reg.ark_address).await?;
 
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
+	let nyms: i64 = conn.query_one("SELECT count(*) FROM nym", &[]).await?.get(0);
+	if nyms as u64 >= app.protect.limits.max_nyms {
+		return Err(conflict("the service is not taking new registrations"));
+	}
 	// The unique constraints refuse a second nym for one address and a
 	// second address for one nym, even under concurrent registrations.
 	let row = conn.query_opt(&format!("
@@ -100,14 +112,16 @@ pub async fn register(
 /// `GET /api/v1/nym/<nym>`: whether a nym is free, and what it serves.
 pub async fn lookup(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
+	check_lookup(&app, &caller, &name).await?;
 	if let Err(e) = nym::check(&name, &app.cfg.nyms.reserved) {
 		return Ok(Json(json!({
 			"nym": name, "registered": false, "available": false, "reason": e.to_string(),
 		})));
 	}
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let row = conn.query_opt(
 		&format!("SELECT {} FROM nym n WHERE n.name = $1", NYM_COLUMNS), &[&name],
 	).await?;
@@ -154,7 +168,7 @@ pub async fn update_own(
 		},
 		Some(_) => return Err(bad_request("the display name must be at most 64 characters on one line")),
 	};
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let row = conn.query_one(&format!("
 		UPDATE nym n SET display_name = $2, updated_at = NOW() WHERE n.id = $1 RETURNING {}
 	", NYM_COLUMNS), &[&owner.nym.id, &display_name]).await?;
@@ -178,7 +192,7 @@ pub async fn list_payments(
 	Query(q): Query<PaymentsQuery>,
 ) -> ApiResult<Json<Value>> {
 	let limit = q.limit.unwrap_or(50).clamp(1, 100);
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let rows = conn.query("
 		SELECT id, payment_hash, amount_sat, state, received_sat, created_at, expires_at, settled_at
 		FROM lnurl_invoice

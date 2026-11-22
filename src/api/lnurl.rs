@@ -26,9 +26,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::api::{lightning_address, public_url};
+use crate::api::{check_lookup, lightning_address, open_invoices, public_url};
 use crate::database::{NYM_COLUMNS, Nym};
-use crate::error::ApiError;
+use crate::error::{ApiError, UNAVAILABLE_MESSAGE};
+use crate::protect::{self, Caller, Surface};
 
 
 /// The LUD-22 methods this service offers.
@@ -50,9 +51,24 @@ impl LnurlResponse {
 
 impl From<ApiError> for LnurlResponse {
 	fn from(e: ApiError) -> LnurlResponse {
-		let resp = e.into_response();
-		LnurlResponse::err(resp.status(), "the payment cannot be made right now")
+		let reason = match &e {
+			ApiError::BadRequest(m) | ApiError::NotFound(m) | ApiError::Conflict(m) => m.clone(),
+			ApiError::TooManyRequests => e.to_string(),
+			_ => UNAVAILABLE_MESSAGE.to_string(),
+		};
+		LnurlResponse::err(e.into_response().status(), reason)
 	}
+}
+
+/// The LUD-22 methods offered now: `ARK` while the Ark server is healthy,
+/// and `SP` always.
+fn offered_methods(app: &App) -> Vec<&'static str> {
+	let mut methods = Vec::new();
+	if app.protect.health.ark_payments() {
+		methods.push(METHOD_ARK);
+	}
+	methods.push(METHOD_SP);
+	methods
 }
 
 impl IntoResponse for LnurlResponse {
@@ -67,7 +83,7 @@ impl IntoResponse for LnurlResponse {
 }
 
 async fn nym_by_name(app: &App, name: &str) -> Result<Option<Nym>, ApiError> {
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	let row = conn.query_opt(
 		&format!("SELECT {} FROM nym n WHERE n.name = $1", NYM_COLUMNS), &[&name],
 	).await?;
@@ -82,7 +98,14 @@ fn metadata(app: &App, nym: &Nym) -> String {
 }
 
 /// `GET /.well-known/lnurlp/<nym>`.
-pub async fn pay_request(State(app): State<Arc<App>>, Path(name): Path<String>) -> LnurlResponse {
+pub async fn pay_request(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(name): Path<String>,
+) -> LnurlResponse {
+	if let Err(e) = check_lookup(&app, &caller, &name).await {
+		return e.into();
+	}
 	let nym = match nym_by_name(&app, &name).await {
 		Ok(Some(n)) => n,
 		Ok(None) => return LnurlResponse::err(StatusCode::NOT_FOUND, "no such Lightning Address"),
@@ -94,7 +117,7 @@ pub async fn pay_request(State(app): State<Arc<App>>, Path(name): Path<String>) 
 		"minSendable": app.cfg.nyms.min_sendable_sat * 1000,
 		"maxSendable": app.cfg.nyms.max_sendable_sat * 1000,
 		"metadata": metadata(&app, &nym),
-		"payment_methods": [METHOD_ARK, METHOD_SP],
+		"payment_methods": offered_methods(&app),
 	}))
 }
 
@@ -148,9 +171,13 @@ pub fn check_amount(amount: Option<&str>, min_sat: u64, max_sat: u64) -> Result<
 /// `GET /api/v1/lnurlp/<nym>/callback?amount=<msat>[&payment_method=<m>]`.
 pub async fn callback(
 	State(app): State<Arc<App>>,
+	caller: Caller,
 	Path(name): Path<String>,
 	Query(q): Query<CallbackQuery>,
 ) -> LnurlResponse {
+	if let Err(e) = app.protect.check(&caller, Surface::Callback) {
+		return e.into();
+	}
 	let nym = match nym_by_name(&app, &name).await {
 		Ok(Some(n)) => n,
 		Ok(None) => return LnurlResponse::err(StatusCode::NOT_FOUND, "no such Lightning Address"),
@@ -164,6 +191,28 @@ pub async fn callback(
 		Ok(m) => m,
 		Err(e) => return LnurlResponse::err(StatusCode::BAD_REQUEST, e),
 	};
+	if !caller.bypass {
+		let res = async {
+			let mut conn = app.public.db.conn().await?;
+			protect::shared_window(
+				&mut conn, &format!("callback-nym:{}", nym.id),
+				app.protect.limits.callbacks_per_nym_per_minute, 60,
+			).await
+		}.await;
+		if let Err(e) = res {
+			return e.into();
+		}
+	}
+	// Each option is offered only while its backend is healthy. The Silent
+	// Payment address needs none: the owner's wallet scans for it.
+	let available = match method {
+		Method::Ark => app.protect.health.ark_payments(),
+		Method::SilentPayment => true,
+		Method::Lightning => app.protect.health.invoices(),
+	};
+	if !available {
+		return LnurlResponse::err(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_MESSAGE);
+	}
 	if let Some(reply) = static_reply(method, &nym) {
 		return LnurlResponse::ok(reply);
 	}
@@ -187,13 +236,28 @@ pub fn static_reply(method: Method, nym: &Nym) -> Option<Value> {
 /// registered Ark address. The service records it, watches barkd for its
 /// payment and cancels it at expiry.
 async fn lightning_invoice(app: &App, nym: &Nym, amount: Amount) -> Result<String, ApiError> {
+	// Open invoices are capped per nym and in total, so the service cannot
+	// be used to flood the Ark server with hold invoices.
+	{
+		let conn = app.public.db.conn().await?;
+		let of_nym: i64 = conn.query_one(
+			"SELECT count(*) FROM lnurl_invoice WHERE nym_id = $1 AND state = 'open'", &[&nym.id],
+		).await?.get(0);
+		if of_nym >= app.protect.limits.max_open_invoices_per_nym as i64 {
+			return Err(ApiError::TooManyRequests);
+		}
+		if open_invoices(&*conn).await? >= app.protect.limits.max_open_invoices as i64 {
+			return Err(ApiError::Upstream(anyhow::anyhow!("the open invoice cap is reached")));
+		}
+	}
+	app.protect.take_public_invoice()?;
 	let address = ark::Address::from_str(&nym.ark_address)
 		.map_err(|e| ApiError::Internal(anyhow::anyhow!("nym {} has an invalid address: {}", nym.name, e)))?;
 	let expiry = app.cfg.nyms.invoice_expiry();
 	let description = Some(format!("Payment to {}", nym.shown_name()));
-	let invoice = app.forwarder.create_invoice(amount, &address, description, expiry, false).await
+	let invoice = app.public.forwarder.create_invoice(amount, &address, description, expiry, false).await
 		.map_err(ApiError::Upstream)?;
-	let conn = app.db.conn().await?;
+	let conn = app.public.db.conn().await?;
 	conn.execute("
 		INSERT INTO lnurl_invoice (nym_id, payment_hash, invoice, amount_sat, expires_at)
 		VALUES ($1, $2, $3, $4, NOW() + make_interval(secs => $5))

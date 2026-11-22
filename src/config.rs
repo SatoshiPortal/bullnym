@@ -202,6 +202,37 @@ pub struct Config {
 	pub sales: Sales,
 	#[serde(default)]
 	pub startup: Startup,
+	#[serde(default)]
+	pub limits: crate::protect::Limits,
+	#[serde(default)]
+	pub certification: crate::protect::Certification,
+	#[serde(default)]
+	pub watcher: Watcher,
+}
+
+/// The watchers' own resources, kept apart from public traffic so a flood
+/// cannot stop payment detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Watcher {
+	/// Database connections of the watchers, on top of
+	/// `postgres.max_connections` for public traffic.
+	#[serde(default = "default_watcher_connections")]
+	pub max_connections: u32,
+	/// How often the backends are probed for health.
+	#[serde(default = "default_health_interval_secs")]
+	pub health_interval_secs: u64,
+}
+
+fn default_watcher_connections() -> u32 { 4 }
+fn default_health_interval_secs() -> u64 { 5 }
+
+impl Default for Watcher {
+	fn default() -> Self {
+		Watcher {
+			max_connections: default_watcher_connections(),
+			health_interval_secs: default_health_interval_secs(),
+		}
+	}
 }
 
 /// What the service checks before it starts.
@@ -275,6 +306,9 @@ mod test {
 			nyms: Nyms::default(),
 			sales,
 			startup: Startup::default(),
+			limits: Default::default(),
+			certification: Default::default(),
+			watcher: Watcher::default(),
 		};
 		assert!(cfg(sales.clone()).validate().is_ok());
 		sales.onchain_reuse_grace_secs = sales.onchain_watch_secs - 1;

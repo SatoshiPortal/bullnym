@@ -161,6 +161,24 @@ CREATE TABLE sale (
 CREATE INDEX sale_store_id_idx ON sale (store_id, id DESC);
 CREATE INDEX sale_watch_idx ON sale (state, expires_at);
 
+-- Shared rate-limit counters: hits per bucket, such as callbacks per nym.
+CREATE TABLE rate_limit_event (
+	id BIGSERIAL PRIMARY KEY,
+	bucket TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX rate_limit_event_idx ON rate_limit_event (bucket, created_at);
+
+-- Shared distinct-name counters: which names, or registering addresses, a
+-- source used.
+CREATE TABLE name_access_event (
+	id BIGSERIAL PRIMARY KEY,
+	source_key TEXT NOT NULL,
+	name TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX name_access_event_idx ON name_access_event (source_key, created_at);
+
 -- An on-chain address of a store. It is handed to one live sale at a time.
 -- An address that never received anything is handed out again once its last
 -- sale ended more than the grace period ago; one that received anything,

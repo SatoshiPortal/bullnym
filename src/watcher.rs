@@ -19,7 +19,7 @@ use anyhow::Context;
 use bitcoin::{Address, Amount};
 use tokio_postgres::GenericClient;
 
-use crate::App;
+use crate::{App, Backends};
 use crate::database::{Rail, SaleState, WatchedPayment};
 use crate::rails::forward::ForwardStatus;
 use crate::stages::{self, FeePolicy, TxRecord, TxStatus};
@@ -105,7 +105,7 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 
 /// The invoices of recent sales.
 async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> {
-	let conn = app.db.conn().await?;
+	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, s.state, s.amount_sat,
 			s.expires_at, p.rail, p.payment_hash, p.onchain_address, p.onchain_address_id,
@@ -125,7 +125,7 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 	match p.rail {
 		Rail::Lightning | Rail::Ark => {
 			let hash = p.payment_hash.as_deref().context("invoice payment without hash")?;
-			Ok(match app.forwarder.status(hash).await? {
+			Ok(match app.watch.forwarder.status(hash).await? {
 				ForwardStatus::Unpaid | ForwardStatus::Arriving | ForwardStatus::Unknown => None,
 				// Settled by the Ark server, not yet in the owner's mailbox.
 				ForwardStatus::AwaitingDelivery if p.sale_state == SaleState::InProgress => None,
@@ -171,7 +171,7 @@ pub fn next_state(state: SaleState, amount_sat: i64, obs: &Observation) -> Optio
 /// Stores an observation and moves the sale on. Returns whether a sale
 /// changed state.
 async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Result<bool> {
-	let mut conn = app.db.conn().await?;
+	let mut conn = app.watch.db.conn().await?;
 	let tx = conn.transaction().await?;
 
 	// Lock the sale, so two payments cannot both mark it paid.
@@ -210,7 +210,7 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 
 	if next == Some(SaleState::Paid) {
 		tracing::info!("sale {} paid by {}", p.sale_public_id, obs.paid_rail(p.rail).as_str());
-		sale_ended(app, p.sale_id).await;
+		sale_ended(&app.watch, p.sale_id).await;
 	}
 	Ok(next.is_some())
 }
@@ -231,7 +231,7 @@ struct WatchedAddress {
 /// window, sales in progress or with a payment issue, and sales paid
 /// on-chain until they are final.
 async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
-	let conn = app.db.conn().await?;
+	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, p.onchain_address,
 			p.onchain_address_id, p.received_sat, p.pending_sat, p.warnings
@@ -263,9 +263,9 @@ async fn watch_onchain(app: &App) -> anyhow::Result<bool> {
 	if watched.is_empty() {
 		return Ok(false);
 	}
-	let received = app.chain.received_by_address().await?;
+	let received = app.watch.chain.received_by_address().await?;
 	let fees = FeePolicy {
-		estimate_sat_vb: app.chain.fee_estimate(app.cfg.sales.fee_estimate_blocks).await,
+		estimate_sat_vb: app.watch.chain.fee_estimate(app.cfg.sales.fee_estimate_blocks).await,
 		ratio: app.cfg.sales.low_fee_ratio,
 		floor_sat_vb: app.cfg.sales.low_fee_floor_sat_vb,
 	};
@@ -282,7 +282,7 @@ async fn watch_onchain(app: &App) -> anyhow::Result<bool> {
 		let all = txids.iter().cloned().collect::<Vec<_>>();
 		let mut records = Vec::with_capacity(all.len());
 		for txid in &all {
-			match app.chain.observe_tx(txid, &address, &all).await {
+			match app.watch.chain.observe_tx(txid, &address, &all).await {
 				Ok(obs) => records.push(stages::classify(known.get(txid), &obs, &fees)),
 				Err(e) => {
 					tracing::warn!("check of transaction {} failed: {:#}", txid, e);
@@ -301,7 +301,7 @@ async fn watch_onchain(app: &App) -> anyhow::Result<bool> {
 }
 
 async fn known_txs(app: &App, payment_id: i64) -> anyhow::Result<HashMap<String, TxRecord>> {
-	let conn = app.db.conn().await?;
+	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT txid, amount_sat, status, confirmations, low_fee, unconfirmed_parents, replaced,
 			absent_count
@@ -328,7 +328,7 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 	let summary = stages::summarize(records);
 	let warnings = summary.warnings.iter().map(|w| w.as_str().to_string()).collect::<Vec<_>>();
 
-	let mut conn = app.db.conn().await?;
+	let mut conn = app.watch.db.conn().await?;
 	let tx = conn.transaction().await?;
 	// Lock the sale, so its rails cannot both mark it paid.
 	let row = tx.query_one("
@@ -414,17 +414,17 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 
 	if t.counts_as_paid {
 		tracing::info!("sale {} paid on-chain", w.sale_public_id);
-		sale_ended(app, w.sale_id).await;
+		sale_ended(&app.watch, w.sale_id).await;
 	}
 	if matches!(t.state, Some(SaleState::Expired)) {
-		release_address(app, w.sale_id).await;
+		release_address(&app.watch, w.sale_id).await;
 	}
 	Ok(t.state.is_some() || became_final || payment_changed)
 }
 
 /// The payment hash of a sale's invoice, while it is not settled.
-pub async fn invoice_hash(app: &App, sale_id: i64) -> anyhow::Result<Option<String>> {
-	let conn = app.db.conn().await?;
+pub async fn invoice_hash(b: &Backends, sale_id: i64) -> anyhow::Result<Option<String>> {
+	let conn = b.db.conn().await?;
 	let row = conn.query_opt(
 		"SELECT payment_hash FROM sale_payment WHERE sale_id = $1 AND rail = 'lightning' AND settled_at IS NULL",
 		&[&sale_id],
@@ -444,14 +444,14 @@ pub enum CancelError {
 }
 
 /// Cancels an invoice in barkd, unless a payment is arriving for it.
-pub async fn cancel_invoice(app: &App, hash: &str) -> Result<(), CancelError> {
-	match app.forwarder.status(hash).await.map_err(CancelError::Unavailable)? {
+pub async fn cancel_invoice(b: &Backends, hash: &str) -> Result<(), CancelError> {
+	match b.forwarder.status(hash).await.map_err(CancelError::Unavailable)? {
 		ForwardStatus::Gone => Ok(()),
-		ForwardStatus::Unpaid => match app.forwarder.cancel(hash).await {
+		ForwardStatus::Unpaid => match b.forwarder.cancel(hash).await {
 			Ok(()) => Ok(()),
 			// barkd refuses once it revealed the preimage. Ask again what
 			// it holds.
-			Err(e) => match app.forwarder.status(hash).await {
+			Err(e) => match b.forwarder.status(hash).await {
 				Ok(ForwardStatus::Gone) => Ok(()),
 				Ok(ForwardStatus::Unpaid) | Err(_) => Err(CancelError::Unavailable(e)),
 				Ok(_) => Err(CancelError::PaymentArriving),
@@ -467,23 +467,23 @@ pub async fn cancel_invoice(app: &App, hash: &str) -> Result<(), CancelError> {
 /// reused after the grace period if it never received anything. It is
 /// best effort: a payment already in flight still completes and counts as
 /// excess or late.
-pub async fn sale_ended(app: &App, sale_id: i64) {
-	match invoice_hash(app, sale_id).await {
+pub async fn sale_ended(b: &Backends, sale_id: i64) {
+	match invoice_hash(b, sale_id).await {
 		Ok(Some(hash)) => {
-			if let Err(e) = cancel_invoice(app, &hash).await {
+			if let Err(e) = cancel_invoice(b, &hash).await {
 				tracing::debug!("invoice {} stays open: {}", hash, e);
 			}
 		},
 		Ok(None) => {},
 		Err(e) => tracing::warn!("failed to load the invoice of sale {}: {:#}", sale_id, e),
 	}
-	release_address(app, sale_id).await;
+	release_address(b, sale_id).await;
 }
 
 /// Releases the on-chain address of a sale that ended.
-async fn release_address(app: &App, sale_id: i64) {
+async fn release_address(b: &Backends, sale_id: i64) {
 	let res = async {
-		let conn = app.db.conn().await?;
+		let conn = b.db.conn().await?;
 		conn.execute("
 			UPDATE onchain_address SET sale_id = NULL, released_at = NOW() WHERE sale_id = $1
 		", &[&sale_id]).await?;
@@ -500,7 +500,7 @@ async fn release_address(app: &App, sale_id: i64) {
 /// stays open for its payment.
 async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 	let rows = {
-		let conn = app.db.conn().await?;
+		let conn = app.watch.db.conn().await?;
 		conn.query("
 			SELECT s.id, s.public_id, p.payment_hash,
 				s.expires_at < NOW() - make_interval(secs => $1) AS past_grace
@@ -514,7 +514,7 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 		let sale_id: i64 = row.get("id");
 		let past_grace: bool = row.get("past_grace");
 		if let Some(hash) = row.get::<_, Option<String>>("payment_hash") {
-			match cancel_invoice(app, &hash).await {
+			match cancel_invoice(&app.watch, &hash).await {
 				Ok(()) => {},
 				Err(CancelError::PaymentArriving) if !past_grace => continue,
 				// The invoice expires at the Ark server at the same time, so
@@ -523,11 +523,11 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 			}
 		}
 		let n = {
-			let conn = app.db.conn().await?;
+			let conn = app.watch.db.conn().await?;
 			expire_sale(&*conn, sale_id).await?
 		};
 		if n > 0 {
-			release_address(app, sale_id).await;
+			release_address(&app.watch, sale_id).await;
 			changed = true;
 		}
 	}
@@ -545,7 +545,7 @@ pub async fn expire_sale(conn: &impl GenericClient, sale_id: i64) -> anyhow::Res
 /// unpaid invoices at expiry.
 async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 	let rows = {
-		let conn = app.db.conn().await?;
+		let conn = app.watch.db.conn().await?;
 		conn.query("
 			SELECT id, payment_hash, expires_at < NOW() AS expired,
 				expires_at < NOW() - make_interval(secs => $1) AS past_grace
@@ -557,7 +557,7 @@ async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 		let hash: String = row.get("payment_hash");
 		let expired: bool = row.get("expired");
 		let past_grace: bool = row.get("past_grace");
-		let status = match app.forwarder.status(&hash).await {
+		let status = match app.watch.forwarder.status(&hash).await {
 			Ok(s) => s,
 			Err(e) if past_grace => {
 				tracing::info!("closing Lightning Address invoice {} unanswered: {:#}", hash, e);
@@ -568,7 +568,7 @@ async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 				continue;
 			},
 		};
-		let conn = app.db.conn().await?;
+		let conn = app.watch.db.conn().await?;
 		match status {
 			ForwardStatus::Delivered(amount) => {
 				conn.execute("
@@ -582,7 +582,7 @@ async fn watch_lnurl_invoices(app: &App) -> anyhow::Result<()> {
 				", &[&id]).await?;
 			},
 			ForwardStatus::Unpaid if expired => {
-				match cancel_invoice(app, &hash).await {
+				match cancel_invoice(&app.watch, &hash).await {
 					Ok(()) => {
 						conn.execute("
 							UPDATE lnurl_invoice SET state = 'expired', settled_at = NOW() WHERE id = $1

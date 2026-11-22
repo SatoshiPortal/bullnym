@@ -28,6 +28,7 @@ use serde::Serialize;
 use crate::App;
 use crate::database::{NYM_COLUMNS, Nym, STORE_COLUMNS, Store};
 use crate::error::{ApiError, ApiResult, not_found};
+use crate::protect::{self, Caller, Surface};
 use crate::token;
 
 
@@ -62,7 +63,44 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/c/{secret}/manifest.webmanifest", get(web::unlisted_manifest))
 		.route("/{nym}/manifest.webmanifest", get(web::public_manifest))
 		.fallback(web::asset)
+		.layer(axum::middleware::from_fn_with_state(app.clone(), protect::resolve_caller))
 		.with_state(app)
+}
+
+/// Counts a name lookup: per source per minute, and distinct names per
+/// source per hour.
+pub async fn check_lookup(app: &App, caller: &Caller, name: &str) -> ApiResult<()> {
+	app.protect.check(caller, Surface::Lookup)?;
+	if caller.bypass {
+		return Ok(());
+	}
+	let mut conn = app.public.db.conn().await?;
+	protect::distinct_names(
+		&mut conn, "lookup", &caller.source, name, app.protect.limits.lookup_names_per_hour, 3600,
+	).await
+}
+
+/// Counts a registration: per source per minute, and new registering Ark
+/// addresses per source per hour.
+pub async fn check_registration(app: &App, caller: &Caller, ark_address: &str) -> ApiResult<()> {
+	if caller.bypass {
+		return Ok(());
+	}
+	let mut conn = app.public.db.conn().await?;
+	protect::distinct_names(
+		&mut conn, "register", &caller.source, ark_address,
+		app.protect.limits.register_identities_per_hour, 3600,
+	).await
+}
+
+/// The open invoices of every nym and sale: each is a hold invoice on the
+/// Ark server and a pending receive in barkd.
+pub async fn open_invoices(conn: &impl tokio_postgres::GenericClient) -> ApiResult<i64> {
+	Ok(conn.query_one("
+		SELECT (SELECT count(*) FROM lnurl_invoice WHERE state = 'open')
+			+ (SELECT count(*) FROM sale_payment p JOIN sale s ON s.id = p.sale_id
+				WHERE p.rail = 'lightning' AND p.settled_at IS NULL AND s.state IN ('open', 'in-progress'))
+	", &[]).await?.get(0))
 }
 
 fn bearer(parts: &Parts) -> Result<&str, ApiError> {
@@ -86,7 +124,7 @@ impl FromRequestParts<Arc<App>> for Owner {
 
 	async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
 		let hash = token::hash(bearer(parts)?);
-		let conn = app.db.conn().await?;
+		let conn = app.public.db.conn().await?;
 		let row = conn.query_opt(&format!("
 			SELECT {} FROM owner_session o JOIN nym n ON n.id = o.nym_id
 			WHERE o.token_hash = $1 AND o.expires_at > NOW()
