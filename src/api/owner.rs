@@ -66,6 +66,10 @@ pub struct OwnerStoreView {
 	/// Whether an unlisted cashier link exists. Its URL is shown once, when
 	/// it is made.
 	pub unlisted_link: bool,
+	/// The next derivation index of an on-chain sale: every address the
+	/// service handed out is below it. The wallet scans the store account up
+	/// to it, so no payment is missed after many empty addresses.
+	pub next_onchain_index: i64,
 }
 
 impl OwnerStoreView {
@@ -75,6 +79,7 @@ impl OwnerStoreView {
 			public_checkout: store.public_checkout,
 			checkout_url: format!("{}/{}", public_url(app), store.nym),
 			unlisted_link: store.has_unlisted_link,
+			next_onchain_index: store.next_onchain_index,
 		}
 	}
 }

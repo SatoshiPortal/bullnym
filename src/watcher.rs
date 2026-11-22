@@ -114,7 +114,7 @@ async fn watched_payments(app: &App) -> anyhow::Result<Vec<WatchedPayment>> {
 	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, s.state, s.amount_sat,
-			s.expires_at, p.rail, p.payment_hash, p.onchain_address, p.onchain_address_id,
+			s.expires_at, p.rail, p.payment_hash, p.onchain_address,
 			p.received_sat, p.pending_sat, p.settled_at
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
@@ -249,7 +249,6 @@ struct WatchedAddress {
 	sale_id: i64,
 	sale_public_id: String,
 	address: String,
-	address_id: Option<i64>,
 	received_sat: i64,
 	pending_sat: i64,
 	warnings: Vec<String>,
@@ -262,7 +261,7 @@ async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, p.onchain_address,
-			p.onchain_address_id, p.received_sat, p.pending_sat, p.warnings
+			p.received_sat, p.pending_sat, p.warnings
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
 		WHERE p.rail = 'onchain' AND (
@@ -277,7 +276,6 @@ async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 		sale_id: r.get("sale_id"),
 		sale_public_id: r.get("public_id"),
 		address: r.get("onchain_address"),
-		address_id: r.get("onchain_address_id"),
 		received_sat: r.get("received_sat"),
 		pending_sat: r.get("pending_sat"),
 		warnings: r.get("warnings"),
@@ -383,11 +381,6 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 			&r.confirmations, &r.low_fee, &r.unconfirmed_parents, &r.replaced, &r.absent_count,
 		]).await?;
 	}
-	if summary.ever_received {
-		if let Some(id) = w.address_id {
-			tx.execute("UPDATE onchain_address SET ever_received = TRUE WHERE id = $1", &[&id]).await?;
-		}
-	}
 	let confirmed = summary.confirmed.to_sat() as i64;
 	let seen = summary.seen.to_sat() as i64;
 	let payment_changed = confirmed != w.received_sat || seen != w.pending_sat || warnings != w.warnings;
@@ -444,9 +437,6 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 		tracing::info!("sale {} paid on-chain", w.sale_public_id);
 		sale_ended(&app.watch, w.sale_id).await;
 	}
-	if matches!(t.state, Some(SaleState::Expired)) {
-		release_address(&app.watch, w.sale_id).await;
-	}
 	Ok(t.state.is_some() || became_final || payment_changed)
 }
 
@@ -490,11 +480,10 @@ pub async fn cancel_invoice(b: &Backends, hash: &str) -> Result<(), CancelError>
 	}
 }
 
-/// Ends what a sale holds once it is paid, canceled or expired: its open
-/// invoice is canceled, and its on-chain address is released, to be
-/// reused after the grace period if it never received anything. It is
-/// best effort: a payment already in flight still completes and counts as
-/// excess or late.
+/// Cancels the open invoice of a sale that another rail paid, or that was
+/// canceled or expired. It is best effort: a payment already in flight
+/// still completes and counts as excess or late. The sale's on-chain
+/// address is never handed out again, and stays watched for late payments.
 pub async fn sale_ended(b: &Backends, sale_id: i64) {
 	match invoice_hash(b, sale_id).await {
 		Ok(Some(hash)) => {
@@ -504,21 +493,6 @@ pub async fn sale_ended(b: &Backends, sale_id: i64) {
 		},
 		Ok(None) => {},
 		Err(e) => tracing::warn!("failed to load the invoice of sale {}: {:#}", sale_id, e),
-	}
-	release_address(b, sale_id).await;
-}
-
-/// Releases the on-chain address of a sale that ended.
-async fn release_address(b: &Backends, sale_id: i64) {
-	let res = async {
-		let conn = b.db.conn().await?;
-		conn.execute("
-			UPDATE onchain_address SET sale_id = NULL, released_at = NOW() WHERE sale_id = $1
-		", &[&sale_id]).await?;
-		anyhow::Ok(())
-	}.await;
-	if let Err(e) = res {
-		tracing::warn!("failed to release the address of sale {}: {:#}", sale_id, e);
 	}
 }
 
@@ -550,14 +524,8 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 				Err(e) => tracing::info!("expiring sale {} with its invoice open: {}", sale_id, e),
 			}
 		}
-		let n = {
-			let conn = app.watch.db.conn().await?;
-			expire_sale(&*conn, sale_id).await?
-		};
-		if n > 0 {
-			release_address(&app.watch, sale_id).await;
-			changed = true;
-		}
+		let conn = app.watch.db.conn().await?;
+		changed |= expire_sale(&*conn, sale_id).await? > 0;
 	}
 	Ok(changed)
 }

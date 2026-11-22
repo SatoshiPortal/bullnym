@@ -216,14 +216,12 @@ pub struct Summary {
 	/// The fewest confirmations of a confirmed payment.
 	pub min_confirmations: Option<i64>,
 	pub warnings: Vec<Warning>,
-	/// Whether anything, confirmed or not, ever paid the address.
-	pub ever_received: bool,
 	/// Whether a payment went away because it was replaced.
 	pub replaced: bool,
 }
 
 pub fn summarize(records: &[TxRecord]) -> Summary {
-	let mut s = Summary { ever_received: !records.is_empty(), ..Default::default() };
+	let mut s = Summary::default();
 	let mut low_fee = false;
 	let mut parents = false;
 	for r in records {
@@ -429,10 +427,10 @@ mod test {
 		assert_eq!(r.status, TxStatus::Seen, "no confirmation: it no longer counts");
 	}
 
-	fn summary(confirmed: u64, seen: u64, min_conf: Option<i64>, ever: bool, replaced: bool) -> Summary {
+	fn summary(confirmed: u64, seen: u64, min_conf: Option<i64>, replaced: bool) -> Summary {
 		Summary {
 			confirmed: Amount::from_sat(confirmed), seen: Amount::from_sat(seen),
-			min_confirmations: min_conf, warnings: vec![], ever_received: ever, replaced,
+			min_confirmations: min_conf, warnings: vec![], replaced,
 		}
 	}
 
@@ -440,39 +438,39 @@ mod test {
 	fn sale_stages() {
 		let a = Amount::from_sat(1000);
 		// Seen in the mempool: in progress, never paid.
-		let t = next_onchain_state(Open, a, false, true, false, &summary(0, 1000, None, true, false), 3);
+		let t = next_onchain_state(Open, a, false, true, false, &summary(0, 1000, None, false), 3);
 		assert_eq!(t.state, Some(InProgress));
 		assert!(!t.counts_as_paid);
 		// Below the amount: stays open.
-		let t = next_onchain_state(Open, a, false, true, false, &summary(0, 999, None, true, false), 3);
+		let t = next_onchain_state(Open, a, false, true, false, &summary(0, 999, None, false), 3);
 		assert_eq!(t.state, None);
 		// An in-progress sale outlives its expiry.
-		let t = next_onchain_state(InProgress, a, false, true, true, &summary(0, 1000, None, true, false), 3);
+		let t = next_onchain_state(InProgress, a, false, true, true, &summary(0, 1000, None, false), 3);
 		assert_eq!(t.state, None);
 		// Paid at 1 confirmation, final at 3.
-		let t = next_onchain_state(InProgress, a, false, true, true, &summary(1000, 0, Some(1), true, false), 3);
+		let t = next_onchain_state(InProgress, a, false, true, true, &summary(1000, 0, Some(1), false), 3);
 		assert_eq!((t.state, t.counts_as_paid, t.is_final), (Some(Paid), true, false));
-		let t = next_onchain_state(Paid, a, true, true, true, &summary(1000, 0, Some(3), true, false), 3);
+		let t = next_onchain_state(Paid, a, true, true, true, &summary(1000, 0, Some(3), false), 3);
 		assert_eq!((t.state, t.is_final), (None, true));
 		// A reorg after paid: payment issue, then resolved.
-		let t = next_onchain_state(Paid, a, true, true, true, &summary(0, 1000, None, true, false), 3);
+		let t = next_onchain_state(Paid, a, true, true, true, &summary(0, 1000, None, false), 3);
 		assert_eq!(t.state, Some(PaymentIssue));
-		let t = next_onchain_state(PaymentIssue, a, true, true, true, &summary(1000, 0, Some(1), true, false), 3);
+		let t = next_onchain_state(PaymentIssue, a, true, true, true, &summary(1000, 0, Some(1), false), 3);
 		assert_eq!(t.state, Some(Paid));
 		// A sale paid by its invoice ignores its address.
-		let t = next_onchain_state(Paid, a, false, true, true, &summary(0, 0, None, true, false), 3);
+		let t = next_onchain_state(Paid, a, false, true, true, &summary(0, 0, None, false), 3);
 		assert_eq!(t.state, None);
 		// Replaced: back to open, or expired, with a notice.
-		let t = next_onchain_state(InProgress, a, false, true, false, &summary(0, 0, None, true, true), 3);
+		let t = next_onchain_state(InProgress, a, false, true, false, &summary(0, 0, None, true), 3);
 		assert_eq!((t.state, t.notice), (Some(Open), Some(Notice::PaymentReplaced)));
-		let t = next_onchain_state(InProgress, a, false, true, true, &summary(0, 0, None, true, false), 3);
+		let t = next_onchain_state(InProgress, a, false, true, true, &summary(0, 0, None, false), 3);
 		assert_eq!((t.state, t.notice), (Some(Expired), Some(Notice::PaymentDropped)));
 		// An Ark payment awaiting delivery is not undone by the address.
-		let t = next_onchain_state(InProgress, a, false, false, false, &summary(0, 0, None, false, false), 3);
+		let t = next_onchain_state(InProgress, a, false, false, false, &summary(0, 0, None, false), 3);
 		assert_eq!(t.state, None);
 		// Ended sales do not change: a later payment is a late payment.
 		for s in [Expired, Canceled] {
-			let t = next_onchain_state(s, a, false, true, true, &summary(1000, 0, Some(1), true, false), 3);
+			let t = next_onchain_state(s, a, false, true, true, &summary(1000, 0, Some(1), false), 3);
 			assert_eq!(t, Transition::default());
 		}
 	}
@@ -485,7 +483,6 @@ mod test {
 		};
 		let s = summarize(&[gone]);
 		assert_eq!(s.warnings, vec![Warning::Replaced]);
-		assert!(s.ever_received);
 		assert_eq!(s.seen + s.confirmed, Amount::ZERO);
 	}
 }

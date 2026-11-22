@@ -203,12 +203,14 @@ pub struct Store {
 	pub onchain_min_sat: i64,
 	pub public_checkout: bool,
 	pub has_unlisted_link: bool,
+	/// The next derivation index of an on-chain sale.
+	pub next_onchain_index: i64,
 }
 
 /// The columns of a store joined with its nym as `n`.
 pub const STORE_COLUMNS: &str = "s.id, s.nym_id, n.name AS nym, s.name, s.ark_address, \
 	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.public_checkout, \
-	s.unlisted_link_hash IS NOT NULL AS has_unlisted_link";
+	s.unlisted_link_hash IS NOT NULL AS has_unlisted_link, s.next_onchain_index";
 
 impl Store {
 	pub fn from_row(row: &Row) -> Store {
@@ -223,6 +225,7 @@ impl Store {
 			onchain_min_sat: row.get("onchain_min_sat"),
 			public_checkout: row.get("public_checkout"),
 			has_unlisted_link: row.get("has_unlisted_link"),
+			next_onchain_index: row.get("next_onchain_index"),
 		}
 	}
 }
@@ -312,7 +315,6 @@ pub struct WatchedPayment {
 	pub rail: Rail,
 	pub payment_hash: Option<String>,
 	pub onchain_address: Option<String>,
-	pub onchain_address_id: Option<i64>,
 	pub received_sat: i64,
 	pub pending_sat: i64,
 	pub settled: bool,
@@ -330,7 +332,6 @@ impl WatchedPayment {
 			rail: row.get("rail"),
 			payment_hash: row.get("payment_hash"),
 			onchain_address: row.get("onchain_address"),
-			onchain_address_id: row.get("onchain_address_id"),
 			received_sat: row.get("received_sat"),
 			pending_sat: row.get("pending_sat"),
 			settled: row.get::<_, Option<DateTime<Utc>>>("settled_at").is_some(),

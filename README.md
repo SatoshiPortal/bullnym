@@ -21,6 +21,9 @@ It started from posd, Lee Salminen's point-of-sale service for Scuttle. See
   Lightning Address, with the same Ark address. A nym has one store.
 - **The cashier link** replaces posd's paired terminals. Any device with it
   takes payments; the store's history and CSV are behind the owner login.
+- **Bitcoin for the store** is an address per sale from the store's
+  descriptor, as in posd: never reused. The owner's wallet scans the store
+  account up to the store's next index, which the owner's store view shows.
 - **Paid** means: Lightning delivered by barkd; Ark delivered to the owner's
   mailbox (S4); on-chain at 1 confirmation. A payment seen but not counted
   shows as in progress, not guaranteed, and never as paid.

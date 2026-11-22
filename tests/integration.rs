@@ -254,7 +254,8 @@ async fn cashier_links() {
 	let (status, manifest) = svc.call(Method::GET, "/cafe/manifest.webmanifest", None, None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(manifest["start_url"], "/cafe");
-	assert_eq!(svc.sql("SELECT 1 FROM onchain_address").await.unwrap(), 0);
+	let index = svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"].clone();
+	assert_eq!(index, 0, "viewing the checkout takes no address");
 
 	// The public link creates, follows and cancels its sale, without a
 	// token.
@@ -482,25 +483,24 @@ async fn reorg_after_paid_is_a_payment_issue() {
 }
 
 #[tokio::test]
-async fn late_payment_and_address_reuse() {
-	let ctx = TestContext::new("bullnym/late_payment_and_address_reuse").await;
+async fn late_payment_and_new_address_per_sale() {
+	let ctx = TestContext::new("bullnym/late_payment_and_new_address_per_sale").await;
 	let store = store_setup_with(&ctx, |cfg| {
 		cfg.sales.expiry_secs = 5;
-		cfg.sales.onchain_watch_secs = 30;
-		cfg.sales.onchain_reuse_grace_secs = 32;
-		cfg.sales.onchain_gap_limit = 2;
 		cfg.sales.default_onchain_min_sat = 1000;
 	}).await;
+	let owner = Some(store.owner.token.as_str());
+	assert_eq!(store.svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 0);
 
+	// Each sale that offers Bitcoin takes the next address, as in posd.
 	let a = store.new_sale(json!({ "amount_sat": 2000 })).await;
 	let b = store.new_sale(json!({ "amount_sat": 2000 })).await;
 	let addr_a = a["onchain_address"].as_str().unwrap().to_string();
 	let addr_b = b["onchain_address"].as_str().unwrap().to_string();
-	// Two unpaid addresses reach the gap limit of 2: the next sale offers
-	// no on-chain payment, but still has its invoice.
-	let c = store.new_sale(json!({ "amount_sat": 2000 })).await;
-	assert_eq!(c["onchain_address"], Value::Null);
-	assert!(c["lightning_invoice"].is_string());
+	assert_ne!(addr_a, addr_b);
+	// Below the on-chain minimum, a sale takes no address.
+	let small = store.new_sale(json!({ "amount_sat": 500 })).await;
+	assert_eq!(small["onchain_address"], Value::Null);
 
 	let b_id = b["id"].as_str().unwrap();
 	store.svc.wait_sale_state(b_id, "expired", SALE_TIMEOUT).await;
@@ -513,15 +513,16 @@ async fn late_payment_and_address_reuse() {
 	ctx.generate_blocks(1).await;
 	let late = store.svc.wait_sale(b_id, SALE_TIMEOUT, |s| s["received_sat"] == 2000, "counted").await;
 	assert_eq!(late["state"], "expired", "a late payment never revives the sale");
+	let history = store.svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await;
+	let row = history["sales"].as_array().unwrap().iter().find(|s| s["id"] == b_id).unwrap().clone();
+	assert_eq!(row["late_payment"], true, "the owner sees the late payment");
 
-	// After the grace period, the address that never received anything is
-	// handed out again; the one that did never is.
-	tokio::time::sleep(Duration::from_secs(33)).await;
-	let d = store.new_sale(json!({ "amount_sat": 2000 })).await;
-	assert_eq!(d["onchain_address"].as_str().unwrap(), addr_a, "the unused address is reused");
-	let e = store.new_sale(json!({ "amount_sat": 2000 })).await;
-	let addr_e = e["onchain_address"].as_str().expect("a new address past the paid one");
-	assert!(addr_e != addr_a && addr_e != addr_b);
+	// An address is never handed out again, even after its sale ended.
+	let c = store.new_sale(json!({ "amount_sat": 2000 })).await;
+	let addr_c = c["onchain_address"].as_str().unwrap();
+	assert!(addr_c != addr_a && addr_c != addr_b);
+	// The owner's store view gives the next index, for the wallet's scan.
+	assert_eq!(store.svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"], 3);
 }
 
 #[tokio::test]

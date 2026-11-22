@@ -147,8 +147,11 @@ nym:<nym>
 }
 ```
 
-The owner's view adds `public_checkout`, `checkout_url` and `unlisted_link`
-(whether one exists).
+The owner's view adds `public_checkout`, `checkout_url`, `unlisted_link`
+(whether one exists) and `next_onchain_index`: each sale that offers Bitcoin
+takes the store's next derivation index, as in posd, and no address is
+handed out twice. The owner's wallet scans the store account up to this
+index, so a payment after many empty addresses is still found.
 
 ## Owner
 
@@ -179,8 +182,8 @@ paid_at, state, paid_rail, amount_sat, received_sat, fiat_amount, currency,
 btc_price, memo, link, cashier_name, seen_sat, progress, warnings, notice,
 final_at, late_payment`.
 
-The web app's `/owner#token=<owner token>` shows the history, the CSV export
-and the cashier links.
+The web app's `/owner#token=<owner token>` shows the history and the CSV
+export.
 
 ## Cashier link and public checkout
 
@@ -254,7 +257,9 @@ Holding a sale's unguessable id is what lets a cashier follow and cancel it.
   - `payment-issue`: a counted on-chain payment went away in a reorg. It
     returns to `paid` when it confirms again.
   - `expired` or `canceled`. A payment after that is a late payment
-    (`late_payment`): it shows on this sale and never pays another one.
+    (`late_payment`): it shows on this sale and never pays another one,
+    because no address is handed out twice. An address is watched for 7
+    days after its sale was created.
 - `received_sat` counts only delivered invoices and confirmed outputs;
   `seen_sat` is the unconfirmed amount, never counted. Nothing sets the
   paid time or rail before a payment counts, and nothing marks a sale paid

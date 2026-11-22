@@ -186,67 +186,27 @@ async fn invoice_admission(app: &App) -> anyhow::Result<()> {
 	app.protect.take_public_invoice().map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-/// Whether a new address at `next_index` stays within `gap_limit` of the
-/// last address that received anything, so a wallet scanning with that gap
-/// limit sees it.
-pub fn within_gap(next_index: i64, last_used: Option<i64>, gap_limit: u32) -> bool {
-	next_index <= last_used.unwrap_or(-1) + gap_limit as i64
-}
-
-/// Hands out an on-chain address for a new sale: an address that never
-/// received anything and whose last sale ended more than the grace period
-/// ago, or else a new one within the gap limit. `None` when there is none.
-async fn allocate_address(
+/// Hands out the store's next on-chain address, as posd does: each sale
+/// that offers Bitcoin takes the next derivation index, so two sales never
+/// share an address and no address is handed out twice. The index is taken
+/// only if the address is watched; otherwise the sale offers no on-chain
+/// payment and the index stays free.
+async fn next_address(
 	app: &App,
-	tx: &tokio_postgres::Transaction<'_>,
+	tx: &mut tokio_postgres::Transaction<'_>,
 	store: &Store,
-) -> anyhow::Result<Option<(i64, bitcoin::Address)>> {
-	// Allocations of one store run one at a time.
-	tx.query_one("SELECT id FROM store WHERE id = $1 FOR UPDATE", &[&store.id]).await?;
-	let grace = app.cfg.sales.onchain_reuse_grace_secs as f64;
-	let reusable = tx.query("
-		SELECT id, address FROM onchain_address
-		WHERE store_id = $1 AND NOT ever_received AND sale_id IS NULL
-			AND released_at < NOW() - make_interval(secs => $2)
-		ORDER BY derivation_index LIMIT 5
-	", &[&store.id, &grace]).await?;
-	for row in reusable {
-		let id: i64 = row.get("id");
-		let address = bitcoin::Address::from_str(row.get::<_, &str>("address"))?
-			.require_network(app.cfg.network)?;
-		// The chain has the last word: an address that ever received
-		// anything is never handed out again.
-		if app.public.chain.has_received(&address).await? {
-			tx.execute("UPDATE onchain_address SET ever_received = TRUE WHERE id = $1", &[&id]).await?;
-			continue;
-		}
-		return Ok(Some((id, address)));
-	}
-
-	let row = tx.query_one("
-		SELECT next_onchain_index, (
-			SELECT max(derivation_index) FROM onchain_address WHERE store_id = $1 AND ever_received
-		) AS last_used
-		FROM store WHERE id = $1
+) -> anyhow::Result<(i64, bitcoin::Address)> {
+	let sp = tx.savepoint("onchain_index").await?;
+	let row = sp.query_one("
+		UPDATE store SET next_onchain_index = next_onchain_index + 1, updated_at = NOW()
+		WHERE id = $1 RETURNING next_onchain_index - 1 AS idx
 	", &[&store.id]).await?;
-	let next: i64 = row.get("next_onchain_index");
-	let last_used: Option<i64> = row.get("last_used");
-	if !within_gap(next, last_used, app.cfg.sales.onchain_gap_limit) {
-		tracing::warn!("store {} has {} unpaid addresses past its last payment, the gap limit; \
-			the sale offers no on-chain payment", store.id, next - last_used.unwrap_or(-1) - 1);
-		return Ok(None);
-	}
+	let index = row.get::<_, i64>("idx");
 	let desc = StoreDescriptor::parse(&store.onchain_descriptor).context("store has an invalid descriptor")?;
-	let address = desc.address(u32::try_from(next).context("on-chain index overflow")?, app.cfg.network)?;
+	let address = desc.address(u32::try_from(index).context("on-chain index overflow")?, app.cfg.network)?;
 	app.public.chain.watch(&address).await?;
-	let id: i64 = tx.query_one("
-		INSERT INTO onchain_address (store_id, derivation_index, address) VALUES ($1, $2, $3)
-		RETURNING id
-	", &[&store.id, &next, &address.to_string()]).await?.get("id");
-	tx.execute("
-		UPDATE store SET next_onchain_index = $2, updated_at = NOW() WHERE id = $1
-	", &[&store.id, &(next + 1)]).await?;
-	Ok(Some((id, address)))
+	sp.commit().await?;
+	Ok((index, address))
 }
 
 /// Creates a sale with all the rails it offers: one invoice for Lightning
@@ -286,13 +246,11 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 	};
 
 	let mut conn = app.public.db.conn().await?;
-	let tx = conn.transaction().await?;
+	let mut tx = conn.transaction().await?;
 
-	// Each on-chain sale gets its own address, so two open sales never
-	// share one.
 	let onchain = if amount_sat.to_sat() >= store.onchain_min_sat as u64 && app.protect.health.onchain() {
-		match allocate_address(app, &tx, store).await {
-			Ok(a) => a,
+		match next_address(app, &mut tx, store).await {
+			Ok(a) => Some(a),
 			Err(e) => {
 				tracing::warn!("sale without an on-chain address: {:#}", e);
 				None
@@ -326,14 +284,11 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 			VALUES ($1, 'lightning', $2, $3)
 		", &[&sale_id, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
 	}
-	if let Some((address_id, address)) = &onchain {
+	if let Some((index, address)) = &onchain {
 		tx.execute("
-			UPDATE onchain_address SET sale_id = $2, released_at = NULL WHERE id = $1
-		", &[address_id, &sale_id]).await?;
-		tx.execute("
-			INSERT INTO sale_payment (sale_id, rail, onchain_address_id, onchain_address)
+			INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
 			VALUES ($1, 'onchain', $2, $3)
-		", &[&sale_id, address_id, &address.to_string()]).await?;
+		", &[&sale_id, index, &address.to_string()]).await?;
 	}
 
 	let sale = get_sale_by_id(&tx, sale_id).await?;
@@ -450,18 +405,6 @@ mod test {
 		);
 		assert_eq!(btc_amount(Amount::from_sat(100_000_000)), "1");
 		assert_eq!(btc_amount(Amount::from_sat(1)), "0.00000001");
-	}
-
-	#[test]
-	fn gap_limit() {
-		// No address used yet: indexes 0 to 19 for a gap limit of 20.
-		assert!(within_gap(0, None, 20));
-		assert!(within_gap(19, None, 20));
-		assert!(!within_gap(20, None, 20));
-		// The gap counts from the last address that received anything.
-		assert!(within_gap(25, Some(5), 20));
-		assert!(!within_gap(26, Some(5), 20));
-		assert!(within_gap(1005, Some(5), 1000));
 	}
 
 	#[test]

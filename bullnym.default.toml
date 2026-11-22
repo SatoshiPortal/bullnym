@@ -79,18 +79,12 @@ default_onchain_min_sat = 50000
 # How often the watcher checks open sales, in milliseconds. On-chain
 # addresses are checked every fifth time.
 poll_interval_ms = 2000
+# Each sale that offers Bitcoin takes the store's next address, and no address
+# is handed out twice. The owner's wallet scans the store account up to the
+# store's next index, which the owner's store view shows.
 # How long an on-chain address is watched after its sale was created, for
 # late and extra payments.
 onchain_watch_secs = 604800
-# How long after its sale ended an address that never received anything can
-# be handed out again. At least onchain_watch_secs, so a late payment is
-# never attributed to the wrong sale.
-onchain_reuse_grace_secs = 608400
-# The most addresses past the last one that received a payment. A wallet
-# that scans the store's account with this gap limit sees every payment.
-# When it is reached and no address can be reused, sales offer no bitcoin
-# address. Raise it to what the store wallet scans, for example 1000.
-onchain_gap_limit = 20
 # The confirmations that make an on-chain payment final. It is paid at 1.
 final_confirmations = 3
 # A payment whose fee rate is below this share of bitcoind's estimate gets

@@ -45,7 +45,8 @@ CREATE TABLE store (
 	-- The extended public key of the descriptor. A store's on-chain account
 	-- is its own: no two stores share one.
 	onchain_xpub TEXT NOT NULL UNIQUE,
-	-- The next derivation index to hand out for an on-chain sale.
+	-- The next derivation index to hand out for an on-chain sale. The
+	-- owner's wallet scans the store account up to it.
 	next_onchain_index BIGINT NOT NULL DEFAULT 0,
 	currency TEXT NOT NULL,
 	onchain_min_sat BIGINT NOT NULL,
@@ -179,26 +180,6 @@ CREATE TABLE name_access_event (
 );
 CREATE INDEX name_access_event_idx ON name_access_event (source_key, created_at);
 
--- An on-chain address of a store. It is handed to one live sale at a time.
--- An address that never received anything is handed out again once its last
--- sale ended more than the grace period ago; one that received anything,
--- confirmed or not, never is.
-CREATE TABLE onchain_address (
-	id BIGSERIAL PRIMARY KEY,
-	store_id BIGINT NOT NULL REFERENCES store(id),
-	derivation_index BIGINT NOT NULL,
-	address TEXT NOT NULL UNIQUE,
-	ever_received BOOLEAN NOT NULL DEFAULT FALSE,
-	-- The sale it is handed to, while that sale is live.
-	sale_id BIGINT UNIQUE REFERENCES sale(id),
-	-- When its last sale ended.
-	released_at TIMESTAMPTZ,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	UNIQUE (store_id, derivation_index)
-);
-CREATE INDEX onchain_address_reuse_idx ON onchain_address (store_id, derivation_index)
-	WHERE NOT ever_received AND sale_id IS NULL;
-
 -- One row per payment rail offered for a sale: the invoice, which
 -- Lightning and Ark payers both pay, and the on-chain address.
 CREATE TABLE sale_payment (
@@ -208,7 +189,9 @@ CREATE TABLE sale_payment (
 	rail payment_rail NOT NULL,
 	payment_hash TEXT UNIQUE,
 	invoice TEXT,
-	onchain_address_id BIGINT REFERENCES onchain_address(id),
+	-- The derivation index of the address. Each on-chain sale takes the
+	-- store's next index, and no index is ever handed out twice.
+	onchain_index BIGINT,
 	onchain_address TEXT,
 	-- The amount this rail delivered: the invoice amount once delivered, or
 	-- the sum of the confirmed outputs to the address.
