@@ -1,21 +1,18 @@
-// The cashier link of this page, from its path ("/<nym>" or "/c/<secret>"):
-// any device with the link takes payments, with no pairing and no token.
+// The cashier link of this page, from its path "/<nym>": any device with the
+// link takes payments, with no pairing and no token.
 import { PosClient, type Checkout, type Link } from './api'
 
-/** The cashier link in "/<nym>" or "/c/<secret>", or null. */
+/** The cashier link in "/<nym>", or null. */
 export function linkFromPath(pathname: string): Link | null {
-	const unlisted = pathname.match(/^\/c\/([0-9a-fA-F]{1,64})\/?$/)
-	if (unlisted) return { kind: 'unlisted', secret: unlisted[1]! }
-	const pub = pathname.match(/^\/([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)\/?$/)
-	if (pub) return { kind: 'public', nym: pub[1]! }
-	return null
+	const match = pathname.match(/^\/([a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?)\/?$/)
+	return match ? { nym: match[1]! } : null
 }
 
 const link = linkFromPath(location.pathname)
 
 function linkKey(what: string): string | null {
 	if (!link) return null
-	return `bullnym:${link.kind === 'public' ? link.nym : link.secret}:${what}`
+	return `bullnym:${link.nym}:${what}`
 }
 
 function readLocal(key: string | null): string | null {

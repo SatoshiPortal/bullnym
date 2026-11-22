@@ -130,8 +130,7 @@ pub async fn lookup(
 	};
 	let nym = Nym::from_row(&row);
 	let store = store_of_nym(&*conn, nym.id).await?;
-	let checkout_url = store.as_ref().filter(|s| s.public_checkout)
-		.map(|_| format!("{}/{}", public_url(&app), nym.name));
+	let checkout_url = store.as_ref().map(|_| format!("{}/{}", public_url(&app), nym.name));
 	Ok(Json(json!({
 		"nym": nym.name,
 		"registered": true,

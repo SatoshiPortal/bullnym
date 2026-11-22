@@ -16,7 +16,7 @@ pub const RESERVED_ROUTE_NAMES: &[&str] = &[
 	"signup", "settings", "account", "dashboard", "test", "i", "invoice", "invoices",
 	"pos", "a",
 	// This service's routes and web app paths.
-	"c", "owner", "nym", "nyms", "store", "stores", "checkout", "links", "sales", "sale",
+	"owner", "nym", "nyms", "store", "stores", "checkout", "sales", "sale",
 	"icons", "manifest", "sw", "workbox", "registersw", "index", "pair", "cashier",
 	"history", "receipt", "pay",
 ];
@@ -92,7 +92,6 @@ mod test {
 	#[test]
 	fn reserved_names() {
 		assert_eq!(check("api", &[]), Err(NymError::Reserved));
-		assert_eq!(check("c", &[]), Err(NymError::Reserved));
 		assert_eq!(check("owner", &[]), Err(NymError::Reserved));
 		assert_eq!(check("bullbitcoin", &[]), Err(NymError::Reserved));
 		assert_eq!(check("cafe", &[]), Ok(()));

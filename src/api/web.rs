@@ -1,9 +1,7 @@
 //! Serves the web app, embedded at build time (see `build.rs`).
 //!
-//! One page is the cashier screen and the public checkout: `/<nym>` for a
-//! store's public link and `/c/<secret>` for its unlisted link. `/owner`
-//! shows the owner's history, from a session token the owner's wallet
-//! hands over. Viewing a page allocates nothing.
+//! One page is the cashier screen and the public checkout of a store:
+//! `/<nym>`. Viewing it allocates nothing.
 
 use axum::extract::Path;
 use axum::http::{StatusCode, Uri, header};
@@ -59,16 +57,8 @@ pub async fn public_manifest(Path(name): Path<String>) -> Response {
 	manifest(format!("/{}", name))
 }
 
-/// `GET /c/<secret>/manifest.webmanifest`.
-pub async fn unlisted_manifest(Path(secret): Path<String>) -> Response {
-	if secret.is_empty() || secret.len() > 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
-		return StatusCode::NOT_FOUND.into_response();
-	}
-	manifest(format!("/c/{}", secret))
-}
-
 /// Static assets. Unknown paths outside the API fall back to the web app,
-/// so its routes (`/<nym>`, `/c/<secret>`, `/owner`) work on reload.
+/// so `/<nym>` works on reload.
 pub async fn asset(uri: Uri) -> Response {
 	let path = uri.path().trim_start_matches('/');
 	if path.starts_with("api/") || path.starts_with(".well-known/") {

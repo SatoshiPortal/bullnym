@@ -8,7 +8,7 @@
 		<ShieldCheck class="mx-auto text-[#776b5a] dark:text-[#b9aa91]" size={44} />
 		<h1 class="mt-5 text-3xl font-black">Open the store's link</h1>
 		<p class="mt-3 text-[#776b5a] dark:text-[#b9aa91]">
-			A store takes payments at its link, for example /cafe. The owner can also share a private cashier link from the wallet.
+			A store takes payments at its link, for example /cafe.
 		</p>
 		<BullFooter />
 	</section>

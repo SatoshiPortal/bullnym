@@ -22,24 +22,21 @@ function header(call: Call, name: string): string | undefined {
 	return (call.init.headers as Record<string, string> | undefined)?.[name]
 }
 
-const PUBLIC = { kind: 'public', nym: 'cafe' } as const
-const UNLISTED = { kind: 'unlisted', secret: 'ab12' } as const
+const PUBLIC = { nym: 'cafe' }
 
 describe('PosClient', () => {
-	it('loads the store of a public or an unlisted link without a token', async () => {
-		const { fetch, calls } = fakeFetch([json({ store: { name: 'S' }, link: 'public' }), json({ store: { name: 'S' } })])
+	it('loads the store of its link without a token', async () => {
+		const { fetch, calls } = fakeFetch([json({ store: { name: 'S' } })])
 		const res = await new PosClient({ fetch, link: PUBLIC }).checkout()
 		expect(res.store.name).toBe('S')
-		await new PosClient({ fetch, link: UNLISTED }).checkout()
 		expect(calls[0]!.url).toBe('/api/v1/checkout/cafe')
-		expect(calls[1]!.url).toBe('/api/v1/links/ab12')
 		expect(header(calls[0]!, 'Authorization')).toBeUndefined()
 	})
 
 	it('reads the rate of the link', async () => {
 		const { fetch, calls } = fakeFetch([json({ currency: 'CRC', btc_price: '1', fetched_at: 'x' })])
-		await new PosClient({ fetch, link: UNLISTED }).rate()
-		expect(calls[0]!.url).toBe('/api/v1/links/ab12/rate')
+		await new PosClient({ fetch, link: PUBLIC }).rate()
+		expect(calls[0]!.url).toBe('/api/v1/checkout/cafe/rate')
 	})
 
 	it('creates a fiat sale with the contract body', async () => {

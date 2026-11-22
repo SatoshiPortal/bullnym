@@ -147,8 +147,8 @@ nym:<nym>
 }
 ```
 
-The owner's view adds `public_checkout`, `checkout_url`, `unlisted_link`
-(whether one exists) and `next_onchain_index`: each sale that offers Bitcoin
+The owner's view adds `checkout_url`, the store's cashier link, and
+`next_onchain_index`: each sale that offers Bitcoin
 takes the store's next derivation index, as in posd, and no address is
 handed out twice. The owner's wallet scans the store account up to this
 index, so a payment after many empty addresses is still found.
@@ -170,34 +170,28 @@ serves the nym and its store.
 | `PATCH /api/v1/owner/nym` | `display_name` (empty removes it) | `{"nym": Nym}` |
 | `GET /api/v1/owner/nym/payments?before=<id>&limit=<n>` | | `{"payments": [...]}`: the Lightning payments to the Lightning Address |
 | `GET /api/v1/owner/store` | | Owner store |
-| `PATCH /api/v1/owner/store` | any of `name`, `currency`, `onchain_min_sat`, `public_checkout` | Owner store |
-| `POST /api/v1/owner/store/unlisted-link` | | `{"url": "https://…/c/<secret>", "secret"}`; the previous link stops working |
-| `DELETE /api/v1/owner/store/unlisted-link` | | `204` |
+| `PATCH /api/v1/owner/store` | any of `name`, `currency`, `onchain_min_sat` | Owner store |
 | `GET /api/v1/owner/sales?before=<id>&limit=<n>` | | `{"sales": [Sale]}`, newest first, at most 100 |
 | `GET /api/v1/owner/sales.csv?from=<date>&to=<date>` | | CSV, one row per sale |
 
 `from` and `to` are dates (`2026-11-20`, in UTC) or RFC 3339 times. A date
 as `to` includes that whole day. The CSV columns are: `id, created_at,
 paid_at, state, paid_rail, amount_sat, received_sat, fiat_amount, currency,
-btc_price, memo, link, cashier_name, seen_sat, progress, warnings, notice,
+btc_price, memo, cashier_name, seen_sat, progress, warnings, notice,
 final_at, late_payment`.
 
-The web app's `/owner#token=<owner token>` shows the history and the CSV
-export.
+The owner's wallet calls these endpoints; the service has no owner page.
 
 ## Cashier link and public checkout
 
-Any device with a store's link acts as a cashier. There is no pairing, no
-device token and no login. The same page is the public checkout.
-
-- Public link: `https://<host>/<nym>`, open to anyone unless the owner turns
-  it off. API prefix `/api/v1/checkout/<nym>`.
-- Unlisted link: `https://<host>/c/<secret>`, which the owner shares with
-  staff and can replace. API prefix `/api/v1/links/<secret>`.
+A store has one cashier link, `https://<host>/<nym>`, always on and open to
+anyone. Any device with it acts as a cashier: there is no pairing, no device
+token and no login. The same page is the public checkout. Its API prefix is
+`/api/v1/checkout/<nym>`.
 
 | Method and path | Body | Returns |
 |---|---|---|
-| `GET <prefix>` | | `{"store": Store, "link": "public"\|"unlisted"}`. Viewing allocates nothing |
+| `GET <prefix>` | | `{"store": Store}`. Viewing allocates nothing |
 | `GET <prefix>/rate` | | `{"currency", "btc_price", "fetched_at"}` |
 | `POST <prefix>/sales` | `{"fiat_amount": "12.50"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) and `cashier_name` (64 characters, never verified) | `Sale` |
 | `GET /api/v1/sales/<id>` | | `Sale` |
@@ -233,7 +227,6 @@ Holding a sale's unguessable id is what lets a cashier follow and cancel it.
   "final": false,
   "final_at": null,
   "late_payment": false,
-  "link": "public",
   "cashier_name": "Front till"
 }
 ```

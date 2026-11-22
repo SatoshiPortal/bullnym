@@ -11,16 +11,13 @@
 		<link rel="apple-touch-icon" href="/icons/icon-192.png" />
 		<title>Point of sale</title>
 		<script>
-			// A cashier link installs with its own manifest, whose start_url is
-			// the link. The service serves the manifests of both kinds of link.
+			// A store's link installs with its own manifest, whose start_url is
+			// the link. The service serves it.
 			;(function () {
-				var unlisted = location.pathname.match(/^\/c\/([0-9a-fA-F]+)\/?$/)
-				var pub = location.pathname.match(/^\/([a-z0-9-]+)\/?$/)
+				var match = location.pathname.match(/^\/([a-z0-9-]+)\/?$/)
 				var link = document.createElement('link')
 				link.rel = 'manifest'
-				if (unlisted) link.href = '/c/' + unlisted[1] + '/manifest.webmanifest'
-				else if (pub) link.href = '/' + pub[1] + '/manifest.webmanifest'
-				else link.href = '/manifest.webmanifest'
+				link.href = match ? '/' + match[1] + '/manifest.webmanifest' : '/manifest.webmanifest'
 				document.head.appendChild(link)
 			})()
 		</script>

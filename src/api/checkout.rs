@@ -1,15 +1,11 @@
 //! The cashier link, which is also the store's public checkout.
 //!
-//! Any device with the link acts as a cashier: there is no pairing, no
-//! device token and no login. The link can create a sale, and whoever holds
-//! a sale's unguessable id can follow it and cancel it while it is open.
-//! The link cannot list the store's sales or export them: the history and
-//! the CSV are behind the owner login.
-//!
-//! A store has two kinds of link:
-//! - public: `/<nym>`, open to anyone, unless the owner turns it off;
-//! - unlisted: `/c/<secret>`, which the owner shares with staff and can
-//!   rotate, which kills the previous one.
+//! A store has one link, `/<nym>`, always on and open to anyone. Any device
+//! with it acts as a cashier: there is no pairing, no device token and no
+//! login. The link can create a sale, and whoever holds a sale's
+//! unguessable id can follow it and cancel it while it is open. The link
+//! cannot list the store's sales or export them: the history and the CSV
+//! are behind the owner login.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +18,11 @@ use serde_json::{Value, json};
 use crate::App;
 use crate::api::{StoreView, check_lookup};
 use crate::protect::{Caller, Surface};
-use crate::database::{CheckoutLink, STORE_COLUMNS, SaleState, Store};
+use crate::database::{STORE_COLUMNS, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, conflict, not_found};
 use crate::money::Decimal;
 use crate::sales::{self, NewSale, SaleAmount, SaleView};
-use crate::{token, watcher};
+use crate::watcher;
 
 
 /// The longest a long-poll waits.
@@ -35,44 +31,13 @@ const LONG_POLL: Duration = Duration::from_secs(25);
 /// The longest cashier name.
 const MAX_CASHIER_NAME_CHARS: usize = 64;
 
-/// The store behind a cashier link.
-struct Checkout {
-	store: Store,
-	link: CheckoutLink,
-}
-
-async fn by_nym(app: &App, nym: &str) -> ApiResult<Checkout> {
+/// The store of a nym.
+async fn store_of(app: &App, nym: &str) -> ApiResult<Store> {
 	let conn = app.public.db.conn().await?;
 	let row = conn.query_opt(&format!(
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE n.name = $1", STORE_COLUMNS,
 	), &[&nym]).await?;
-	let store = row.map(|r| Store::from_row(&r)).filter(|s| s.public_checkout)
-		.ok_or_else(|| not_found("no such store"))?;
-	Ok(Checkout { store, link: CheckoutLink::Public })
-}
-
-async fn by_secret(app: &App, secret: &str) -> ApiResult<Checkout> {
-	let conn = app.public.db.conn().await?;
-	let row = conn.query_opt(&format!(
-		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.unlisted_link_hash = $1",
-		STORE_COLUMNS,
-	), &[&token::hash(secret)]).await?;
-	let store = row.map(|r| Store::from_row(&r))
-		.ok_or_else(|| not_found("this cashier link does not work any more"))?;
-	Ok(Checkout { store, link: CheckoutLink::Unlisted })
-}
-
-fn store_view(app: &App, c: &Checkout) -> Json<Value> {
-	Json(json!({ "store": StoreView::new(app, &c.store), "link": c.link }))
-}
-
-async fn rate(app: &App, c: &Checkout) -> ApiResult<Json<Value>> {
-	let quote = app.price.quote(&c.store.currency).await.map_err(ApiError::Upstream)?;
-	Ok(Json(json!({
-		"currency": quote.currency,
-		"btc_price": quote.btc_price.to_string(),
-		"fetched_at": quote.fetched_at,
-	})))
+	row.map(|r| Store::from_row(&r)).ok_or_else(|| not_found("no such store"))
 }
 
 #[derive(Deserialize)]
@@ -85,8 +50,43 @@ pub struct CreateSale {
 	cashier_name: Option<String>,
 }
 
-async fn create_sale(app: &App, caller: &Caller, c: Checkout, req: CreateSale) -> ApiResult<Json<SaleView>> {
-	app.protect.check(caller, Surface::SaleCreate)?;
+/// `GET /api/v1/checkout/<nym>`: the store behind its link. Viewing
+/// allocates nothing.
+pub async fn store(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(nym): Path<String>,
+) -> ApiResult<Json<Value>> {
+	check_lookup(&app, &caller, &nym).await?;
+	let store = store_of(&app, &nym).await?;
+	Ok(Json(json!({ "store": StoreView::new(&app, &store) })))
+}
+
+/// `GET /api/v1/checkout/<nym>/rate`.
+pub async fn rate(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(nym): Path<String>,
+) -> ApiResult<Json<Value>> {
+	app.protect.check(&caller, Surface::StatusRead)?;
+	let store = store_of(&app, &nym).await?;
+	let quote = app.price.quote(&store.currency).await.map_err(ApiError::Upstream)?;
+	Ok(Json(json!({
+		"currency": quote.currency,
+		"btc_price": quote.btc_price.to_string(),
+		"fetched_at": quote.fetched_at,
+	})))
+}
+
+/// `POST /api/v1/checkout/<nym>/sales`.
+pub async fn create_sale(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(nym): Path<String>,
+	Json(req): Json<CreateSale>,
+) -> ApiResult<Json<SaleView>> {
+	app.protect.check(&caller, Surface::SaleCreate)?;
+	let store = store_of(&app, &nym).await?;
 	let amount = match (req.fiat_amount, req.amount_sat) {
 		(Some(fiat), None) => SaleAmount::Fiat(fiat.parse::<Decimal>()
 			.map_err(|e| bad_request(e.to_string()))?),
@@ -102,78 +102,19 @@ async fn create_sale(app: &App, caller: &Caller, c: Checkout, req: CreateSale) -
 	let open: i64 = {
 		let conn = app.public.db.conn().await?;
 		conn.query_one(
-			"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&c.store.id],
+			"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&store.id],
 		).await?.get(0)
 	};
 	if open >= app.protect.limits.max_open_sales_per_store as i64 {
-		tracing::info!("store {} has {} open sales, its cap", c.store.id, open);
+		tracing::info!("store {} has {} open sales, its cap", store.id, open);
 		return Err(ApiError::TooManyRequests);
 	}
-	let sale = sales::create_sale(app, &c.store, NewSale {
-		link: c.link,
+	let sale = sales::create_sale(&app, &store, NewSale {
 		cashier_name,
 		amount,
 		memo: req.memo,
 	}).await?;
 	Ok(Json(sale.into()))
-}
-
-/// `GET /api/v1/checkout/<nym>`: the store behind a public link. Viewing
-/// allocates nothing.
-pub async fn public_store(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(nym): Path<String>,
-) -> ApiResult<Json<Value>> {
-	check_lookup(&app, &caller, &nym).await?;
-	Ok(store_view(&app, &by_nym(&app, &nym).await?))
-}
-
-pub async fn public_rate(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(nym): Path<String>,
-) -> ApiResult<Json<Value>> {
-	app.protect.check(&caller, Surface::StatusRead)?;
-	rate(&app, &by_nym(&app, &nym).await?).await
-}
-
-pub async fn public_create_sale(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(nym): Path<String>,
-	Json(req): Json<CreateSale>,
-) -> ApiResult<Json<SaleView>> {
-	let c = by_nym(&app, &nym).await?;
-	create_sale(&app, &caller, c, req).await
-}
-
-pub async fn unlisted_store(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(secret): Path<String>,
-) -> ApiResult<Json<Value>> {
-	app.protect.check(&caller, Surface::StatusRead)?;
-	Ok(store_view(&app, &by_secret(&app, &secret).await?))
-}
-
-pub async fn unlisted_rate(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(secret): Path<String>,
-) -> ApiResult<Json<Value>> {
-	app.protect.check(&caller, Surface::StatusRead)?;
-	rate(&app, &by_secret(&app, &secret).await?).await
-}
-
-pub async fn unlisted_create_sale(
-	State(app): State<Arc<App>>,
-	caller: Caller,
-	Path(secret): Path<String>,
-	Json(req): Json<CreateSale>,
-) -> ApiResult<Json<SaleView>> {
-	let c = by_secret(&app, &secret).await?;
-	create_sale(&app, &caller, c, req).await
 }
 
 #[derive(Deserialize)]

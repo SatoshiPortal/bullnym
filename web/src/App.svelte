@@ -1,7 +1,6 @@
 <script lang="ts">
-	// Terminal shell. A cashier link ("/<nym>" or "/c/<secret>") opens the
-	// terminal on any device, with no pairing; the app is hash-routed like
-	// bullnym's POS.
+	// Terminal shell. The store's link ("/<nym>") opens the terminal on any
+	// device, with no pairing; the app is hash-routed like bullnym's POS.
 	import { ApiError } from '$lib/api'
 	import { router } from '$lib/router.svelte'
 	import { client, session } from '$lib/session.svelte'
@@ -26,7 +25,7 @@
 			})
 			.catch((e) => {
 				if (!current) return
-				if (e instanceof ApiError && e.status === 404) loadError = 'This link does not work. Ask the owner for the current link.'
+				if (e instanceof ApiError && e.status === 404) loadError = 'There is no store at this link.'
 				else loadError = e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the store.'
 			})
 		return () => {

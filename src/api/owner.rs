@@ -1,5 +1,5 @@
 //! Store registration, the owner login, and everything behind it: store
-//! settings, the unlisted cashier link, the sales history and the CSV.
+//! settings, the sales history and the CSV.
 //!
 //! The owner is the Ark address that registered the nym. It proves control
 //! by signing with that address's key. The same login serves the nym and
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use bitcoin::secp256k1::schnorr;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -60,12 +60,8 @@ fn check_store_name(name: &str) -> ApiResult<()> {
 pub struct OwnerStoreView {
 	#[serde(flatten)]
 	pub store: StoreView,
-	/// Whether anyone can open the checkout at `checkout_url`.
-	pub public_checkout: bool,
+	/// The store's cashier link and public checkout.
 	pub checkout_url: String,
-	/// Whether an unlisted cashier link exists. Its URL is shown once, when
-	/// it is made.
-	pub unlisted_link: bool,
 	/// The next derivation index of an on-chain sale: every address the
 	/// service handed out is below it. The wallet scans the store account up
 	/// to it, so no payment is missed after many empty addresses.
@@ -76,9 +72,7 @@ impl OwnerStoreView {
 	fn new(app: &App, store: &Store) -> OwnerStoreView {
 		OwnerStoreView {
 			store: StoreView::new(app, store),
-			public_checkout: store.public_checkout,
 			checkout_url: format!("{}/{}", public_url(app), store.nym),
-			unlisted_link: store.has_unlisted_link,
 			next_onchain_index: store.next_onchain_index,
 		}
 	}
@@ -229,7 +223,6 @@ pub struct UpdateStore {
 	name: Option<String>,
 	currency: Option<String>,
 	onchain_min_sat: Option<u64>,
-	public_checkout: Option<bool>,
 }
 
 pub async fn update_store(
@@ -252,12 +245,11 @@ pub async fn update_store(
 			name = coalesce($2, name),
 			currency = coalesce($3, currency),
 			onchain_min_sat = coalesce($4, onchain_min_sat),
-			public_checkout = coalesce($5, public_checkout),
 			updated_at = NOW()
 		WHERE id = $1
 	", &[
 		&store.id, &req.name.map(|n| n.trim().to_string()), &req.currency,
-		&req.onchain_min_sat.map(|v| v as i64), &req.public_checkout,
+		&req.onchain_min_sat.map(|v| v as i64),
 	]).await?;
 	let store = reload_store(&app, store.id).await?;
 	Ok(Json(OwnerStoreView::new(&app, &store)))
@@ -269,36 +261,6 @@ async fn reload_store(app: &App, store_id: i64) -> ApiResult<Store> {
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.id = $1", STORE_COLUMNS,
 	), &[&store_id]).await?;
 	Ok(Store::from_row(&row))
-}
-
-/// `POST /api/v1/owner/store/unlisted-link`: makes a new unlisted cashier
-/// link. The previous one stops working at once. The URL is shown only
-/// here; only its hash is stored.
-pub async fn rotate_unlisted_link(
-	State(app): State<Arc<App>>,
-	owner: Owner,
-) -> ApiResult<Json<Value>> {
-	let store = owner.store()?;
-	let secret = token::new_link_secret();
-	let conn = app.public.db.conn().await?;
-	conn.execute("
-		UPDATE store SET unlisted_link_hash = $2, updated_at = NOW() WHERE id = $1
-	", &[&store.id, &token::hash(&secret)]).await?;
-	let url = format!("{}/c/{}", public_url(&app), secret);
-	Ok(Json(json!({ "url": url, "secret": secret })))
-}
-
-/// `DELETE /api/v1/owner/store/unlisted-link`.
-pub async fn remove_unlisted_link(
-	State(app): State<Arc<App>>,
-	owner: Owner,
-) -> ApiResult<impl IntoResponse> {
-	let store = owner.store()?;
-	let conn = app.public.db.conn().await?;
-	conn.execute("
-		UPDATE store SET unlisted_link_hash = NULL, updated_at = NOW() WHERE id = $1
-	", &[&store.id]).await?;
-	Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

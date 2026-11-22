@@ -4,13 +4,12 @@ import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
 import { resolve } from 'node:path'
 
-// bullnym embeds dist/ and serves it at the site root. The SPA handles "/",
-// "/<nym>", "/c/<secret>" and "/owner", so assets use root-absolute URLs.
+// bullnym embeds dist/ and serves it at the site root. The SPA handles "/"
+// and "/<nym>", so assets use root-absolute URLs.
 //
-// The service serves the manifests of the cashier links itself
-// ("/<nym>/manifest.webmanifest" and "/c/<secret>/manifest.webmanifest"),
-// and public/manifest.webmanifest is the default, so the plugin must not
-// emit one.
+// The service serves the manifest of a store's link itself
+// ("/<nym>/manifest.webmanifest"), and public/manifest.webmanifest is the
+// default, so the plugin must not emit one.
 export default defineConfig({
 	base: '/',
 	plugins: [

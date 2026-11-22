@@ -104,7 +104,6 @@ sw create owner; sw create customer
 sw faucet customer 0.05; sw board customer
 sw nym mycafe                          # mycafe@<host>
 sw register "My Cafe" CRC              # the store, at https://<host>/mycafe
-sw link                                # an unlisted cashier link for staff
 sw sell 6250 "2 coffees"; sw pay customer; sw wait
 ```
 

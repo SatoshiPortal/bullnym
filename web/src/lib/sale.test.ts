@@ -37,7 +37,6 @@ function sale(overrides: Partial<Sale> = {}): Sale {
 		notice: null,
 		final: false,
 		late_payment: false,
-		link: 'public',
 		cashier_name: 'Front till',
 		...overrides,
 	}

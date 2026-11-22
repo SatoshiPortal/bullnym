@@ -32,7 +32,6 @@ export interface Sale {
 	notice: 'payment-replaced' | 'payment-dropped' | null
 	final: boolean
 	late_payment: boolean
-	link: 'public' | 'unlisted'
 	cashier_name: string | null
 }
 
@@ -47,11 +46,10 @@ export interface Store {
 /** The store behind a cashier link. */
 export interface Checkout {
 	store: Store
-	link: 'public' | 'unlisted'
 }
 
-/** A cashier link: the store's public link under its nym, or its unlisted link. */
-export type Link = { kind: 'public'; nym: string } | { kind: 'unlisted'; secret: string }
+/** A store's cashier link, "/<nym>". */
+export type Link = { nym: string }
 
 export interface Rate {
 	currency: string
@@ -88,9 +86,7 @@ const DEFAULT_TIMEOUT_MS = 15_000
 
 /** The API path of a cashier link. */
 export function linkPath(link: Link): string {
-	return link.kind === 'public'
-		? `/api/v1/checkout/${encodeURIComponent(link.nym)}`
-		: `/api/v1/links/${encodeURIComponent(link.secret)}`
+	return `/api/v1/checkout/${encodeURIComponent(link.nym)}`
 }
 
 export class PosClient {

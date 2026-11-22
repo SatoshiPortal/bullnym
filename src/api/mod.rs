@@ -4,8 +4,8 @@
 //! - `/api/v1/stores`: posd's store registration.
 //! - `/api/v1/owner/...`: everything behind the owner login, including the
 //!   sales history and CSV.
-//! - `/api/v1/checkout/<nym>/...` and `/api/v1/links/<secret>/...`: the
-//!   cashier link, which is also the public checkout. It needs no token.
+//! - `/api/v1/checkout/<nym>/...`: the store's cashier link, which is also
+//!   its public checkout. It needs no token.
 //! - `/api/v1/sales/<id>`: following and canceling one sale, for whoever
 //!   holds its unguessable id.
 //! - LNURL: `/.well-known/lnurlp/<nym>` and its callback.
@@ -42,16 +42,11 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/owner/nym", get(nym::get_own).patch(nym::update_own))
 		.route("/owner/nym/payments", get(nym::list_payments))
 		.route("/owner/store", get(owner::get_store).patch(owner::update_store))
-		.route("/owner/store/unlisted-link",
-			post(owner::rotate_unlisted_link).delete(owner::remove_unlisted_link))
 		.route("/owner/sales", get(owner::list_sales))
 		.route("/owner/sales.csv", get(owner::sales_csv))
-		.route("/checkout/{nym}", get(checkout::public_store))
-		.route("/checkout/{nym}/rate", get(checkout::public_rate))
-		.route("/checkout/{nym}/sales", post(checkout::public_create_sale))
-		.route("/links/{secret}", get(checkout::unlisted_store))
-		.route("/links/{secret}/rate", get(checkout::unlisted_rate))
-		.route("/links/{secret}/sales", post(checkout::unlisted_create_sale))
+		.route("/checkout/{nym}", get(checkout::store))
+		.route("/checkout/{nym}/rate", get(checkout::rate))
+		.route("/checkout/{nym}/sales", post(checkout::create_sale))
 		.route("/sales/{id}", get(checkout::get_sale))
 		.route("/sales/{id}/cancel", post(checkout::cancel_sale))
 		.route("/lnurlp/{nym}/callback", get(lnurl::callback))
@@ -60,7 +55,6 @@ pub fn router(app: Arc<App>) -> Router {
 	Router::new()
 		.nest("/api/v1", api)
 		.route("/.well-known/lnurlp/{nym}", get(lnurl::pay_request))
-		.route("/c/{secret}/manifest.webmanifest", get(web::unlisted_manifest))
 		.route("/{nym}/manifest.webmanifest", get(web::public_manifest))
 		.fallback(web::asset)
 		.layer(axum::middleware::from_fn_with_state(app.clone(), protect::resolve_caller))

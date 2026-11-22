@@ -137,28 +137,6 @@ impl Rail {
 	}
 }
 
-/// How a sale was created.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSql, FromSql)]
-#[postgres(name = "checkout_link")]
-#[serde(rename_all = "kebab-case")]
-pub enum CheckoutLink {
-	/// The store's public checkout under its nym.
-	#[postgres(name = "public")]
-	Public,
-	/// The store's unlisted cashier link.
-	#[postgres(name = "unlisted")]
-	Unlisted,
-}
-
-impl CheckoutLink {
-	pub fn as_str(&self) -> &'static str {
-		match self {
-			CheckoutLink::Public => "public",
-			CheckoutLink::Unlisted => "unlisted",
-		}
-	}
-}
-
 /// A nym and its Lightning Address destinations.
 #[derive(Debug, Clone)]
 pub struct Nym {
@@ -201,16 +179,13 @@ pub struct Store {
 	pub onchain_descriptor: String,
 	pub currency: String,
 	pub onchain_min_sat: i64,
-	pub public_checkout: bool,
-	pub has_unlisted_link: bool,
 	/// The next derivation index of an on-chain sale.
 	pub next_onchain_index: i64,
 }
 
 /// The columns of a store joined with its nym as `n`.
 pub const STORE_COLUMNS: &str = "s.id, s.nym_id, n.name AS nym, s.name, s.ark_address, \
-	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.public_checkout, \
-	s.unlisted_link_hash IS NOT NULL AS has_unlisted_link, s.next_onchain_index";
+	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.next_onchain_index";
 
 impl Store {
 	pub fn from_row(row: &Row) -> Store {
@@ -223,8 +198,6 @@ impl Store {
 			onchain_descriptor: row.get("onchain_descriptor"),
 			currency: row.get("currency"),
 			onchain_min_sat: row.get("onchain_min_sat"),
-			public_checkout: row.get("public_checkout"),
-			has_unlisted_link: row.get("has_unlisted_link"),
 			next_onchain_index: row.get("next_onchain_index"),
 		}
 	}
@@ -236,7 +209,6 @@ pub struct Sale {
 	pub id: i64,
 	pub public_id: String,
 	pub store_id: i64,
-	pub link: CheckoutLink,
 	pub cashier_name: Option<String>,
 	pub amount_sat: i64,
 	pub fiat_amount: Option<String>,
@@ -263,7 +235,7 @@ pub struct Sale {
 
 /// Selects a sale joined with its rails. Callers add the WHERE clause.
 pub const SALE_SELECT: &str = "
-	SELECT s.id, s.public_id, s.store_id, s.link, s.cashier_name, s.amount_sat, s.fiat_amount,
+	SELECT s.id, s.public_id, s.store_id, s.cashier_name, s.amount_sat, s.fiat_amount,
 		s.currency, s.btc_price, s.memo, s.state, s.progress, s.notice, s.paid_rail,
 		s.received_sat, coalesce(oc.pending_sat, 0) AS seen_sat,
 		coalesce(oc.warnings, '{}') AS warnings, s.created_at, s.expires_at, s.paid_at,
@@ -279,7 +251,6 @@ impl Sale {
 			id: row.get("id"),
 			public_id: row.get("public_id"),
 			store_id: row.get("store_id"),
-			link: row.get("link"),
 			cashier_name: row.get("cashier_name"),
 			amount_sat: row.get("amount_sat"),
 			fiat_amount: row.get("fiat_amount"),

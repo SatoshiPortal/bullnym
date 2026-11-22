@@ -50,10 +50,6 @@ CREATE TABLE store (
 	next_onchain_index BIGINT NOT NULL DEFAULT 0,
 	currency TEXT NOT NULL,
 	onchain_min_sat BIGINT NOT NULL,
-	-- Whether anyone can open the store's checkout under its nym.
-	public_checkout BOOLEAN NOT NULL DEFAULT TRUE,
-	-- The hash of the secret of the unlisted cashier link, if there is one.
-	unlisted_link_hash TEXT UNIQUE,
 	registration_timestamp BIGINT NOT NULL,
 	registration_signature TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -124,9 +120,6 @@ CREATE INDEX lnurl_invoice_nym_idx ON lnurl_invoice (nym_id, id DESC);
 -- payment-issue: a counted on-chain payment went away in a reorg.
 CREATE TYPE sale_state AS ENUM ('open', 'in-progress', 'paid', 'payment-issue', 'expired', 'canceled');
 CREATE TYPE payment_rail AS ENUM ('lightning', 'ark', 'onchain');
--- How a sale was created: through the store's public checkout under its
--- nym, or through its unlisted cashier link.
-CREATE TYPE checkout_link AS ENUM ('public', 'unlisted');
 
 CREATE TABLE sale (
 	id BIGSERIAL PRIMARY KEY,
@@ -135,7 +128,6 @@ CREATE TABLE sale (
 	-- the sale.
 	public_id TEXT NOT NULL UNIQUE,
 	store_id BIGINT NOT NULL REFERENCES store(id),
-	link checkout_link NOT NULL,
 	-- A name typed on the cashier screen. The service never verifies it.
 	cashier_name TEXT,
 	amount_sat BIGINT NOT NULL,

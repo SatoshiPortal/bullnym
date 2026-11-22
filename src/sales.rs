@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio_postgres::GenericClient;
 
 use crate::App;
-use crate::database::{CheckoutLink, Rail, SALE_SELECT, Sale, SaleState, Store};
+use crate::database::{Rail, SALE_SELECT, Sale, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, not_found};
 use crate::money::{Decimal, currency_decimals};
 use crate::rails::onchain::StoreDescriptor;
@@ -28,7 +28,6 @@ pub enum SaleAmount {
 /// A sale to create.
 #[derive(Debug, Clone)]
 pub struct NewSale {
-	pub link: CheckoutLink,
 	pub cashier_name: Option<String>,
 	pub amount: SaleAmount,
 	pub memo: Option<String>,
@@ -68,7 +67,6 @@ pub struct SaleView {
 	/// The sale ended unpaid and a payment came after: the owner sees it,
 	/// and it never pays another sale.
 	pub late_payment: bool,
-	pub link: CheckoutLink,
 	pub cashier_name: Option<String>,
 }
 
@@ -102,7 +100,6 @@ impl From<Sale> for SaleView {
 			r#final: s.final_at.is_some(),
 			final_at: s.final_at,
 			late_payment: s.state.ended_unpaid() && (s.received_sat > 0 || s.seen_sat > 0),
-			link: s.link,
 			cashier_name: s.cashier_name,
 		}
 	}
@@ -265,12 +262,12 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 
 	let public_id = token::random_hex(16);
 	let row = tx.query_one("
-		INSERT INTO sale (public_id, store_id, link, cashier_name, amount_sat, fiat_amount,
+		INSERT INTO sale (public_id, store_id, cashier_name, amount_sat, fiat_amount,
 			currency, btc_price, memo, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + make_interval(secs => $10))
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW() + make_interval(secs => $9))
 		RETURNING id
 	", &[
-		&public_id, &store.id, &new.link, &new.cashier_name, &(amount_sat.to_sat() as i64),
+		&public_id, &store.id, &new.cashier_name, &(amount_sat.to_sat() as i64),
 		&fiat.as_ref().map(|(f, _)| f.to_string()),
 		&fiat.as_ref().map(|_| store.currency.clone()),
 		&fiat.as_ref().map(|(_, p)| p.to_string()),
@@ -338,7 +335,7 @@ pub async fn sales_csv(
 	", SALE_SELECT), &[&store_id, &from, &to]).await?;
 	let mut out = String::from(
 		"id,created_at,paid_at,state,paid_rail,amount_sat,received_sat,fiat_amount,currency,\
-		btc_price,memo,link,cashier_name,seen_sat,progress,warnings,notice,final_at,late_payment\n",
+		btc_price,memo,cashier_name,seen_sat,progress,warnings,notice,final_at,late_payment\n",
 	);
 	for row in rows {
 		let s = Sale::from_row(&row);
@@ -356,7 +353,6 @@ pub async fn sales_csv(
 			s.currency.unwrap_or_default(),
 			s.btc_price.unwrap_or_default(),
 			s.memo.unwrap_or_default(),
-			s.link.as_str().to_string(),
 			s.cashier_name.unwrap_or_default(),
 			s.seen_sat.to_string(),
 			progress.unwrap_or_default(),

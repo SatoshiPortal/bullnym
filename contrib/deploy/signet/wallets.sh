@@ -15,18 +15,14 @@
 #   nym <nym>                         register the Lightning Address <nym>@<host>
 #   register "<name>" [CRC]           register the store of the nym
 #   store                             show the store
-#   store-set <key>=<value>...        name, currency, onchain_min_sat,
-#                                     public_checkout (true or false)
-#   link                              a new unlisted cashier link; the
-#                                     previous one stops working
-#   unlink                            remove the unlisted cashier link
+#   store-set <key>=<value>...        name, currency, onchain_min_sat
 #   owner-sales [n]                   the store's latest sales
 #   owner-csv [from] [to]             CSV export (dates YYYY-MM-DD)
 #   payments [n]                      Lightning payments to the Lightning
 #                                     Address
 #
-# Cashier (the store's public checkout, or its unlisted link with
-# LINK=<secret>; the web app at https://<host>/<nym> is the real one)
+# Cashier (the store's link; the web app at https://<host>/<nym> is the
+# real one)
 #   rate                              the store's bitcoin price
 #   sell <amount> [memo]              new sale; amount is fiat ("6250",
 #                                     "12.50") or sats ("20000sat")
@@ -58,7 +54,6 @@ ESPLORA="https://$HOST:10000"
 SERVICE="https://$HOST"
 HOME_DIR="${SIGNET_HOME:-$HOME/.bullnym-signet}"
 BARK="${BARK:-bark}"
-LINK="${LINK:-}"
 
 mkdir -p "$HOME_DIR"
 
@@ -103,10 +98,8 @@ owner_token() {
 	echo "$token"
 }
 
-# The API prefix of the cashier link: the public checkout under the nym, or
-# the unlisted link in LINK.
+# The API prefix of the store's cashier link.
 checkout() {
-	if [ -n "$LINK" ]; then echo "/api/v1/links/$LINK"; return; fi
 	echo "/api/v1/checkout/$(cat "$HOME_DIR/nym" 2>/dev/null || die "register the nym first")"
 }
 
@@ -118,7 +111,7 @@ get_sale() { api GET "/api/v1/sales/$1"; }
 
 show_sale() {
 	jq '{id, state, progress, warnings, notice, amount_sat, fiat_amount, currency, memo,
-		received_sat, seen_sat, paid_rail, paid_at, final, late_payment, expires_at, link,
+		received_sat, seen_sat, paid_rail, paid_at, final, late_payment, expires_at,
 		cashier_name, onchain_address, payment_request}'
 }
 
@@ -223,23 +216,16 @@ store-set)
 	for kv in "$@"; do
 		k=${kv%%=*}; v=${kv#*=}
 		case "$k" in
-			onchain_min_sat|public_checkout) body=$(jq --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$body") ;;
+			onchain_min_sat) body=$(jq --arg k "$k" --argjson v "$v" '.[$k] = $v' <<<"$body") ;;
 			name|currency) body=$(jq --arg k "$k" --arg v "$v" '.[$k] = $v' <<<"$body") ;;
 			*) die "unknown key $k" ;;
 		esac
 	done
 	api PATCH /api/v1/owner/store "$(owner_token)" "$body" | jq .
 	;;
-link)
-	api POST /api/v1/owner/store/unlisted-link "$(owner_token)" | jq -r '"\(.url)\n(use LINK=\(.secret) here; the previous link stopped working)"'
-	;;
-unlink)
-	api DELETE /api/v1/owner/store/unlisted-link "$(owner_token)" >/dev/null
-	echo "the unlisted link stopped working"
-	;;
 owner-sales)
 	api GET "/api/v1/owner/sales?limit=${1:-10}" "$(owner_token)" \
-		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.warnings | join(","))\t\(.link)\t\(.cashier_name // "")\t\(.memo // "")"'
+		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.warnings | join(","))\t\(.cashier_name // "")\t\(.memo // "")"'
 	;;
 owner-csv)
 	q=""; [ -n "${1:-}" ] && q="from=$1"; [ -n "${2:-}" ] && q="$q&to=$2"

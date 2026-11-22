@@ -64,7 +64,6 @@ async fn sale_paid_by_lightning() {
 	assert_eq!(sale["amount_sat"], 20_000);
 	assert_eq!(sale["fiat_amount"], "12500.00");
 	assert_eq!(sale["onchain_address"], Value::Null);
-	assert_eq!(sale["link"], "public");
 	let pr = sale["payment_request"].as_str().unwrap();
 	assert!(pr.starts_with("bitcoin:?lightning="), "{}", pr);
 	assert!(!pr.contains("ark-lightning"), "one invoice only: {}", pr);
@@ -92,7 +91,7 @@ async fn sale_paid_by_lightning() {
 	assert_eq!(status, StatusCode::UNAUTHORIZED);
 	let csv = owner_csv(&store).await;
 	assert!(csv.contains(id) && csv.contains("2 coffees") && csv.contains(",paid,lightning,"), "{}", csv);
-	assert!(csv.contains(",public,Front till,"), "{}", csv);
+	assert!(csv.contains(",2 coffees,Front till,"), "{}", csv);
 }
 
 #[tokio::test]
@@ -241,27 +240,29 @@ async fn lightning_address_and_lud22() {
 }
 
 #[tokio::test]
-async fn cashier_links() {
-	let ctx = TestContext::new("bullnym/cashier_links").await;
+async fn cashier_link() {
+	let ctx = TestContext::new("bullnym/cashier_link").await;
 	let store = store_setup(&ctx).await;
 	let svc = &store.svc;
 	let owner = Some(store.owner.token.as_str());
 
-	// Viewing the public checkout allocates nothing.
+	// The store has one link, /<nym>. Viewing it allocates nothing.
 	let view = svc.ok(Method::GET, "/api/v1/checkout/cafe", None, None).await;
 	assert_eq!(view["store"]["name"], "Café Uvita");
 	assert!(view["store"]["lightning_address"].as_str().unwrap().starts_with("cafe@"));
 	let (status, manifest) = svc.call(Method::GET, "/cafe/manifest.webmanifest", None, None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert_eq!(manifest["start_url"], "/cafe");
-	let index = svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await["next_onchain_index"].clone();
-	assert_eq!(index, 0, "viewing the checkout takes no address");
+	let owner_view = svc.ok(Method::GET, "/api/v1/owner/store", owner, None).await;
+	assert_eq!(owner_view["next_onchain_index"], 0, "viewing the checkout takes no address");
+	assert!(owner_view["checkout_url"].as_str().unwrap().ends_with("/cafe"));
+	let (status, _) = svc.call(Method::GET, "/api/v1/checkout/nobody", None, None).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
 
-	// The public link creates, follows and cancels its sale, without a
-	// token.
-	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
+	// The link creates, follows and cancels its sale, without a token.
+	let sale = store.new_sale(json!({ "amount_sat": 60_000, "cashier_name": "Back till" })).await;
 	let id = sale["id"].as_str().unwrap();
-	assert_eq!(sale["link"], "public");
+	assert_eq!(sale["cashier_name"], "Back till");
 	svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
 	let canceled = svc.ok(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
 	assert_eq!(canceled["state"], "canceled");
@@ -269,39 +270,24 @@ async fn cashier_links() {
 	assert_eq!(status, StatusCode::CONFLICT);
 	let (status, _) = svc.call(Method::GET, "/api/v1/sales/0123456789abcdef0123456789abcdef", None, None).await;
 	assert_eq!(status, StatusCode::NOT_FOUND);
+	store.new_sale(json!({ "amount_sat": 1000 })).await;
 
-	// An unlisted link, rotated: the old one stops working.
-	let first = svc.ok(Method::POST, "/api/v1/owner/store/unlisted-link", owner, None).await;
-	let first_secret = first["secret"].as_str().unwrap().to_string();
-	assert!(first["url"].as_str().unwrap().ends_with(&format!("/c/{}", first_secret)));
-	let sale = svc.ok(Method::POST, &format!("/api/v1/links/{}/sales", first_secret), None,
-		Some(json!({ "amount_sat": 1000, "cashier_name": "Back till" }))).await;
-	assert_eq!(sale["link"], "unlisted");
-	assert_eq!(sale["cashier_name"], "Back till");
-	let second = svc.ok(Method::POST, "/api/v1/owner/store/unlisted-link", owner, None).await;
-	let second_secret = second["secret"].as_str().unwrap().to_string();
-	let (status, _) = svc.call(Method::GET, &format!("/api/v1/links/{}", first_secret), None, None).await;
-	assert_eq!(status, StatusCode::NOT_FOUND, "the rotated link is dead");
-	let (status, _) = svc.call(Method::POST, &format!("/api/v1/links/{}/sales", first_secret), None,
-		Some(json!({ "amount_sat": 1000 }))).await;
+	// The link is always on: the owner has no switch for it, and no other
+	// link exists.
+	let unchanged = svc.ok(Method::PATCH, "/api/v1/owner/store", owner,
+		Some(json!({ "public_checkout": false }))).await;
+	assert!(unchanged.get("public_checkout").is_none());
+	svc.ok(Method::GET, "/api/v1/checkout/cafe", None, None).await;
+	let (status, _) = svc.call(Method::POST, "/api/v1/owner/store/unlisted-link", owner, None).await;
 	assert_eq!(status, StatusCode::NOT_FOUND);
-	svc.ok(Method::GET, &format!("/api/v1/links/{}", second_secret), None, None).await;
-
-	// The owner can turn the public checkout off; the unlisted link goes on.
-	svc.ok(Method::PATCH, "/api/v1/owner/store", owner, Some(json!({ "public_checkout": false }))).await;
-	let (status, _) = svc.call(Method::GET, "/api/v1/checkout/cafe", None, None).await;
-	assert_eq!(status, StatusCode::NOT_FOUND);
-	svc.ok(Method::POST, &format!("/api/v1/links/{}/sales", second_secret), None,
-		Some(json!({ "amount_sat": 1000 }))).await;
 
 	// History is the owner's only.
 	let (status, _) = svc.call(Method::GET, "/api/v1/owner/sales", Some("not-a-token"), None).await;
 	assert_eq!(status, StatusCode::UNAUTHORIZED);
 	let history = svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await;
 	let sales = history["sales"].as_array().unwrap();
-	assert_eq!(sales.len(), 3);
-	assert_eq!(sales[0]["link"], "unlisted");
-	assert_eq!(sales[2]["state"], "canceled");
+	assert_eq!(sales.len(), 2);
+	assert_eq!(sales[1]["state"], "canceled");
 }
 
 #[tokio::test]
