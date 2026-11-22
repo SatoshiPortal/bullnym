@@ -9,6 +9,15 @@ use std::str::FromStr;
 use bitcoin::Amount;
 
 
+/// The largest amount in sats the service takes anywhere: a sale, a
+/// Lightning Address payment, or an on-chain threshold. It is all the
+/// bitcoin there will ever be, and every amount below it fits the signed
+/// 64-bit columns of the database.
+pub const MAX_SAT: u64 = 21_000_000 * 100_000_000;
+
+/// A fiat amount must be below this, whatever the currency.
+pub const MAX_FIAT_INTEGER: u128 = 1_000_000_000_000_000;
+
 /// The fiat currencies the Bull Bitcoin price API quotes, with their
 /// decimal places.
 pub const CURRENCIES: &[(&str, u32)] = &[
@@ -50,6 +59,11 @@ impl Decimal {
 
 	pub fn is_zero(&self) -> bool {
 		self.value == 0
+	}
+
+	/// The whole units, without the decimals.
+	pub fn integer_part(&self) -> u128 {
+		self.value / 10u128.pow(self.scale)
 	}
 
 	/// Rounds half up to `scale` decimal places.
@@ -147,6 +161,14 @@ mod test {
 		assert_eq!(d("1").fiat_to_sat(&d("300000")), Some(Amount::from_sat(333)));
 		assert_eq!(d("2").fiat_to_sat(&d("300000")), Some(Amount::from_sat(667)));
 		assert_eq!(d("1").fiat_to_sat(&d("0")), None);
+	}
+
+	#[test]
+	fn bounds() {
+		assert_eq!(MAX_SAT, bitcoin::Amount::MAX_MONEY.to_sat());
+		assert!(MAX_SAT <= i64::MAX as u64);
+		assert_eq!(d("999999999999999.99").integer_part(), MAX_FIAT_INTEGER - 1);
+		assert_eq!(d("12.50").integer_part(), 12);
 	}
 
 	#[test]

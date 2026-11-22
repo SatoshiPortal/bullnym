@@ -5,18 +5,23 @@
 //! login. The link can create a sale, and whoever holds a sale's
 //! unguessable id can follow it and cancel it while it is open. The link
 //! cannot list the store's sales or export them: the history and the CSV
-//! are behind the owner login.
+//! are behind the owner login. The cashier screen keeps the ids of the
+//! sales it created, and shows them only after the service checked the
+//! owner's cashier PIN (see [crate::pin]).
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::App;
 use crate::api::{StoreView, check_lookup};
+use crate::pin;
 use crate::protect::{Caller, Surface};
 use crate::database::{STORE_COLUMNS, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, conflict, not_found};
@@ -105,6 +110,90 @@ pub async fn create_sale(
 		memo: req.memo,
 	}).await?;
 	Ok(Json(sale.into()))
+}
+
+#[derive(Deserialize)]
+pub struct CheckPin {
+	pin: String,
+}
+
+/// The answer to a PIN check that did not unlock the list.
+pub enum PinRefusal {
+	/// The PIN is wrong. Further checks are locked for `retry_after`
+	/// seconds, 0 while wrong PINs are still free.
+	Wrong { retry_after: i64 },
+	/// Too many wrong PINs: checks are locked for `retry_after` seconds.
+	Locked { retry_after: i64 },
+	Api(ApiError),
+}
+
+impl From<ApiError> for PinRefusal {
+	fn from(e: ApiError) -> PinRefusal {
+		PinRefusal::Api(e)
+	}
+}
+
+impl From<anyhow::Error> for PinRefusal {
+	fn from(e: anyhow::Error) -> PinRefusal {
+		PinRefusal::Api(ApiError::Internal(e))
+	}
+}
+
+impl IntoResponse for PinRefusal {
+	fn into_response(self) -> Response {
+		let (status, error, retry_after) = match self {
+			PinRefusal::Wrong { retry_after } => (StatusCode::UNAUTHORIZED, "wrong PIN", retry_after),
+			PinRefusal::Locked { retry_after } => {
+				(StatusCode::TOO_MANY_REQUESTS, "too many wrong PINs; try again later", retry_after)
+			},
+			PinRefusal::Api(e) => return e.into_response(),
+		};
+		let mut resp = (status, Json(json!({ "error": error, "retry_after": retry_after }))).into_response();
+		if retry_after > 0 {
+			resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
+		}
+		resp
+	}
+}
+
+/// `POST /api/v1/checkout/<nym>/pin`: checks the cashier PIN, which
+/// unlocks the screen's list of its own sales. The answer says only
+/// whether it matched.
+pub async fn check_pin(
+	State(app): State<Arc<App>>,
+	caller: Caller,
+	Path(nym): Path<String>,
+	Json(req): Json<CheckPin>,
+) -> Result<Json<Value>, PinRefusal> {
+	app.protect.check(&caller, Surface::PinCheck)?;
+	let store = store_of(&app, &nym).await?;
+	if req.pin.len() > pin::MAX_PIN_DIGITS * 4 {
+		return Err(bad_request("the PIN is too long").into());
+	}
+	let scopes = pin::scopes(store.id, &caller.source);
+	let hash: Option<String> = {
+		let conn = app.public.db.conn().await?;
+		// The backoff holds for every caller, certified or not.
+		let locked = pin::locked_for(&*conn, &scopes).await?;
+		if locked > 0 {
+			return Err(PinRefusal::Locked { retry_after: locked });
+		}
+		conn.query_one("SELECT cashier_pin_hash FROM store WHERE id = $1", &[&store.id]).await
+			.map_err(ApiError::from)?.get("cashier_pin_hash")
+	};
+	let Some(hash) = hash else {
+		return Err(not_found("the owner has not set a cashier PIN").into());
+	};
+	let given = req.pin;
+	let matches = tokio::task::spawn_blocking(move || pin::verify(&given, &hash)).await
+		.map_err(|e| anyhow::anyhow!("PIN check task: {}", e))?;
+	if !matches {
+		let mut conn = app.public.db.conn().await?;
+		let retry_after = pin::record_failure(&mut conn, &scopes).await?;
+		tracing::info!("wrong cashier PIN for store {} from {}", store.id, caller.source);
+		return Err(PinRefusal::Wrong { retry_after });
+	}
+	Ok(Json(json!({ "ok": true })))
 }
 
 #[derive(Deserialize)]

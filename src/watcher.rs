@@ -2,14 +2,20 @@
 //! Lightning Addresses, and moves them to their next state.
 //!
 //! A sale is paid by the first rail that delivers its full amount. The
-//! watcher keeps checking the other rails until they expire, so a second
-//! payment is recorded as excess instead of being missed. A payment to a
-//! sale that ended unpaid is a late payment: the owner sees it on that
-//! sale, and it never pays another one.
+//! watcher keeps checking its invoice until barkd says how it ended, so a
+//! second payment over it is recorded as excess instead of being missed.
+//! A payment to a sale that ended unpaid is a late payment: the owner sees
+//! it on that sale, and it never pays another one.
 //!
 //! On-chain payments go through the stages of [crate::stages]: seen in the
-//! mempool (in progress, not guaranteed), paid at 1 confirmation, final at
-//! 3, and a payment issue if a reorg takes a counted payment away.
+//! mempool (in progress, not guaranteed), then paid at 1 confirmation,
+//! which is final as in posd.
+//!
+//! The rail that paid an invoice is recorded only on positive evidence
+//! from the Ark server: HTLCs it granted for a Lightning payment, or its
+//! report that an Ark payment was delivered. Without one the sale keeps
+//! its state, and an Ark payment that is not delivered keeps its sale in
+//! progress with no deadline.
 
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
@@ -149,22 +155,39 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 					};
 					awaiting_delivery(delivered, p.sale_state)
 				},
-				ForwardStatus::Delivered(amount) => {
-					// The Ark server granted HTLCs only to a Lightning payment.
-					let via_ark = match app.ark.receive(hash).await {
-						Ok(r) => !r.has_htlcs,
-						Err(e) => {
-							tracing::warn!("could not tell how invoice {} was paid: {:#}", hash, e);
-							p.sale_state == SaleState::InProgress
+				ForwardStatus::Delivered(amount) => match app.ark.receive(hash).await {
+					Ok(r) => match paid_by(&r) {
+						Some(via_ark) => Some(Observation::invoice(amount, true, false, via_ark)),
+						None => {
+							tracing::info!("invoice {} is delivered; waiting for the Ark server to say how \
+								it was paid", hash);
+							None
 						},
-					};
-					Some(Observation::invoice(amount, true, false, via_ark))
+					},
+					Err(e) => {
+						tracing::warn!("could not tell how invoice {} was paid: {:#}", hash, e);
+						None
+					},
 				},
 				// Canceled or expired unpaid: stop checking it.
 				ForwardStatus::Gone => Some(Observation::invoice(Amount::ZERO, true, false, false)),
 			})
 		},
 		Rail::Onchain => Ok(None),
+	}
+}
+
+/// How a delivered invoice was paid, from the Ark server's positive
+/// evidence: `Some(false)` for Lightning (it granted HTLCs, which only a
+/// Lightning payment gets), `Some(true)` for Ark (it reports the transfer
+/// delivered). `None` when the answer shows neither: the sale waits.
+pub fn paid_by(r: &crate::ark::ServerReceive) -> Option<bool> {
+	if r.has_htlcs {
+		Some(false)
+	} else if r.delivered == Some(true) {
+		Some(true)
+	} else {
+		None
 	}
 }
 
@@ -222,15 +245,14 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 
 	let next = next_state(state, amount_sat, obs);
 	if let Some(next) = next {
-		// A sale paid by its invoice is final at once. An Ark payment that
-		// is not delivered yet puts the sale in progress.
+		// An Ark payment that is not delivered yet puts the sale in
+		// progress.
 		let paid = next == SaleState::Paid;
 		let progress = (next == SaleState::InProgress).then_some("ark");
 		tx.execute("
 			UPDATE sale SET state = $2,
 				paid_rail = CASE WHEN $3 THEN $4 ELSE paid_rail END,
 				paid_at = CASE WHEN $3 THEN NOW() ELSE paid_at END,
-				final_at = CASE WHEN $3 THEN NOW() ELSE final_at END,
 				progress = $5,
 				notice = NULL
 			WHERE id = $1
@@ -256,9 +278,10 @@ struct WatchedAddress {
 	warnings: Vec<String>,
 }
 
-/// The on-chain payments to follow: addresses in their late-payment
-/// window, sales in progress or with a payment issue, and sales paid
-/// on-chain until they are final.
+/// The on-chain payments to follow: the address of a sale until it is
+/// paid, and the address of a sale that ended unpaid for 7 days after the
+/// sale was created, for late payments. Observation of a sale ends when it
+/// is paid, at 1 confirmation.
 async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
@@ -267,9 +290,8 @@ async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
 		WHERE p.rail = 'onchain' AND (
-			s.created_at > NOW() - make_interval(secs => $1)
-			OR s.state IN ('in-progress', 'payment-issue')
-			OR (s.state = 'paid' AND s.paid_rail = 'onchain' AND s.final_at IS NULL)
+			s.state IN ('open', 'in-progress')
+			OR (s.state IN ('expired', 'canceled') AND s.created_at > NOW() - make_interval(secs => $1))
 		)
 		ORDER BY p.id
 	", &[&(app.cfg.sales.onchain_watch_secs as f64)]).await?;
@@ -311,7 +333,7 @@ async fn watch_onchain(app: &App) -> anyhow::Result<bool> {
 		let mut records = Vec::with_capacity(all.len());
 		for txid in &all {
 			match app.watch.chain.observe_tx(txid, &address, &all).await {
-				Ok(obs) => records.push(stages::classify(known.get(txid), &obs, &fees)),
+				Ok(obs) => records.extend(stages::classify(known.get(txid), &obs, &fees)),
 				Err(e) => {
 					tracing::warn!("check of transaction {} failed: {:#}", txid, e);
 					if let Some(k) = known.get(txid) {
@@ -360,15 +382,13 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 	let tx = conn.transaction().await?;
 	// Lock the sale, so its rails cannot both mark it paid.
 	let row = tx.query_one("
-		SELECT state, amount_sat, expires_at < NOW() AS expired, paid_rail, progress, final_at
+		SELECT state, amount_sat, expires_at < NOW() AS expired, progress
 		FROM sale WHERE id = $1 FOR UPDATE
 	", &[&w.sale_id]).await?;
 	let state: SaleState = row.get("state");
 	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat") as u64);
 	let expired: bool = row.get("expired");
-	let paid_rail: Option<Rail> = row.get("paid_rail");
 	let progress: Option<String> = row.get("progress");
-	let has_final: bool = row.get::<_, Option<chrono::DateTime<chrono::Utc>>>("final_at").is_some();
 
 	for r in records {
 		tx.execute("
@@ -396,8 +416,7 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 	", &[&w.sale_id]).await?;
 
 	let t = stages::next_onchain_state(
-		state, amount, paid_rail == Some(Rail::Onchain), progress.as_deref() == Some("onchain"),
-		expired, &summary, app.cfg.sales.final_confirmations as i64,
+		state, amount, progress.as_deref() == Some("onchain"), expired, &summary,
 	);
 	match t.state {
 		Some(SaleState::InProgress) => {
@@ -412,15 +431,6 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 				WHERE id = $1
 			", &[&w.sale_id]).await?;
 		},
-		Some(SaleState::Paid) => {
-			tx.execute("UPDATE sale SET state = 'paid' WHERE id = $1", &[&w.sale_id]).await?;
-		},
-		Some(SaleState::PaymentIssue) => {
-			tracing::warn!("sale {}: a counted on-chain payment went away", w.sale_public_id);
-			tx.execute("
-				UPDATE sale SET state = 'payment-issue', final_at = NULL WHERE id = $1
-			", &[&w.sale_id]).await?;
-		},
 		Some(back) => {
 			let notice = t.notice.map(|n| n.as_str());
 			tx.execute("
@@ -429,17 +439,13 @@ async fn record_onchain(app: &App, w: &WatchedAddress, records: &[TxRecord]) -> 
 		},
 		None => {},
 	}
-	let became_final = t.is_final && !has_final;
-	if became_final {
-		tx.execute("UPDATE sale SET final_at = NOW() WHERE id = $1", &[&w.sale_id]).await?;
-	}
 	tx.commit().await?;
 
 	if t.counts_as_paid {
 		tracing::info!("sale {} paid on-chain", w.sale_public_id);
 		sale_ended(&app.watch, w.sale_id).await;
 	}
-	Ok(t.state.is_some() || became_final || payment_changed)
+	Ok(t.state.is_some() || payment_changed)
 }
 
 /// The payment hash of a sale's invoice, while it is not settled.
@@ -650,7 +656,19 @@ mod test {
 		assert_eq!(next_state(Expired, 1000, &obs(1000, true)), None);
 		assert_eq!(next_state(Canceled, 1000, &obs(1000, true)), None);
 		assert_eq!(next_state(Paid, 1000, &obs(1000, true)), None);
-		assert_eq!(next_state(PaymentIssue, 1000, &obs(1000, true)), None);
+	}
+
+	#[test]
+	fn the_paying_rail_needs_positive_evidence() {
+		use crate::ark::ServerReceive;
+		let r = |has_htlcs, delivered| ServerReceive { has_htlcs, delivered, amount: Amount::from_sat(1000) };
+		assert_eq!(paid_by(&r(true, None)), Some(false), "HTLCs: Lightning");
+		assert_eq!(paid_by(&r(true, Some(false))), Some(false));
+		assert_eq!(paid_by(&r(false, Some(true))), Some(true), "delivered by Ark");
+		// Neither HTLCs nor a delivery report: nothing is inferred, whatever
+		// the sale's state, and the sale waits.
+		assert_eq!(paid_by(&r(false, None)), None);
+		assert_eq!(paid_by(&r(false, Some(false))), None);
 	}
 
 	#[test]

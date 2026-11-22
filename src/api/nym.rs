@@ -71,7 +71,8 @@ pub async fn register(
 	let signature = parse_signature(&req.signature)?;
 	nym::check(&reg.nym, &app.cfg.nyms.reserved).map_err(|e| bad_request(e.to_string()))?;
 	let info = app.ark.ark_info().await;
-	let address = reg.verify(&signature, info.server_pubkey).map_err(|e| bad_request(e.to_string()))?;
+	let address = reg.verify(&signature, info.server_pubkey, app.cfg.network)
+		.map_err(|e| bad_request(e.to_string()))?;
 	check_timestamp(reg.timestamp)?;
 	silent_payment::check(&reg.silent_payment_address, app.cfg.network)
 		.map_err(|e| bad_request(format!("the Silent Payment address is not valid: {}", e)))?;

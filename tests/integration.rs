@@ -11,6 +11,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use bark::Wallet;
 use bark::payment_request::PaymentRequest;
 
 use ark_testing::{TestContext, sat};
+use bullnym::TestOverrides;
 use bullnym::error::UNAVAILABLE_MESSAGE;
 use common::{SALE_TIMEOUT, Service, Store, owner_restores, rpc, store_setup, store_setup_with};
 
@@ -80,7 +82,7 @@ async fn sale_paid_by_lightning() {
 	let id = sale["id"].as_str().unwrap();
 	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
 	assert_eq!(paid["paid_rail"], "lightning");
-	assert_eq!(paid["final"], true, "a delivered invoice is final");
+	assert!(paid.get("final").is_none(), "paid is final: no separate finality");
 
 	owner_restores(&ctx, &store, sat(15_000)).await;
 
@@ -163,19 +165,36 @@ async fn sale_paid_onchain_through_its_stages() {
 	let (status, _) = store.svc.call(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
 	assert_eq!(status, StatusCode::CONFLICT);
 
-	// Paid at 1 confirmation, final at 3.
+	// Paid at 1 confirmation, for good, on the cashier's view and the
+	// owner's.
 	ctx.generate_blocks(1).await;
 	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
 	assert_eq!(paid["paid_rail"], "onchain");
 	assert_eq!(paid["received_sat"], 60_000);
-	assert_eq!(paid["final"], false);
+	assert!(paid.get("final").is_none() && paid.get("final_at").is_none(), "{}", paid);
 	assert!(warnings(&paid).is_empty(), "{}", paid);
-	ctx.generate_blocks(2).await;
-	let fin = store.svc.wait_sale(id, SALE_TIMEOUT, |s| s["final"] == true, "final").await;
-	assert_eq!(fin["state"], "paid");
+	let history = store.svc.ok(Method::GET, "/api/v1/owner/sales", Some(&store.owner.token), None).await;
+	let row = history["sales"].as_array().unwrap().iter().find(|s| s["id"] == id).unwrap().clone();
+	assert_eq!((row["state"].clone(), row["received_sat"].clone()), (json!("paid"), json!(60_000)));
+
+	// Observation of the sale ends there: the block with the payment going
+	// away changes nothing, and neither does a later payment to the address.
+	let node = &store.svc.bitcoind;
+	let tip = rpc(node, None, "getbestblockhash", json!([])).await;
+	rpc(node, None, "invalidateblock", json!([tip])).await;
+	tokio::time::sleep(Duration::from_secs(6)).await;
+	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
+	assert_eq!((after["state"].clone(), after["received_sat"].clone()), (json!("paid"), json!(60_000)), "{}", after);
+	rpc(node, None, "reconsiderblock", json!([tip])).await;
+	ctx.bitcoind().fund_addr(&address, sat(10_000)).await;
+	ctx.generate_blocks(1).await;
+	tokio::time::sleep(Duration::from_secs(6)).await;
+	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
+	assert_eq!((after["state"].clone(), after["received_sat"].clone()), (json!("paid"), json!(60_000)), "{}", after);
 
 	let csv = owner_csv(&store).await;
 	assert!(csv.contains(id) && csv.contains(",paid,onchain,60000,60000,"), "{}", csv);
+	assert!(!csv.contains("final"), "{}", csv);
 }
 
 #[tokio::test]
@@ -186,7 +205,7 @@ async fn lightning_address_and_lud22() {
 
 	let pay_request = svc.ok(Method::GET, "/.well-known/lnurlp/cafe", None, None).await;
 	assert_eq!(pay_request["tag"], "payRequest");
-	assert_eq!(pay_request["payment_methods"], json!(["ARK", "SP"]));
+	assert_eq!(pay_request["payment_methods"], json!(["SCUTTLE", "SP"]));
 	assert!(pay_request["metadata"].as_str().unwrap().contains("cafe@127.0.0.1"));
 	let callback = pay_request["callback"].as_str().unwrap();
 	let path = callback.strip_prefix(&svc.url).unwrap().to_string();
@@ -209,22 +228,31 @@ async fn lightning_address_and_lud22() {
 		tokio::time::sleep(Duration::from_millis(200)).await;
 	}
 
-	// LUD-22: each method answers with only that method's static address,
-	// and creates no invoice.
+	// LUD-22: each method answers with only the requested methods' static
+	// addresses, and creates no invoice.
 	let open_before = svc.ok(Method::GET, "/api/v1/owner/nym/payments", Some(&store.owner.token), None).await
 		["payments"].as_array().unwrap().len();
-	let ark = svc.ok(Method::GET, &format!("{}?amount=5000000&payment_method=ARK", path), None, None).await;
-	assert_eq!(ark, json!({ "ARK": { "address": store.owner.address.to_string() } }));
-	let sp = svc.ok(Method::GET, &format!("{}?amount=5000000&payment_method=SP", path), None, None).await;
-	assert_eq!(sp, json!({ "SP": { "address": common::silent_payment_address() } }));
+	let ark = json!({ "address": store.owner.address.to_string() });
+	let sp = json!({ "address": common::silent_payment_address() });
+	let with = |m: &str| format!("{}?amount=5000000&payment_method={}", path, m);
+	assert_eq!(svc.ok(Method::GET, &with("SCUTTLE"), None, None).await, json!({ "SCUTTLE": ark.clone() }));
+	assert_eq!(svc.ok(Method::GET, &with("SP"), None, None).await, json!({ "SP": sp.clone() }));
+	assert_eq!(svc.ok(Method::GET, &with("SCUTTLE,SP"), None, None).await,
+		json!({ "SCUTTLE": ark.clone(), "SP": sp.clone() }));
+	assert_eq!(svc.ok(Method::GET, &with("SP,SCUTTLE"), None, None).await, json!({ "SCUTTLE": ark, "SP": sp }));
 	let open_after = svc.ok(Method::GET, "/api/v1/owner/nym/payments", Some(&store.owner.token), None).await
 		["payments"].as_array().unwrap().len();
 	assert_eq!(open_before, open_after, "a LUD-22 method creates no invoice");
 
-	// Errors use the LNURL shape.
-	let (status, err) = svc.call(Method::GET, &format!("{}?amount=5000000&payment_method=L-BTC", path), None, None).await;
-	assert_eq!(status, StatusCode::BAD_REQUEST);
-	assert_eq!(err["status"], "ERROR");
+	// An unknown method is refused in the LNURL error shape. ARK is not an
+	// alias of SCUTTLE.
+	for unknown in ["ARK", "L-BTC", "SCUTTLE,L-BTC"] {
+		let (status, err) = svc.call(Method::GET,
+			&format!("{}?amount=5000000&payment_method={}", path, unknown), None, None).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{}", unknown);
+		assert_eq!(err["status"], "ERROR");
+		assert!(err["reason"].as_str().unwrap().starts_with("unsupported payment method"), "{}", err);
+	}
 	let (status, _) = svc.call(Method::GET, &format!("{}?amount=1500", path), None, None).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST, "not whole sats");
 	let (status, _) = svc.call(Method::GET, "/.well-known/lnurlp/nobody", None, None).await;
@@ -291,6 +319,71 @@ async fn cashier_link() {
 }
 
 #[tokio::test]
+async fn cashier_pin() {
+	let ctx = TestContext::new("bullnym/cashier_pin").await;
+	let store = store_setup(&ctx).await;
+	let svc = &store.svc;
+	let owner = Some(store.owner.token.as_str());
+	let check = |pin: &str| svc.call(Method::POST, "/api/v1/checkout/cafe/pin", None, Some(json!({ "pin": pin })));
+
+	// Before the owner sets a PIN, the list stays hidden: no PIN unlocks it.
+	let view = svc.ok(Method::GET, "/api/v1/checkout/cafe", None, None).await;
+	assert_eq!(view["store"]["cashier_pin_set"], false);
+	let (status, _) = check("0000").await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+	// Selling needs no PIN.
+	store.new_sale(json!({ "amount_sat": 1000 })).await;
+
+	// Only the owner sets it, 4 to 12 digits.
+	let (status, _) = svc.call(Method::PUT, "/api/v1/owner/store/cashier-pin", None,
+		Some(json!({ "pin": "2468" }))).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	for bad in ["123", "12a4", "1234567890123"] {
+		let (status, _) = svc.call(Method::PUT, "/api/v1/owner/store/cashier-pin", owner,
+			Some(json!({ "pin": bad }))).await;
+		assert_eq!(status, StatusCode::BAD_REQUEST, "{}", bad);
+	}
+	let set = svc.ok(Method::PUT, "/api/v1/owner/store/cashier-pin", owner, Some(json!({ "pin": "1357" }))).await;
+	assert_eq!(set["cashier_pin_set"], true);
+	// The owner changes it.
+	let set = svc.ok(Method::PUT, "/api/v1/owner/store/cashier-pin", owner, Some(json!({ "pin": "2468" }))).await;
+	assert_eq!(set["cashier_pin_set"], true);
+	assert!(!set.to_string().contains("argon2"), "the hash is never shown: {}", set);
+	let view = svc.ok(Method::GET, "/api/v1/checkout/cafe", None, None).await;
+	assert_eq!(view["store"]["cashier_pin_set"], true);
+	assert!(!view.to_string().contains("argon2"));
+	// Only a salted slow hash is kept.
+	let conn = svc.app.public.db.conn().await.unwrap();
+	let hash: String = conn.query_one("SELECT cashier_pin_hash FROM store", &[]).await.unwrap().get(0);
+	drop(conn);
+	assert!(hash.starts_with("$argon2id$") && !hash.contains("2468"), "{}", hash);
+
+	// The service checks it and says only whether it matched.
+	let (status, body) = check("2468").await;
+	assert_eq!((status, body.clone()), (StatusCode::OK, json!({ "ok": true })));
+	let (status, body) = check("1357").await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "the old PIN no longer unlocks: {}", body);
+	assert_eq!(body, json!({ "error": "wrong PIN", "retry_after": 0 }));
+
+	// Wrong PINs back off: 5 are free, then each locks further checks.
+	for _ in 0..4 {
+		let (status, body) = check("0000").await;
+		assert_eq!((status, body["retry_after"].clone()), (StatusCode::UNAUTHORIZED, json!(0)));
+	}
+	let (status, body) = check("0000").await;
+	assert_eq!((status, body["retry_after"].clone()), (StatusCode::UNAUTHORIZED, json!(2)), "{}", body);
+	// While locked, even the right PIN is not checked.
+	let (status, body) = check("2468").await;
+	assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{}", body);
+	assert!(body["retry_after"].as_i64().unwrap() > 0);
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let (status, _) = check("2468").await;
+	assert_eq!(status, StatusCode::OK);
+	let (status, body) = check("0000").await;
+	assert_eq!((status, body["retry_after"].clone()), (StatusCode::UNAUTHORIZED, json!(4)), "{}", body);
+}
+
+#[tokio::test]
 async fn registration_rules() {
 	let ctx = TestContext::new("bullnym/registration_rules").await;
 	let (srv, _lightning, forwarder) = common::ark_server(&ctx).await;
@@ -349,9 +442,29 @@ async fn registration_rules() {
 	let a2 = alice.new_address().await.unwrap();
 	let (status, body) = common::register_store(&svc, &alice, &a2, "cafe", common::store_descriptor(1)).await;
 	assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+	// posd's mailbox id is signed and must be one.
+	let mut reg = bullnym::registration::StoreRegistration {
+		name: "Café Uvita".into(), ark_address: a1.to_string(), mailbox_id: "02zz".into(),
+		onchain_descriptor: common::store_descriptor(1), currency: "CRC".into(),
+		timestamp: chrono::Utc::now().timestamp() as u64, nym: "cafe".into(),
+	};
+	let sig = common::sign(&alice, &reg.message(), &a1).await;
+	let (status, body) = svc.call(Method::POST, "/api/v1/stores", None,
+		Some(json!({ "registration": reg.clone(), "signature": sig }))).await;
+	assert_eq!((status, body["error"].clone()), (StatusCode::BAD_REQUEST, json!("not a valid mailbox id")));
+	reg.mailbox_id = alice.mailbox_identifier().to_string();
+	let (status, _) = svc.call(Method::POST, "/api/v1/stores", None,
+		Some(json!({ "registration": reg, "signature": sig }))).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "the mailbox id is part of the signed message");
 	let (status, body) = common::register_store(&svc, &alice, &a1, "cafe", common::store_descriptor(1)).await;
 	assert!(status.is_success(), "{}", body);
 	assert!(body["store"]["lightning_address"].as_str().unwrap().starts_with("cafe@"));
+	// The service keeps the mailbox id and shows it nowhere.
+	let conn = svc.app.public.db.conn().await.unwrap();
+	let kept: String = conn.query_one("SELECT mailbox_id FROM store", &[]).await.unwrap().get(0);
+	drop(conn);
+	assert_eq!(kept, alice.mailbox_identifier().to_string());
+	assert!(!body.to_string().contains(&kept));
 	let (status, _) = common::register_store(&svc, &alice, &a1, "cafe", common::store_descriptor(2)).await;
 	assert_eq!(status, StatusCode::CONFLICT, "one store per nym");
 	// The service does not judge the account the wallet chose: another
@@ -367,6 +480,7 @@ async fn registration_rules() {
 	assert!(svc.sql("UPDATE nym SET silent_payment_address = 'x' WHERE name = 'cafe'").await.is_err());
 	assert!(svc.sql("DELETE FROM nym WHERE name = 'bob'").await.is_err());
 	assert!(svc.sql("UPDATE store SET onchain_descriptor = 'x'").await.is_err());
+	assert!(svc.sql("UPDATE store SET mailbox_id = 'x'").await.is_err());
 	assert!(svc.sql("DELETE FROM store").await.is_err());
 	assert_eq!(svc.sql("UPDATE nym SET display_name = 'Café' WHERE name = 'cafe'").await.unwrap(), 1);
 }
@@ -444,29 +558,6 @@ async fn replaced_payment_returns_the_sale_to_open() {
 	assert_eq!(back["notice"], "payment-replaced", "{}", back);
 	assert_eq!(back["received_sat"], 0);
 	assert_eq!(back["seen_sat"], 0);
-}
-
-#[tokio::test]
-async fn reorg_after_paid_is_a_payment_issue() {
-	let ctx = TestContext::new("bullnym/reorg_after_paid_is_a_payment_issue").await;
-	let store = store_setup(&ctx).await;
-	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
-	let id = sale["id"].as_str().unwrap();
-	ctx.bitcoind().fund_addr(sale["onchain_address"].as_str().unwrap(), sat(60_000)).await;
-	store.svc.wait_sale_state(id, "in-progress", SALE_TIMEOUT).await;
-	ctx.generate_blocks(1).await;
-	store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
-
-	// The service's node drops the block with the payment.
-	let node = &store.svc.bitcoind;
-	let tip = rpc(node, None, "getbestblockhash", json!([])).await;
-	rpc(node, None, "invalidateblock", json!([tip])).await;
-	let issue = store.svc.wait_sale_state(id, "payment-issue", SALE_TIMEOUT).await;
-	assert_eq!(issue["final"], false);
-
-	// The block comes back: paid again.
-	rpc(node, None, "reconsiderblock", json!([tip])).await;
-	store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
 }
 
 #[tokio::test]
@@ -658,9 +749,17 @@ async fn rate_limits_and_bypass() {
 }
 
 #[tokio::test]
-async fn startup_checks_and_the_hint_field() {
-	let ctx = TestContext::new("bullnym/startup_checks_and_the_hint_field").await;
+async fn startup_and_sale_hint_checks() {
+	let ctx = TestContext::new("bullnym/startup_and_sale_hint_checks").await;
 	let (srv, _lightning, forwarder) = common::ark_server(&ctx).await;
+
+	// posd's startup check: a server that is not in expiry payout mode is
+	// refused.
+	let plain = ctx.captaind("plain").cfg(|cfg| cfg.expiry_payouts = false).create().await;
+	let err = Service::try_start_with(&ctx, &plain, &forwarder, |_| {}).await
+		.err().expect("the service must refuse a server without expiry payouts");
+	let err = format!("{:#}", err);
+	assert!(err.contains("does not run in expiry payout mode"), "{}", err);
 
 	// barkd's invoice-for-address with the field S1 adds. A barkd without
 	// S1 ignores the unknown field and returns an invoice without the hint.
@@ -683,21 +782,154 @@ async fn startup_checks_and_the_hint_field() {
 		assert_eq!(invoice_hint(&invoice), None);
 	}
 
-	// Without the override, the service starts only with S1 and S4.
-	let res = Service::try_start_with(&ctx, &srv, &forwarder, |cfg| {
-		cfg.startup.allow_missing_s1_s4 = false;
-	}).await;
+	// In payout mode the service starts: nothing else is checked at
+	// startup, and no override is set.
+	let svc = Service::try_start_overridden(&ctx, &srv, &forwarder, |_| {}, TestOverrides::default()).await
+		.map_err(|e| format!("{:#}", e)).expect("the service starts in payout mode");
+	let (address, (status, body)) = common::register_nym(&svc, &owner, "cafe").await;
+	assert!(status.is_success(), "{}", body);
+	let (status, body) = common::register_store(&svc, &owner, &address, "cafe", common::store_descriptor(3)).await;
+	assert!(status.is_success(), "{}", body);
+	let token = common::login(&svc, &owner, &address).await;
+
+	// Each sale checks its invoice, as posd did: without the store's Ark
+	// hint the sale is refused with a message saying why, and nothing is
+	// left of it.
+	let (status, body) = svc.call(Method::POST, "/api/v1/checkout/cafe/sales", None,
+		Some(json!({ "amount_sat": 60_000 }))).await;
 	if common::s1_s4() {
-		assert!(res.is_ok(), "{:#}", res.err().unwrap());
+		assert_eq!(status, StatusCode::OK, "{}", body);
+		assert_eq!(invoice_hint(body["lightning_invoice"].as_str().unwrap()), Some(address.to_string()));
 	} else {
-		let err = format!("{:#}", res.err().expect("the service must refuse to start"));
-		assert!(err.contains("(S1)") && err.contains("(S4)"), "{}", err);
+		assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", body);
+		let error = body["error"].as_str().unwrap();
+		assert!(error.contains("the Ark server must allow Ark address hints"), "{}", error);
+		let history = svc.ok(Method::GET, "/api/v1/owner/sales", Some(&token), None).await;
+		assert!(history["sales"].as_array().unwrap().is_empty(), "{}", history);
+		let view = svc.ok(Method::GET, "/api/v1/owner/store", Some(&token), None).await;
+		assert_eq!(view["next_onchain_index"], 0, "the refused sale took no address");
 	}
 }
 
+#[tokio::test]
+async fn stores_sharing_a_descriptor_never_share_an_address() {
+	let ctx = TestContext::new("bullnym/stores_sharing_a_descriptor_never_share_an_address").await;
+	let (srv, _lightning, forwarder) = common::ark_server(&ctx).await;
+	let svc = Service::start_with(&ctx, &srv, &forwarder, |cfg| cfg.sales.default_onchain_min_sat = 1000).await;
+	// Two stores register the same descriptor, which the service accepts.
+	let descriptor = common::store_descriptor(7);
+	let mut tokens = HashMap::new();
+	for nym in ["alpha", "beta"] {
+		let wallet = ctx.bark_sdk(nym, &srv).create().await;
+		let (address, (status, body)) = common::register_nym(&svc, &wallet, nym).await;
+		assert!(status.is_success(), "{}", body);
+		let (status, body) = common::register_store(&svc, &wallet, &address, nym, descriptor.clone()).await;
+		assert!(status.is_success(), "{}", body);
+		tokens.insert(nym, common::login(&svc, &wallet, &address).await);
+	}
+
+	// Ordinary checkouts at both stores, all at once.
+	let http = reqwest::Client::new();
+	let mut set = tokio::task::JoinSet::new();
+	for i in 0..12 {
+		let nym = if i % 2 == 0 { "alpha" } else { "beta" };
+		let req = http.post(format!("{}/api/v1/checkout/{}/sales", svc.url, nym)).json(&json!({ "amount_sat": 2000 }));
+		set.spawn(async move {
+			let resp = req.send().await.unwrap();
+			assert!(resp.status().is_success(), "{}", resp.status());
+			(nym, resp.json::<Value>().await.unwrap())
+		});
+	}
+	let mut sales = Vec::new();
+	while let Some(r) = set.join_next().await {
+		sales.push(r.unwrap());
+	}
+
+	// Every sale has its own address: the first 12 of the shared account,
+	// each handed out once.
+	let desc = bullnym::rails::onchain::StoreDescriptor::parse(&descriptor).unwrap();
+	let index_of = (0..12u32).map(|i| (desc.address(i, bitcoin::Network::Regtest).unwrap().to_string(), i))
+		.collect::<HashMap<_, _>>();
+	let mut issued = HashMap::new();
+	for (nym, sale) in &sales {
+		let address = sale["onchain_address"].as_str().expect("every sale offers an address").to_string();
+		let index = *index_of.get(&address).expect("an address of the first 12");
+		assert!(issued.insert(index, *nym).is_none(), "address {} handed out twice", index);
+	}
+	assert_eq!(issued.len(), 12);
+	// Each store's index moved past every address it handed out, and past
+	// the ones it skipped because the other store had them.
+	for nym in ["alpha", "beta"] {
+		let view = svc.ok(Method::GET, "/api/v1/owner/store", Some(&tokens[nym]), None).await;
+		let next = view["next_onchain_index"].as_u64().unwrap() as u32;
+		let mine = issued.iter().filter(|(_, n)| **n == nym).map(|(i, _)| *i).collect::<Vec<_>>();
+		assert_eq!(mine.len(), 6, "{} sales at {}", mine.len(), nym);
+		assert!(mine.iter().all(|i| *i < next) && next <= 12, "{} next index {} for {:?}", nym, next, mine);
+	}
+
+	// A payment to one address counts for its sale only.
+	let (nym, target) = &sales[0];
+	let target_id = target["id"].as_str().unwrap();
+	ctx.bitcoind().fund_addr(target["onchain_address"].as_str().unwrap(), sat(2000)).await;
+	let seen = svc.wait_sale_state(target_id, "in-progress", SALE_TIMEOUT).await;
+	assert_eq!(seen["seen_sat"], 2000);
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	for (_, sale) in &sales[1..] {
+		let other = svc.ok(Method::GET, &format!("/api/v1/sales/{}", sale["id"].as_str().unwrap()), None, None).await;
+		assert_eq!((other["seen_sat"].clone(), other["state"].clone()), (json!(0), json!("open")), "{}", other);
+	}
+	let history = svc.ok(Method::GET, "/api/v1/owner/sales", Some(&tokens[nym]), None).await;
+	let with_payment = history["sales"].as_array().unwrap().iter().filter(|s| s["seen_sat"] != 0).count();
+	assert_eq!(with_payment, 1);
+}
+
+/// The full payment request of a sale, as its QR code shows it, and its
+/// invoice alone, as a payer copies it, paid by the Scuttle wallet library.
+/// The test prints what the payer did with each (`QR_OUTCOME`,
+/// `COPIED_INVOICE_OUTCOME`).
+#[tokio::test]
+async fn full_qr_and_copied_invoice() {
+	let ctx = TestContext::new("bullnym/full_qr_and_copied_invoice").await;
+	let store = store_setup(&ctx).await;
+	let payer = ctx.bark_sdk("payer", &store.srv).boarded(sat(300_000))
+		.cfg(|cfg| cfg.lightning_ark_address_hints = true)
+		.create().await;
+
+	// A sale above the on-chain minimum: the QR code carries the address,
+	// the amount and the invoice.
+	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
+	let id = sale["id"].as_str().unwrap();
+	let qr = sale["payment_request"].as_str().unwrap();
+	assert!(qr.starts_with("bitcoin:bcrt1") && qr.contains("&lightning="), "{}", qr);
+	match payer.parse_payment_request(qr).await {
+		Ok(req) => {
+			let option = req.default_option().expect("an option").clone();
+			let kind = option.method.type_str().to_string();
+			payer.send_payment(&option.method, None, None::<String>, true).await.unwrap();
+			let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+			eprintln!("QR_OUTCOME parsed; the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
+		},
+		Err(e) => {
+			let e = format!("{:#}", e);
+			eprintln!("QR_OUTCOME the payer refused the QR code: {}", e);
+			assert!(e.contains("No valid payment option found"), "{}", e);
+			store.svc.ok(Method::POST, &format!("/api/v1/sales/{}/cancel", id), None, None).await;
+		},
+	}
+
+	// The invoice alone, copied from a sale of the same amount.
+	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
+	let id = sale["id"].as_str().unwrap();
+	let kind = pay(&payer, sale["lightning_invoice"].as_str().unwrap()).await;
+	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+	eprintln!("COPIED_INVOICE_OUTCOME the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
+	let rail = if common::s1_s4() { "ark" } else { "lightning" };
+	assert_eq!(paid["paid_rail"], rail);
+}
+
 /// A manual demo, not run by default. It starts a full stack, prints the
-/// store's checkout link and pays every sale created on it from a Scuttle
-/// wallet. Run it with
+/// store's checkout link and the owner's token, and pays every sale created
+/// on it from a Scuttle wallet. Run it with
 /// `cargo nextest run --test integration --run-ignored only demo`
 /// and open the link in a browser. DEMO_SECS sets how long it runs.
 #[tokio::test]
@@ -710,6 +942,8 @@ async fn demo() {
 		.create().await;
 	println!("DEMO_CHECKOUT_URL {}/{}", store.svc.url, store.nym);
 	eprintln!("DEMO_CHECKOUT_URL {}/{}", store.svc.url, store.nym);
+	// The owner's token on this throwaway stack, to drive the owner API.
+	eprintln!("DEMO_OWNER_TOKEN {}", store.owner.token);
 
 	let secs = std::env::var("DEMO_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(900);
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);

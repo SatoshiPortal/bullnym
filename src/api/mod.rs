@@ -22,7 +22,7 @@ use axum::Router;
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use serde::Serialize;
 
 use crate::App;
@@ -42,11 +42,13 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/owner/nym", get(nym::get_own).patch(nym::update_own))
 		.route("/owner/nym/payments", get(nym::list_payments))
 		.route("/owner/store", get(owner::get_store).patch(owner::update_store))
+		.route("/owner/store/cashier-pin", put(owner::set_cashier_pin))
 		.route("/owner/sales", get(owner::list_sales))
 		.route("/owner/sales.csv", get(owner::sales_csv))
 		.route("/checkout/{nym}", get(checkout::store))
 		.route("/checkout/{nym}/rate", get(checkout::rate))
 		.route("/checkout/{nym}/sales", post(checkout::create_sale))
+		.route("/checkout/{nym}/pin", post(checkout::check_pin))
 		.route("/sales/{id}", get(checkout::get_sale))
 		.route("/sales/{id}/cancel", post(checkout::cancel_sale))
 		.route("/lnurlp/{nym}/callback", get(lnurl::callback))
@@ -154,6 +156,9 @@ pub struct StoreView {
 	pub lightning_address: String,
 	pub currency: String,
 	pub onchain_min_sat: i64,
+	/// Whether the owner set a cashier PIN. Without one, the cashier screen
+	/// hides its list of sales.
+	pub cashier_pin_set: bool,
 }
 
 impl StoreView {
@@ -164,6 +169,7 @@ impl StoreView {
 			lightning_address: lightning_address(app, &store.nym),
 			currency: store.currency.clone(),
 			onchain_min_sat: store.onchain_min_sat,
+			cashier_pin_set: store.cashier_pin_set,
 		}
 	}
 }

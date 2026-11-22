@@ -136,6 +136,10 @@ pub struct Limits {
 	/// Owner login requests per source per minute.
 	#[serde(default = "d20")]
 	pub owner_per_minute: u32,
+	/// Cashier PIN checks per source per minute. Wrong PINs also back off
+	/// per source and per store (see the pin module).
+	#[serde(default = "d10")]
+	pub pin_checks_per_minute: u32,
 	/// Open Lightning Address invoices per nym.
 	#[serde(default = "d20")]
 	pub max_open_invoices_per_nym: u32,
@@ -204,6 +208,7 @@ pub enum Surface {
 	SaleCreate,
 	StatusRead,
 	Owner,
+	PinCheck,
 }
 
 impl Surface {
@@ -215,6 +220,7 @@ impl Surface {
 			Surface::SaleCreate => "sale",
 			Surface::StatusRead => "status",
 			Surface::Owner => "owner",
+			Surface::PinCheck => "pin",
 		}
 	}
 }
@@ -417,6 +423,7 @@ impl Protect {
 			Surface::SaleCreate => l.sales_per_minute,
 			Surface::StatusRead => l.status_reads_per_minute,
 			Surface::Owner => l.owner_per_minute,
+			Surface::PinCheck => l.pin_checks_per_minute,
 		}
 	}
 

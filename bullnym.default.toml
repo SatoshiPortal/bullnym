@@ -8,9 +8,10 @@
 network = "bitcoin"
 
 # The Ark server's public gRPC address. The service uses only its public API,
-# like any wallet. At startup it checks that the server is in expiry payout
-# mode, puts Ark addresses in invoices (ln_receive_ark_address_hints), and
-# with barkd supports S1 and S4; it refuses to start otherwise.
+# like any wallet. It refuses to start unless the server is in expiry payout
+# mode. A store sale is refused, with a message saying so, if barkd returns
+# its invoice without the store's Ark address in the route hints: the server
+# must allow Ark address hints (ln_receive_ark_address_hints).
 ark_server_url = "https://ark.example.com"
 
 [http]
@@ -61,7 +62,8 @@ cache_secs = 60
 [nyms]
 # Names nobody can register, on top of the built-in route and brand names.
 reserved = []
-# The smallest and largest Lightning Address payments, in sats.
+# The smallest and largest Lightning Address payments, in sats. The largest
+# is at most 2100000000000000 (21,000,000 BTC).
 min_sendable_sat = 1
 max_sendable_sat = 10000000
 # How long a Lightning Address invoice stays payable. barkd cancels it at
@@ -73,20 +75,19 @@ invoice_expiry_secs = 600
 # How long an open sale and its invoice stay payable. A sale with a payment
 # in progress stays open past it.
 expiry_secs = 600
-# The on-chain minimum of a new store, in sats. The owner can change it per
-# store. Below it, a sale offers no bitcoin address.
+# The on-chain minimum of a new store, in sats, at most 2100000000000000. The
+# owner can change it per store. Below it, a sale offers no bitcoin address.
 default_onchain_min_sat = 50000
 # How often the watcher checks open sales, in milliseconds. On-chain
 # addresses are checked every fifth time.
 poll_interval_ms = 2000
 # Each sale that offers Bitcoin takes the store's next address, and no address
-# is handed out twice. The owner's wallet scans the store account up to the
-# store's next index, which the owner's store view shows.
+# is handed out twice, even to two stores with the same descriptor. The
+# owner's wallet scans the store account up to the store's next index, which
+# the owner's store view shows. A sale is paid at 1 confirmation, for good.
 # How long an on-chain address is watched after its sale was created, for
 # late and extra payments.
 onchain_watch_secs = 604800
-# The confirmations that make an on-chain payment final. It is paid at 1.
-final_confirmations = 3
 # A payment whose fee rate is below this share of bitcoind's estimate gets
 # the low-fee warning.
 low_fee_ratio = 0.5
@@ -95,13 +96,6 @@ low_fee_ratio = 0.5
 low_fee_floor_sat_vb = 1.0
 # The confirmation target of the fee estimate, in blocks.
 fee_estimate_blocks = 3
-
-[startup]
-# Start even when barkd and the Ark server lack S1 (a forwarded invoice that
-# names its destination in the Ark hint) or S4 (the delivery status of Ark
-# payments). Store invoices then have no Ark hint. For local tests against
-# older Scuttle releases only; never in production.
-allow_missing_s1_s4 = false
 
 # Protections against floods. Per-source limits count IPv4 callers by
 # address and IPv6 callers by /56.
@@ -128,6 +122,10 @@ sales_per_minute = 60
 status_reads_per_minute = 600
 # Owner login requests per source per minute.
 owner_per_minute = 20
+# Cashier PIN checks per source per minute. Wrong PINs also back off per
+# source and per store: 5 are free, then each locks further checks for twice
+# as long as the one before, up to 15 minutes.
+pin_checks_per_minute = 10
 # Open Lightning Address invoices per nym, and open invoices of all nyms and
 # sales together. Each is a hold invoice on the Ark server.
 max_open_invoices_per_nym = 20

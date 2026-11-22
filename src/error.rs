@@ -27,6 +27,10 @@ pub enum ApiError {
 	/// with one fixed message.
 	#[error("{}", UNAVAILABLE_MESSAGE)]
 	Upstream(anyhow::Error),
+	/// The service or a backend is set up so that the request cannot
+	/// work. The message says what to change.
+	#[error("{0}")]
+	Misconfigured(String),
 	#[error("internal error")]
 	Internal(#[from] anyhow::Error),
 }
@@ -69,6 +73,7 @@ impl IntoResponse for ApiError {
 				tracing::warn!("backend unavailable: {:#}", e);
 				StatusCode::SERVICE_UNAVAILABLE
 			},
+			ApiError::Misconfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
 			ApiError::Internal(e) => {
 				tracing::error!("internal error: {:#}", e);
 				StatusCode::INTERNAL_SERVER_ERROR

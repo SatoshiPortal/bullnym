@@ -88,9 +88,6 @@ pub struct Sales {
 	/// sale.
 	#[serde(default = "default_onchain_watch_secs")]
 	pub onchain_watch_secs: u64,
-	/// The confirmations that make an on-chain payment final.
-	#[serde(default = "default_final_confirmations")]
-	pub final_confirmations: u32,
 	/// A payment whose fee rate is below this share of bitcoind's estimate
 	/// gets the low-fee warning.
 	#[serde(default = "default_low_fee_ratio")]
@@ -108,7 +105,6 @@ fn default_sale_expiry_secs() -> u64 { 600 }
 fn default_onchain_min_sat() -> u64 { 50_000 }
 fn default_poll_interval_ms() -> u64 { 2_000 }
 fn default_onchain_watch_secs() -> u64 { 7 * 24 * 3600 }
-fn default_final_confirmations() -> u32 { 3 }
 fn default_low_fee_ratio() -> f64 { 0.5 }
 fn default_low_fee_floor_sat_vb() -> f64 { 1.0 }
 fn default_fee_estimate_blocks() -> u16 { 3 }
@@ -120,7 +116,6 @@ impl Default for Sales {
 			default_onchain_min_sat: default_onchain_min_sat(),
 			poll_interval_ms: default_poll_interval_ms(),
 			onchain_watch_secs: default_onchain_watch_secs(),
-			final_confirmations: default_final_confirmations(),
 			low_fee_ratio: default_low_fee_ratio(),
 			low_fee_floor_sat_vb: default_low_fee_floor_sat_vb(),
 			fee_estimate_blocks: default_fee_estimate_blocks(),
@@ -187,8 +182,6 @@ pub struct Config {
 	#[serde(default)]
 	pub sales: Sales,
 	#[serde(default)]
-	pub startup: Startup,
-	#[serde(default)]
 	pub limits: crate::protect::Limits,
 	#[serde(default)]
 	pub certification: crate::protect::Certification,
@@ -221,18 +214,6 @@ impl Default for Watcher {
 	}
 }
 
-/// What the service checks before it starts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Startup {
-	/// Starts even when barkd and the Ark server cannot put a forwarded
-	/// receive's destination in its invoice (S1), or the Ark server does not
-	/// report the delivery of Ark payments (S4). Store invoices then have
-	/// no Ark hint, and are paid over Lightning only. For local tests
-	/// against older Scuttle releases only; never set it in production.
-	#[serde(default)]
-	pub allow_missing_s1_s4: bool,
-}
-
 impl Config {
 	/// Loads a config file, then applies `BULLNYM__` environment variables, for
 	/// example `BULLNYM__POSTGRES__HOST`.
@@ -250,12 +231,15 @@ impl Config {
 
 	/// Checks the rules between settings.
 	pub fn validate(&self) -> anyhow::Result<()> {
-		let s = &self.sales;
-		if s.final_confirmations == 0 {
-			anyhow::bail!("sales.final_confirmations must be at least 1");
-		}
+		use crate::money::MAX_SAT;
 		if self.nyms.min_sendable_sat == 0 || self.nyms.min_sendable_sat > self.nyms.max_sendable_sat {
 			anyhow::bail!("nyms.min_sendable_sat must be at least 1 and at most nyms.max_sendable_sat");
+		}
+		if self.nyms.max_sendable_sat > MAX_SAT {
+			anyhow::bail!("nyms.max_sendable_sat must be at most {} (21,000,000 BTC)", MAX_SAT);
+		}
+		if self.sales.default_onchain_min_sat > MAX_SAT {
+			anyhow::bail!("sales.default_onchain_min_sat must be at most {} (21,000,000 BTC)", MAX_SAT);
 		}
 		Ok(())
 	}
@@ -267,9 +251,9 @@ mod test {
 
 	#[test]
 	fn settings_rules() {
-		let mut sales = Sales::default();
+		let sales = Sales::default();
 		assert!(sales.onchain_watch_secs >= 7 * 24 * 3600, "late payments are watched for 7 days");
-		let cfg = |sales: Sales| Config {
+		let cfg = |sales: Sales, nyms: Nyms| Config {
 			network: Network::Regtest,
 			http: Http { listen: "127.0.0.1:1".parse().unwrap(), public_url: "http://x".into() },
 			postgres: Postgres {
@@ -281,16 +265,23 @@ mod test {
 				url: "http://c".into(), cookie: None, rpc_user: None, rpc_password: None, wallet: "w".into(),
 			},
 			price: Price { url: String::new(), fixed_btc_price: None, cache_secs: 1 },
-			nyms: Nyms::default(),
+			nyms,
 			sales,
-			startup: Startup::default(),
 			limits: Default::default(),
 			certification: Default::default(),
 			watcher: Watcher::default(),
 		};
-		assert!(cfg(sales.clone()).validate().is_ok());
-		sales.final_confirmations = 0;
-		assert!(cfg(sales).validate().is_err());
+		assert!(cfg(sales.clone(), Nyms::default()).validate().is_ok());
+		let max = crate::money::MAX_SAT;
+		let nyms = |min_sendable_sat, max_sendable_sat| Nyms { min_sendable_sat, max_sendable_sat, ..Nyms::default() };
+		assert!(cfg(sales.clone(), nyms(1, max)).validate().is_ok());
+		assert!(cfg(sales.clone(), nyms(1, max + 1)).validate().is_err(), "msat would pass i64");
+		assert!(cfg(sales.clone(), nyms(0, 10)).validate().is_err());
+		assert!(cfg(sales.clone(), nyms(11, 10)).validate().is_err());
+		let s = Sales { default_onchain_min_sat: max + 1, ..sales.clone() };
+		assert!(cfg(s, Nyms::default()).validate().is_err());
+		let s = Sales { default_onchain_min_sat: max, ..sales };
+		assert!(cfg(s, Nyms::default()).validate().is_ok());
 	}
 
 	/// The documented default config parses, and documents the defaults.
@@ -305,7 +296,6 @@ mod test {
 		cfg.validate().unwrap();
 		assert_eq!(json(&cfg.nyms), json(&Nyms::default()));
 		assert_eq!(json(&cfg.sales), json(&Sales::default()));
-		assert_eq!(json(&cfg.startup), json(&Startup::default()));
 		assert_eq!(json(&cfg.limits), json(&crate::protect::Limits::default()));
 		assert_eq!(json(&cfg.certification), json(&crate::protect::Certification::default()));
 		assert_eq!(json(&cfg.watcher), json(&Watcher::default()));

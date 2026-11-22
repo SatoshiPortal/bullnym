@@ -3,8 +3,10 @@
 //!
 //! The daemons are the binaries in `CAPTAIND_EXEC`, `BARKD_EXEC`,
 //! `BITCOIND_EXEC` and `LIGHTNINGD_EXEC`. Tests that need a Scuttle release
-//! with S1 and S4 run only with `BULLNYM_TEST_S1_S4=1`; without it, the
-//! service starts with `startup.allow_missing_s1_s4` and those tests skip.
+//! with S1 and S4 run only with `BULLNYM_TEST_S1_S4=1`. Without it, barkd
+//! ignores the hint request, and the service runs with the test override
+//! that accepts store invoices without the Ark hint (see
+//! `bullnym::TestOverrides`), which no config can set.
 
 #![allow(dead_code)]
 
@@ -22,6 +24,7 @@ use serde_json::{Value, json};
 use ark_testing::context::LightningPaymentSetup;
 use ark_testing::util::poll_interval;
 use ark_testing::{Barkd, Bitcoind, Captaind, TestContext, btc};
+use bullnym::TestOverrides;
 use bullnym::config::{self, Config};
 use bullnym::rails::onchain::BitcoindConfig;
 use bullnym::registration::{NymRegistration, StoreRegistration};
@@ -98,6 +101,12 @@ impl Drop for Service {
 	}
 }
 
+/// The test overrides of the daemons in use: a Scuttle release without S1
+/// returns store invoices without the Ark hint.
+pub fn default_overrides() -> TestOverrides {
+	TestOverrides { accept_unhinted_invoices: !s1_s4() }
+}
+
 /// The config of a test service. Rate limits are loose: the tests of the
 /// limits set their own.
 pub async fn test_config(
@@ -130,7 +139,6 @@ pub async fn test_config(
 		price: config::Price { url: String::new(), fixed_btc_price: Some(TEST_BTC_PRICE.into()), cache_secs: 60 },
 		nyms: Default::default(),
 		sales: config::Sales { poll_interval_ms: 200, ..Default::default() },
-		startup: config::Startup { allow_missing_s1_s4: !s1_s4() },
 		limits: Default::default(),
 		certification: Default::default(),
 		watcher: config::Watcher { max_connections: 4, health_interval_secs: 1 },
@@ -145,6 +153,7 @@ pub async fn test_config(
 	l.sales_per_minute = 1000;
 	l.status_reads_per_minute = 100_000;
 	l.owner_per_minute = 1000;
+	l.pin_checks_per_minute = 1000;
 	cfg
 }
 
@@ -169,16 +178,32 @@ impl Service {
 		forwarder: &Barkd,
 		tweak: impl FnOnce(&mut Config),
 	) -> anyhow::Result<Service> {
+		Self::try_start_overridden(ctx, srv, forwarder, tweak, default_overrides()).await
+	}
+
+	pub async fn try_start_overridden(
+		ctx: &TestContext,
+		srv: &Captaind,
+		forwarder: &Barkd,
+		tweak: impl FnOnce(&mut Config),
+		overrides: TestOverrides,
+	) -> anyhow::Result<Service> {
+		// A test may start more than one service: each has its own node and
+		// database.
+		static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+		let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		let suffix = if n == 0 { String::new() } else { n.to_string() };
 		let port = ark_testing::ports::pick_port();
-		let mut btc_cfg = ctx.bitcoind_default_cfg("service_bitcoind");
+		let node = format!("service_bitcoind{}", suffix);
+		let mut btc_cfg = ctx.bitcoind_default_cfg(&node);
 		btc_cfg.wallet = true;
-		let bitcoind = ctx.new_bitcoind_with_cfg("service_bitcoind", btc_cfg).await;
-		let db_name = format!("{}_svc", ctx.test_name.replace('/', "_"));
+		let bitcoind = ctx.new_bitcoind_with_cfg(&node, btc_cfg).await;
+		let db_name = format!("{}_svc{}", ctx.test_name.replace('/', "_"), suffix);
 		let mut cfg = test_config(ctx, srv, forwarder, &bitcoind, port, &db_name).await;
 		tweak(&mut cfg);
 		let listen = cfg.http.listen;
 		let url = cfg.http.public_url.clone();
-		let app = bullnym::App::new(cfg).await?;
+		let app = bullnym::App::new_with_overrides(cfg, overrides).await?;
 		let mut tasks = bullnym::spawn_background(app.clone());
 		let listener = tokio::net::TcpListener::bind(listen).await?;
 		let served = app.clone();
@@ -322,6 +347,7 @@ pub async fn register_store(
 	let reg = StoreRegistration {
 		name: "Café Uvita".into(),
 		ark_address: address.to_string(),
+		mailbox_id: wallet.mailbox_identifier().to_string(),
 		onchain_descriptor: descriptor,
 		currency: "CRC".into(),
 		timestamp: chrono::Utc::now().timestamp() as u64,

@@ -3,15 +3,17 @@
 use std::str::FromStr;
 
 use anyhow::Context;
+use ark::lightning::Bolt11InvoiceExt;
 use bitcoin::{Amount, Denomination};
 use chrono::{DateTime, Utc};
+use lightning_invoice::Bolt11Invoice;
 use serde::Serialize;
 use tokio_postgres::GenericClient;
 
 use crate::App;
 use crate::database::{Rail, SALE_SELECT, Sale, SaleState, Store};
 use crate::error::{ApiError, ApiResult, bad_request, not_found};
-use crate::money::{Decimal, currency_decimals};
+use crate::money::{Decimal, MAX_FIAT_INTEGER, MAX_SAT, currency_decimals};
 use crate::rails::onchain::StoreDescriptor;
 use crate::token;
 
@@ -61,9 +63,6 @@ pub struct SaleView {
 	pub warnings: Vec<String>,
 	/// `payment-replaced` or `payment-dropped`, after a payment went away.
 	pub notice: Option<String>,
-	/// Paid by an invoice, or by on-chain payments with 3 confirmations.
-	pub r#final: bool,
-	pub final_at: Option<DateTime<Utc>>,
 	/// The sale ended unpaid and a payment came after: the owner sees it,
 	/// and it never pays another sale.
 	pub late_payment: bool,
@@ -97,8 +96,6 @@ impl From<Sale> for SaleView {
 			progress: s.progress.filter(|_| s.state == SaleState::InProgress),
 			warnings: s.warnings,
 			notice: s.notice,
-			r#final: s.final_at.is_some(),
-			final_at: s.final_at,
 			late_payment: s.state.ended_unpaid() && (s.received_sat > 0 || s.seen_sat > 0),
 			cashier_name: s.cashier_name,
 		}
@@ -156,16 +153,50 @@ async fn resolve_amount(
 				)));
 			}
 			let fiat = fiat.round(decimals);
+			if fiat.integer_part() >= MAX_FIAT_INTEGER {
+				return Err(bad_request("the amount is too large"));
+			}
 			let quote = app.price.quote(&store.currency).await.map_err(ApiError::Upstream)?;
 			let sat = fiat.fiat_to_sat(&quote.btc_price)
 				.ok_or_else(|| bad_request("the amount is too large"))?;
 			(sat, Some((fiat, quote.btc_price)))
 		},
 	};
-	if amount_sat == Amount::ZERO {
+	check_sale_amount(amount_sat)?;
+	Ok((amount_sat, fiat))
+}
+
+/// A sale is for at least 1 sat and at most [MAX_SAT], checked before
+/// anything is allocated for it.
+pub fn check_sale_amount(amount: Amount) -> ApiResult<()> {
+	if amount == Amount::ZERO {
 		return Err(bad_request("the amount must be at least 1 sat"));
 	}
-	Ok((amount_sat, fiat))
+	if amount.to_sat() > MAX_SAT {
+		return Err(bad_request("the amount is too large"));
+	}
+	Ok(())
+}
+
+/// Why a store invoice from barkd cannot be shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HintError {
+	#[error("the Ark server must allow Ark address hints: barkd returned the sale's invoice \
+		without the store's Ark address in its route hints")]
+	Missing,
+	#[error("barkd returned the sale's invoice with an Ark address that is not the store's")]
+	Other,
+}
+
+/// Checks that a store invoice names the store's Ark address as its Ark
+/// hint, as posd checked its hinted invoice. A Scuttle payer pays that
+/// address instead of the invoice, so any other address is refused.
+pub fn check_invoice_hint(invoice: &Bolt11Invoice, store_address: &ark::Address) -> Result<(), HintError> {
+	match invoice.ark_address() {
+		Some(a) if a.to_string() == store_address.to_string() => Ok(()),
+		Some(_) => Err(HintError::Other),
+		None => Err(HintError::Missing),
+	}
 }
 
 /// The advisory lock under which the caps on open sales and open invoices
@@ -246,33 +277,55 @@ async fn reserve_sale(
 	Ok(Reservation { sale_id, invoice_slot })
 }
 
+/// The most addresses one sale skips because another store issued them.
+const MAX_ADDRESS_SKIPS: u32 = 1_000;
+
 /// Hands out the store's next on-chain address, as posd does: each sale
-/// that offers Bitcoin takes the next derivation index, so two sales never
-/// share an address and no address is handed out twice. The index is taken
-/// only if the address is watched; otherwise the sale offers no on-chain
-/// payment and the index stays free.
+/// that offers Bitcoin takes the next derivation index, so no address is
+/// handed out twice. The index is taken only if the address is watched;
+/// otherwise the sale offers no on-chain payment and the index stays free.
+///
+/// Two stores may register the same descriptor. An address another sale
+/// already has, from any store, is skipped and its index used up, so every
+/// address belongs to one sale and a payment to it counts for that sale
+/// only. The address stays locked until `tx` commits the sale's row with
+/// it, so simultaneous checkouts of two such stores cannot both take it.
 async fn next_address(
 	app: &App,
 	tx: &mut tokio_postgres::Transaction<'_>,
 	store: &Store,
 ) -> anyhow::Result<(i64, bitcoin::Address)> {
-	let sp = tx.savepoint("onchain_index").await?;
-	let row = sp.query_one("
-		UPDATE store SET next_onchain_index = next_onchain_index + 1, updated_at = NOW()
-		WHERE id = $1 RETURNING next_onchain_index - 1 AS idx
-	", &[&store.id]).await?;
-	let index = row.get::<_, i64>("idx");
 	let desc = StoreDescriptor::parse(&store.onchain_descriptor).context("store has an invalid descriptor")?;
-	let address = desc.address(u32::try_from(index).context("on-chain index overflow")?, app.cfg.network)?;
-	app.public.chain.watch(&address).await?;
-	sp.commit().await?;
-	Ok((index, address))
+	let sp = tx.savepoint("onchain_index").await?;
+	for _ in 0..=MAX_ADDRESS_SKIPS {
+		let index: i64 = sp.query_one("
+			UPDATE store SET next_onchain_index = next_onchain_index + 1, updated_at = NOW()
+			WHERE id = $1 RETURNING next_onchain_index - 1 AS idx
+		", &[&store.id]).await?.get("idx");
+		let address = desc.address(u32::try_from(index).context("on-chain index overflow")?, app.cfg.network)?;
+		let text = address.to_string();
+		sp.execute(
+			"SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)", &[&format!("bullnym:address:{}", text)],
+		).await?;
+		let taken: bool = sp.query_one(
+			"SELECT EXISTS (SELECT 1 FROM sale_payment WHERE onchain_address = $1)", &[&text],
+		).await?.get(0);
+		if taken {
+			tracing::info!("store {} skips index {}: another sale has its address", store.id, index);
+			continue;
+		}
+		app.public.chain.watch(&address).await?;
+		sp.commit().await?;
+		return Ok((index, address));
+	}
+	anyhow::bail!("{} addresses in a row of store {} belong to other sales", MAX_ADDRESS_SKIPS + 1, store.id)
 }
 
 /// Creates a sale with all the rails it offers: one invoice for Lightning
 /// and Ark payers, and an address above the store's on-chain minimum. A
 /// rail whose backend fails is left out; with no rail left, the sale is
-/// refused with the fixed "unavailable" message.
+/// refused with the fixed "unavailable" message. An invoice without the
+/// store's Ark hint refuses the sale, as in posd, with its own message.
 pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sale> {
 	let memo = new.memo.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
 	if memo.as_ref().is_some_and(|m| m.chars().count() > MAX_MEMO_CHARS) {
@@ -296,10 +349,25 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 			amount_sat, &ark_address, description, expiry, true,
 		).await {
 			Ok(invoice) => {
+				let hash = invoice.payment_hash().to_string();
+				match check_invoice_hint(&invoice, &ark_address) {
+					Ok(()) => {},
+					Err(HintError::Missing) if app.overrides.accept_unhinted_invoices => {
+						tracing::warn!("test override: sale invoice {} has no Ark hint", hash);
+					},
+					Err(e) => {
+						tracing::error!("sale refused: {} (invoice {})", e, hash);
+						if let Err(e) = app.public.forwarder.cancel(&hash).await {
+							tracing::warn!("failed to cancel invoice {}: {:#}", hash, e);
+						}
+						release_sale(app, res.sale_id).await?;
+						return Err(ApiError::Misconfigured(e.to_string()));
+					},
+				}
 				let conn = app.public.db.conn().await?;
 				conn.execute("
 					UPDATE sale_payment SET payment_hash = $2, invoice = $3 WHERE id = $1
-				", &[&slot, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
+				", &[&slot, &hash, &invoice.to_string()]).await?;
 				true
 			},
 			Err(e) => {
@@ -333,14 +401,20 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 		false
 	};
 
-	let conn = app.public.db.conn().await?;
 	if !invoice && !onchain {
-		// Nobody saw this sale: release it.
-		conn.execute("DELETE FROM sale_payment WHERE sale_id = $1", &[&res.sale_id]).await?;
-		conn.execute("DELETE FROM sale WHERE id = $1", &[&res.sale_id]).await?;
+		release_sale(app, res.sale_id).await?;
 		return Err(ApiError::Upstream(anyhow::anyhow!("no payment rail is available for the sale")));
 	}
+	let conn = app.public.db.conn().await?;
 	Ok(get_sale_by_id(&*conn, res.sale_id).await?)
+}
+
+/// Deletes a reserved sale that nobody saw, with its rails.
+async fn release_sale(app: &App, sale_id: i64) -> ApiResult<()> {
+	let conn = app.public.db.conn().await?;
+	conn.execute("DELETE FROM sale_payment WHERE sale_id = $1", &[&sale_id]).await?;
+	conn.execute("DELETE FROM sale WHERE id = $1", &[&sale_id]).await?;
+	Ok(())
 }
 
 pub async fn get_sale_by_id(conn: &impl GenericClient, id: i64) -> anyhow::Result<Sale> {
@@ -385,7 +459,7 @@ pub async fn sales_csv(
 	", SALE_SELECT), &[&store_id, &from, &to]).await?;
 	let mut out = String::from(
 		"id,created_at,paid_at,state,paid_rail,amount_sat,received_sat,fiat_amount,currency,\
-		btc_price,memo,cashier_name,seen_sat,progress,warnings,notice,final_at,late_payment\n",
+		btc_price,memo,cashier_name,seen_sat,progress,warnings,notice,late_payment\n",
 	);
 	for row in rows {
 		let s = Sale::from_row(&row);
@@ -408,7 +482,6 @@ pub async fn sales_csv(
 			progress.unwrap_or_default(),
 			s.warnings.join(" "),
 			s.notice.unwrap_or_default(),
-			s.final_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
 			late.to_string(),
 		];
 		out.push_str(&fields.iter().map(|f| csv_field(f)).collect::<Vec<_>>().join(","));
@@ -451,6 +524,66 @@ mod test {
 		);
 		assert_eq!(btc_amount(Amount::from_sat(100_000_000)), "1");
 		assert_eq!(btc_amount(Amount::from_sat(1)), "0.00000001");
+	}
+
+	fn key(byte: u8) -> bitcoin::secp256k1::Keypair {
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		bitcoin::secp256k1::Keypair::from_seckey_slice(&secp, &[byte; 32]).unwrap()
+	}
+
+	fn address(owner: u8) -> ark::Address {
+		let k = key(owner);
+		ark::Address::builder()
+			.testnet(true)
+			.server_pubkey(key(3).public_key())
+			.pubkey_policy(k.public_key())
+			.mailbox(key(4).public_key(), ark::mailbox::MailboxIdentifier::from_pubkey(k.public_key()), &k)
+			.unwrap()
+			.into_address().unwrap()
+	}
+
+	fn invoice(hint: Option<&ark::Address>) -> Bolt11Invoice {
+		use bitcoin::hashes::{Hash, sha256};
+		use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret, RouteHint, RouteHintHop, RoutingFees};
+		let secp = bitcoin::secp256k1::Secp256k1::new();
+		let mut builder = InvoiceBuilder::new(Currency::Regtest)
+			.description("test".into())
+			.payment_hash(sha256::Hash::hash(&[0; 32]))
+			.payment_secret(PaymentSecret([0; 32]))
+			.duration_since_epoch(std::time::Duration::from_secs(1_700_000_000))
+			.min_final_cltv_expiry_delta(144)
+			.amount_milli_satoshis(1_000_000);
+		for (src_node_id, short_channel_id) in hint.map(|a| ark::lightning::ark_address_route_hints(a).unwrap())
+			.into_iter().flatten()
+		{
+			builder = builder.private_route(RouteHint(vec![RouteHintHop {
+				src_node_id, short_channel_id,
+				fees: RoutingFees { base_msat: 0, proportional_millionths: 0 },
+				cltv_expiry_delta: 0, htlc_minimum_msat: None, htlc_maximum_msat: None,
+			}]));
+		}
+		builder.build_signed(|hash| secp.sign_ecdsa_recoverable(hash, &key(1).secret_key())).unwrap()
+	}
+
+	#[test]
+	fn store_invoices_name_the_store_address() {
+		let store = address(5);
+		assert_eq!(check_invoice_hint(&invoice(Some(&store)), &store), Ok(()));
+		// No hint: the Ark server does not allow hints, or barkd does not
+		// pass the request on (a Scuttle release without S1).
+		assert_eq!(check_invoice_hint(&invoice(None), &store), Err(HintError::Missing));
+		assert!(HintError::Missing.to_string().contains("must allow Ark address hints"));
+		// Another address, such as barkd's own: an Ark payer would pay it.
+		assert_eq!(check_invoice_hint(&invoice(Some(&address(6))), &store), Err(HintError::Other));
+	}
+
+	#[test]
+	fn sale_amount_bounds() {
+		assert!(check_sale_amount(Amount::from_sat(1)).is_ok());
+		assert!(check_sale_amount(Amount::from_sat(MAX_SAT)).is_ok());
+		assert!(check_sale_amount(Amount::ZERO).is_err());
+		assert!(check_sale_amount(Amount::from_sat(MAX_SAT + 1)).is_err());
+		assert!(check_sale_amount(Amount::from_sat(u64::MAX)).is_err(), "would wrap in a signed column");
 	}
 
 	#[test]

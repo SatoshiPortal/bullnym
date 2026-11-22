@@ -15,6 +15,7 @@ pub mod database;
 pub mod error;
 pub mod money;
 pub mod nym;
+pub mod pin;
 pub mod price;
 pub mod protect;
 pub mod rails;
@@ -61,12 +62,37 @@ pub struct App {
 	pub protect: Protect,
 	/// Bumped whenever a sale changes state, to wake long-polls.
 	pub sale_changes: watch::Sender<u64>,
+	/// Always the default outside the integration tests.
+	pub overrides: TestOverrides,
+}
+
+/// Behavior that only the integration tests can change. It is not part of
+/// [Config], so no config file or environment variable can set it, and it
+/// can only be passed in a build with the `test-overrides` feature, which
+/// the service binary never enables.
+#[derive(Debug, Clone, Default)]
+pub struct TestOverrides {
+	/// Accept a store invoice that barkd returned without the requested Ark
+	/// hint, instead of refusing the sale. Scuttle releases without S1, such
+	/// as 1.0.0-rc.6, ignore the hint request, and the integration tests run
+	/// sales against them with this.
+	pub accept_unhinted_invoices: bool,
 }
 
 impl App {
-	/// Connects to every backend and checks the Ark server. It refuses to
-	/// start when the server cannot serve the store (see [ark]).
+	/// Connects to every backend and checks that the Ark server runs in
+	/// expiry payout mode (see [ark]).
 	pub async fn new(cfg: Config) -> anyhow::Result<Arc<App>> {
+		App::build(cfg, TestOverrides::default()).await
+	}
+
+	/// [App::new] with test overrides. For the integration tests only.
+	#[cfg(feature = "test-overrides")]
+	pub async fn new_with_overrides(cfg: Config, overrides: TestOverrides) -> anyhow::Result<Arc<App>> {
+		App::build(cfg, overrides).await
+	}
+
+	async fn build(cfg: Config, overrides: TestOverrides) -> anyhow::Result<Arc<App>> {
 		cfg.validate()?;
 		let protect = Protect::new(cfg.limits.clone(), cfg.certification.clone())?;
 		let db = Db::connect(&cfg.postgres, cfg.postgres.max_connections).await?;
@@ -77,9 +103,9 @@ impl App {
 			anyhow::bail!("the Ark server runs on {}, not {}", info.network, cfg.network);
 		}
 		let forwarder = Forwarder::new(&cfg.barkd)?;
-		let support = ark.check_support(&forwarder).await?;
-		tracing::info!("Ark server support: {:?}", support);
-		crate::ark::require_support(&support, &cfg.startup)?;
+		if overrides.accept_unhinted_invoices {
+			tracing::warn!("test override: store invoices without the Ark hint are accepted");
+		}
 		let app = App {
 			public: Backends {
 				db,
@@ -96,6 +122,7 @@ impl App {
 			protect,
 			ark,
 			cfg,
+			overrides,
 		};
 		app.probe_health().await;
 		Ok(Arc::new(app))
@@ -142,7 +169,8 @@ pub fn spawn_background(app: Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
 				app.protect.sweep();
 				let res = async {
 					let conn = app.watch.db.conn().await?;
-					protect::sweep_shared(&*conn).await
+					protect::sweep_shared(&*conn).await?;
+					pin::sweep(&*conn).await
 				}.await;
 				if let Err(e) = res {
 					tracing::warn!("sweeping the rate-limit counters failed: {:#}", e);

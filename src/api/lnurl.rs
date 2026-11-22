@@ -4,11 +4,12 @@
 //!   Ark hint, paying the registered Ark address. Any Lightning wallet pays
 //!   it, and barkd forwards the payment to the owner.
 //! - LUD-22 (Bullnym's negotiation shape): the metadata lists
-//!   `payment_methods`, and a callback with `payment_method=ARK` returns
-//!   the registered Ark address, `payment_method=SP` the Silent Payment
-//!   address. A method response carries only that method and creates no
-//!   invoice, so an Ark or Silent Payment payer costs the Ark server
-//!   nothing.
+//!   `payment_methods`, `["SCUTTLE", "SP"]`. A callback with
+//!   `payment_method=SCUTTLE` returns the registered Ark address,
+//!   `payment_method=SP` the Silent Payment address, and
+//!   `payment_method=SCUTTLE,SP` both. A reply carries only the requested
+//!   methods and creates no invoice, so a Scuttle or Silent Payment payer
+//!   costs the Ark server nothing. An unknown method is refused.
 //!
 //! The Ark server cannot put a description hash in an invoice, so the
 //! invoice carries the metadata's text description, not its hash. Wallets
@@ -33,8 +34,9 @@ use crate::protect::{self, Caller, Surface};
 use crate::sales::lock_caps;
 
 
-/// The LUD-22 methods this service offers.
-pub const METHOD_ARK: &str = "ARK";
+/// The LUD-22 methods this service offers: a Scuttle Ark address, and a
+/// Silent Payment address.
+pub const METHOD_SCUTTLE: &str = "SCUTTLE";
 pub const METHOD_SP: &str = "SP";
 
 /// An LNURL answer. Errors use the LNURL error shape.
@@ -61,12 +63,12 @@ impl From<ApiError> for LnurlResponse {
 	}
 }
 
-/// The LUD-22 methods offered now: `ARK` while the Ark server is healthy,
-/// and `SP` always.
+/// The LUD-22 methods offered now: `SCUTTLE` while the Ark server is
+/// healthy, and `SP` always.
 fn offered_methods(app: &App) -> Vec<&'static str> {
 	let mut methods = Vec::new();
 	if app.protect.health.ark_payments() {
-		methods.push(METHOD_ARK);
+		methods.push(METHOD_SCUTTLE);
 	}
 	methods.push(METHOD_SP);
 	methods
@@ -130,30 +132,44 @@ pub struct CallbackQuery {
 	payment_method: Option<String>,
 }
 
-/// The payment method a callback asks for.
+/// A LUD-22 payment method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
-	Lightning,
-	Ark,
+	Scuttle,
 	SilentPayment,
 }
 
-/// Picks the method of a callback: the first one in the list that the
-/// service offers. An empty or absent list means Lightning; a list with no
-/// method the service offers is refused.
-pub fn pick_method(payment_method: Option<&str>) -> Result<Method, String> {
-	let Some(list) = payment_method.map(str::trim).filter(|l| !l.is_empty()) else {
-		return Ok(Method::Lightning);
-	};
-	for m in list.split(',').map(str::trim) {
-		if m.eq_ignore_ascii_case(METHOD_ARK) {
-			return Ok(Method::Ark);
-		}
-		if m.eq_ignore_ascii_case(METHOD_SP) {
-			return Ok(Method::SilentPayment);
+impl Method {
+	pub fn name(&self) -> &'static str {
+		match self {
+			Method::Scuttle => METHOD_SCUTTLE,
+			Method::SilentPayment => METHOD_SP,
 		}
 	}
-	Err(format!("unsupported payment method; this Lightning Address offers {} and {}", METHOD_ARK, METHOD_SP))
+}
+
+/// The methods a callback asks for, in the payer's order, each once. An
+/// empty or absent list asks for a Lightning invoice. Any method the
+/// service does not know refuses the callback.
+pub fn requested_methods(payment_method: Option<&str>) -> Result<Vec<Method>, String> {
+	let mut methods = Vec::new();
+	let list = payment_method.unwrap_or("");
+	for m in list.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+		let method = if m.eq_ignore_ascii_case(METHOD_SCUTTLE) {
+			Method::Scuttle
+		} else if m.eq_ignore_ascii_case(METHOD_SP) {
+			Method::SilentPayment
+		} else {
+			return Err(format!(
+				"unsupported payment method {}; this Lightning Address offers {} and {}",
+				m, METHOD_SCUTTLE, METHOD_SP,
+			));
+		};
+		if !methods.contains(&method) {
+			methods.push(method);
+		}
+	}
+	Ok(methods)
 }
 
 /// Checks the LUD-06 amount, in msat: within the limits and whole sats.
@@ -188,7 +204,7 @@ pub async fn callback(
 		Ok(a) => a,
 		Err(e) => return LnurlResponse::err(StatusCode::BAD_REQUEST, e),
 	};
-	let method = match pick_method(q.payment_method.as_deref()) {
+	let methods = match requested_methods(q.payment_method.as_deref()) {
 		Ok(m) => m,
 		Err(e) => return LnurlResponse::err(StatusCode::BAD_REQUEST, e),
 	};
@@ -205,32 +221,39 @@ pub async fn callback(
 		}
 	}
 	// Each option is offered only while its backend is healthy. The Silent
-	// Payment address needs none: the owner's wallet scans for it.
-	let available = match method {
-		Method::Ark => app.protect.health.ark_payments(),
+	// Payment address needs none: the owner's wallet scans for it. A method
+	// whose backend is down is left out of the reply.
+	if methods.is_empty() {
+		if !app.protect.health.invoices() {
+			return LnurlResponse::err(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_MESSAGE);
+		}
+		return match lightning_invoice(&app, &nym, amount).await {
+			Ok(pr) => LnurlResponse::ok(json!({ "pr": pr, "routes": [] })),
+			Err(e) => e.into(),
+		};
+	}
+	let available = methods.into_iter().filter(|m| match m {
+		Method::Scuttle => app.protect.health.ark_payments(),
 		Method::SilentPayment => true,
-		Method::Lightning => app.protect.health.invoices(),
-	};
-	if !available {
+	}).collect::<Vec<_>>();
+	if available.is_empty() {
 		return LnurlResponse::err(StatusCode::SERVICE_UNAVAILABLE, UNAVAILABLE_MESSAGE);
 	}
-	if let Some(reply) = static_reply(method, &nym) {
-		return LnurlResponse::ok(reply);
-	}
-	match lightning_invoice(&app, &nym, amount).await {
-		Ok(pr) => LnurlResponse::ok(json!({ "pr": pr, "routes": [] })),
-		Err(e) => e.into(),
-	}
+	LnurlResponse::ok(method_reply(&available, &nym))
 }
 
-/// The reply to an `ARK` or `SP` callback: only the requested method, with
-/// the nym's static address. `None` for Lightning.
-pub fn static_reply(method: Method, nym: &Nym) -> Option<Value> {
-	match method {
-		Method::Ark => Some(json!({ METHOD_ARK: { "address": nym.ark_address } })),
-		Method::SilentPayment => Some(json!({ METHOD_SP: { "address": nym.silent_payment_address } })),
-		Method::Lightning => None,
+/// The reply to a LUD-22 callback: the requested methods only, each with
+/// the nym's static address.
+pub fn method_reply(methods: &[Method], nym: &Nym) -> Value {
+	let mut reply = serde_json::Map::new();
+	for m in methods {
+		let address = match m {
+			Method::Scuttle => &nym.ark_address,
+			Method::SilentPayment => &nym.silent_payment_address,
+		};
+		reply.insert(m.name().to_string(), json!({ "address": address }));
 	}
+	Value::Object(reply)
 }
 
 /// A forwarding invoice from barkd, without an Ark hint, paying the nym's
@@ -289,16 +312,22 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn picks_one_method() {
-		assert_eq!(pick_method(None), Ok(Method::Lightning));
-		assert_eq!(pick_method(Some("")), Ok(Method::Lightning));
-		assert_eq!(pick_method(Some("ARK")), Ok(Method::Ark));
-		assert_eq!(pick_method(Some("SP")), Ok(Method::SilentPayment));
-		assert_eq!(pick_method(Some("sp")), Ok(Method::SilentPayment));
-		// The first method the service offers, in the payer's order.
-		assert_eq!(pick_method(Some("L-BTC,SP,ARK")), Ok(Method::SilentPayment));
-		assert_eq!(pick_method(Some("ARK, SP")), Ok(Method::Ark));
-		assert!(pick_method(Some("L-BTC")).is_err());
+	fn reads_the_requested_methods() {
+		use Method::*;
+		// None: a Lightning invoice.
+		assert_eq!(requested_methods(None), Ok(vec![]));
+		assert_eq!(requested_methods(Some("")), Ok(vec![]));
+		assert_eq!(requested_methods(Some("SCUTTLE")), Ok(vec![Scuttle]));
+		assert_eq!(requested_methods(Some("SP")), Ok(vec![SilentPayment]));
+		assert_eq!(requested_methods(Some("sp")), Ok(vec![SilentPayment]));
+		// A list, in the payer's order, each once.
+		assert_eq!(requested_methods(Some("SCUTTLE,SP")), Ok(vec![Scuttle, SilentPayment]));
+		assert_eq!(requested_methods(Some("SP, SCUTTLE,SP")), Ok(vec![SilentPayment, Scuttle]));
+		// Unknown methods are refused, and ARK is not an alias.
+		for unknown in ["ARK", "L-BTC", "SCUTTLE,L-BTC", "SP,ARK"] {
+			let e = requested_methods(Some(unknown)).unwrap_err();
+			assert!(e.starts_with("unsupported payment method") && e.contains("SCUTTLE and SP"), "{}", e);
+		}
 	}
 
 	#[test]
@@ -312,13 +341,16 @@ mod test {
 	}
 
 	#[test]
-	fn method_replies_carry_only_their_method() {
+	fn method_replies_carry_only_the_requested_methods() {
 		let nym = Nym {
 			id: 1, name: "cafe".into(), ark_address: "tark1x".into(),
 			silent_payment_address: "tsp1y".into(), display_name: None, created_at: chrono::Utc::now(),
 		};
-		assert_eq!(static_reply(Method::Ark, &nym), Some(json!({ "ARK": { "address": "tark1x" } })));
-		assert_eq!(static_reply(Method::SilentPayment, &nym), Some(json!({ "SP": { "address": "tsp1y" } })));
-		assert_eq!(static_reply(Method::Lightning, &nym), None);
+		assert_eq!(method_reply(&[Method::Scuttle], &nym), json!({ "SCUTTLE": { "address": "tark1x" } }));
+		assert_eq!(method_reply(&[Method::SilentPayment], &nym), json!({ "SP": { "address": "tsp1y" } }));
+		assert_eq!(
+			method_reply(&[Method::Scuttle, Method::SilentPayment], &nym),
+			json!({ "SCUTTLE": { "address": "tark1x" }, "SP": { "address": "tsp1y" } }),
+		);
 	}
 }

@@ -22,7 +22,8 @@ use crate::api::{Owner, StoreView, check_registration, public_url};
 use crate::protect::{Caller, Surface};
 use crate::database::{NYM_COLUMNS, Nym, STORE_COLUMNS, Store};
 use crate::error::{ApiResult, bad_request, conflict, not_found};
-use crate::money::currency_decimals;
+use crate::money::{MAX_SAT, currency_decimals};
+use crate::pin;
 use crate::rails::onchain::StoreDescriptor;
 use crate::registration::StoreRegistration;
 use crate::sales::{self, SaleView};
@@ -94,7 +95,8 @@ pub async fn register_store(
 	let reg = req.registration;
 	let signature = parse_signature(&req.signature)?;
 	let info = app.ark.ark_info().await;
-	let address = reg.verify(&signature, info.server_pubkey).map_err(|e| bad_request(e.to_string()))?;
+	let (address, mailbox_id) = reg.verify(&signature, info.server_pubkey, app.cfg.network)
+		.map_err(|e| bad_request(e.to_string()))?;
 	check_timestamp(reg.timestamp)?;
 	let name = reg.name.trim();
 	check_store_name(name)?;
@@ -116,15 +118,16 @@ pub async fn register_store(
 	if nym.ark_address != address.to_string() {
 		return Err(bad_request("the store must use the Ark address its nym was registered with"));
 	}
+	// posd's mailbox id is kept with the signed registration, unused.
 	let row = tx.query_opt("
-		INSERT INTO store (nym_id, name, ark_address, onchain_descriptor, currency,
+		INSERT INTO store (nym_id, name, ark_address, mailbox_id, onchain_descriptor, currency,
 			onchain_min_sat, registration_timestamp, registration_signature)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT DO NOTHING
 		RETURNING id
 	", &[
-		&nym.id, &name, &nym.ark_address, &reg.onchain_descriptor, &reg.currency,
-		&(app.cfg.sales.default_onchain_min_sat as i64), &(reg.timestamp as i64),
+		&nym.id, &name, &nym.ark_address, &mailbox_id.to_string(), &reg.onchain_descriptor,
+		&reg.currency, &(app.cfg.sales.default_onchain_min_sat as i64), &(reg.timestamp as i64),
 		&signature.to_string(),
 	]).await?;
 	if row.is_none() {
@@ -233,6 +236,9 @@ pub async fn update_store(
 			return Err(bad_request(format!("unsupported currency: {}", c)));
 		}
 	}
+	if req.onchain_min_sat.is_some_and(|v| v > MAX_SAT) {
+		return Err(bad_request(format!("onchain_min_sat must be at most {} sats", MAX_SAT)));
+	}
 	let conn = app.public.db.conn().await?;
 	conn.execute("
 		UPDATE store SET
@@ -245,6 +251,34 @@ pub async fn update_store(
 		&store.id, &req.name.map(|n| n.trim().to_string()), &req.currency,
 		&req.onchain_min_sat.map(|v| v as i64),
 	]).await?;
+	let store = reload_store(&app, store.id).await?;
+	Ok(Json(OwnerStoreView::new(&app, &store)))
+}
+
+#[derive(Deserialize)]
+pub struct SetPin {
+	pin: String,
+}
+
+/// `PUT /api/v1/owner/store/cashier-pin`: sets or changes the PIN that
+/// unlocks the cashier screen's list of its own sales. Only its salted
+/// hash is kept, and the store's count of wrong PINs starts over.
+pub async fn set_cashier_pin(
+	State(app): State<Arc<App>>,
+	owner: Owner,
+	Json(req): Json<SetPin>,
+) -> ApiResult<Json<OwnerStoreView>> {
+	let store = owner.store()?;
+	pin::check_format(&req.pin).map_err(bad_request)?;
+	let hash = tokio::task::spawn_blocking(move || pin::hash(&req.pin)).await
+		.map_err(|e| anyhow::anyhow!("PIN hashing task: {}", e))??;
+	let conn = app.public.db.conn().await?;
+	conn.execute("
+		UPDATE store SET cashier_pin_hash = $2, updated_at = NOW() WHERE id = $1
+	", &[&store.id, &hash]).await?;
+	pin::clear(&*conn, &pin::scopes(store.id, "")[0]).await?;
+	drop(conn);
+	tracing::info!("the owner of store {} set the cashier PIN", store.id);
 	let store = reload_store(&app, store.id).await?;
 	Ok(Json(OwnerStoreView::new(&app, &store)))
 }

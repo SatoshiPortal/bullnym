@@ -4,13 +4,14 @@
 //! | Stage | When | Counts as paid |
 //! |---|---|---|
 //! | Seen | In the mempool | No: in progress, not guaranteed |
-//! | Paid | 1 confirmation | Yes |
-//! | Final | 3 confirmations | Yes |
-//! | Payment issue | A counted payment disappears in a reorg | Held until resolved |
+//! | Paid | 1 confirmation | Yes, for good |
 //!
 //! Rules:
 //! - An unconfirmed payment never counts: it never sets the received
 //!   amount, the paid time or the rail. Only a confirmation does.
+//! - Paid is final, as in posd: a sale paid at 1 confirmation stays paid.
+//! - A payment shows only on positive evidence: a confirmation, or an
+//!   answer from bitcoind that it is in the mempool.
 //! - A payment counts as gone only on an explicit signal from bitcoind: a
 //!   conflict with a confirmed transaction, or two answers in a row that
 //!   it is not in the mempool. A timeout, an error or a missing answer
@@ -119,8 +120,13 @@ impl FeePolicy {
 pub const ABSENT_ANSWERS_FOR_GONE: i32 = 2;
 
 /// Updates what the service keeps about a transaction from a new
-/// observation.
-pub fn classify(prev: Option<&TxRecord>, obs: &TxObservation, fees: &FeePolicy) -> TxRecord {
+/// observation. `None` when there is nothing to keep: a transaction first
+/// heard of while the mempool gave no answer is not recorded, so it shows
+/// only once bitcoind confirms it is in the mempool or in a block.
+pub fn classify(prev: Option<&TxRecord>, obs: &TxObservation, fees: &FeePolicy) -> Option<TxRecord> {
+	if prev.is_none() && obs.confirmations == 0 && obs.mempool == Mempool::Unknown {
+		return None;
+	}
 	let mut rec = prev.cloned().unwrap_or(TxRecord {
 		txid: obs.txid.clone(),
 		amount: obs.amount,
@@ -165,11 +171,7 @@ pub fn classify(prev: Option<&TxRecord>, obs: &TxObservation, fees: &FeePolicy) 
 				// Otherwise it keeps its status until the next answer.
 			},
 			// No answer: nothing changes.
-			Mempool::Unknown => {
-				if prev.is_none() {
-					rec.status = TxStatus::Seen;
-				}
-			},
+			Mempool::Unknown => {},
 		}
 		// A transaction that had a confirmation and has none now went
 		// through a reorg. It no longer counts.
@@ -177,7 +179,7 @@ pub fn classify(prev: Option<&TxRecord>, obs: &TxObservation, fees: &FeePolicy) 
 			rec.status = TxStatus::Seen;
 		}
 	}
-	rec
+	Some(rec)
 }
 
 /// A warning about an in-progress payment.
@@ -213,8 +215,6 @@ pub struct Summary {
 	pub confirmed: Amount,
 	/// In the mempool: shown, never counted.
 	pub seen: Amount,
-	/// The fewest confirmations of a confirmed payment.
-	pub min_confirmations: Option<i64>,
 	pub warnings: Vec<Warning>,
 	/// Whether a payment went away because it was replaced.
 	pub replaced: bool,
@@ -226,10 +226,7 @@ pub fn summarize(records: &[TxRecord]) -> Summary {
 	let mut parents = false;
 	for r in records {
 		match r.status {
-			TxStatus::Confirmed => {
-				s.confirmed += r.amount;
-				s.min_confirmations = Some(s.min_confirmations.map_or(r.confirmations, |m| m.min(r.confirmations)));
-			},
+			TxStatus::Confirmed => s.confirmed += r.amount,
 			TxStatus::Seen => {
 				s.seen += r.amount;
 				low_fee |= r.low_fee;
@@ -287,50 +284,35 @@ pub struct Transition {
 	pub state: Option<SaleState>,
 	/// Set the paid time and rail: the first confirmation.
 	pub counts_as_paid: bool,
-	/// The sale is final: every counted payment has enough confirmations.
-	pub is_final: bool,
 	pub notice: Option<Notice>,
 }
 
-/// The rules of an on-chain payment for a sale.
-///
-/// - `paid_onchain`: the sale was paid by its address, so a reorg of that
-///   payment is a payment issue. A sale paid by its invoice is never
-///   affected by its address.
-/// - `onchain_progress`: the sale is in progress because of an on-chain
-///   payment, not an Ark payment awaiting delivery.
+/// The rules of an on-chain payment for a sale. `onchain_progress`: the
+/// sale is in progress because of an on-chain payment, not an Ark payment
+/// awaiting delivery.
 ///
 /// The total in sight only drops when a transaction is gone, which needs an
-/// explicit signal from bitcoind (see [classify]).
+/// explicit signal from bitcoind (see [classify]). A paid, expired or
+/// canceled sale never changes.
 pub fn next_onchain_state(
 	state: SaleState,
 	amount: Amount,
-	paid_onchain: bool,
 	onchain_progress: bool,
 	expired: bool,
 	summary: &Summary,
-	final_confirmations: i64,
 ) -> Transition {
 	let covered = summary.confirmed >= amount;
 	let in_sight = summary.confirmed + summary.seen >= amount;
-	let deep = summary.min_confirmations.is_some_and(|c| c >= final_confirmations);
 	let mut t = Transition::default();
 	match state {
 		SaleState::Open | SaleState::InProgress if covered => {
 			t.state = Some(SaleState::Paid);
 			t.counts_as_paid = true;
-			t.is_final = deep;
 		},
 		SaleState::Open if in_sight => t.state = Some(SaleState::InProgress),
 		SaleState::InProgress if onchain_progress && !in_sight => {
 			t.state = Some(if expired { SaleState::Expired } else { SaleState::Open });
 			t.notice = Some(if summary.replaced { Notice::PaymentReplaced } else { Notice::PaymentDropped });
-		},
-		SaleState::Paid if paid_onchain && !covered => t.state = Some(SaleState::PaymentIssue),
-		SaleState::Paid if paid_onchain => t.is_final = deep,
-		SaleState::PaymentIssue if covered => {
-			t.state = Some(SaleState::Paid);
-			t.is_final = deep;
 		},
 		_ => {},
 	}
@@ -368,18 +350,35 @@ mod test {
 		assert!(!none.is_low(3.0), "no estimate, above the floor");
 	}
 
+	fn first(o: &TxObservation) -> TxRecord {
+		classify(None, o, &fees()).expect("a record")
+	}
+
 	#[test]
 	fn seen_then_confirmed() {
-		let r = classify(None, &obs(0, in_mempool(30.0, false)), &fees());
+		let r = first(&obs(0, in_mempool(30.0, false)));
 		assert_eq!(r.status, TxStatus::Seen);
 		assert!(!r.low_fee && !r.unconfirmed_parents);
-		let r = classify(Some(&r), &obs(1, Mempool::Unknown), &fees());
+		let r = classify(Some(&r), &obs(1, Mempool::Unknown), &fees()).unwrap();
 		assert_eq!(r.status, TxStatus::Confirmed);
 	}
 
 	#[test]
+	fn a_first_sighting_needs_positive_evidence() {
+		// The mempool query failed and nothing was known: nothing is
+		// recorded, so nothing shows.
+		assert_eq!(classify(None, &obs(0, Mempool::Unknown), &fees()), None);
+		// In the mempool, or confirmed, is positive evidence.
+		assert_eq!(first(&obs(0, in_mempool(30.0, false))).status, TxStatus::Seen);
+		assert_eq!(first(&obs(1, Mempool::Unknown)).status, TxStatus::Confirmed);
+		// A known payment keeps its status through the outage.
+		let seen = first(&obs(0, in_mempool(30.0, false)));
+		assert_eq!(classify(Some(&seen), &obs(0, Mempool::Unknown), &fees()), Some(seen));
+	}
+
+	#[test]
 	fn warnings_from_the_mempool() {
-		let r = classify(None, &obs(0, in_mempool(2.0, true)), &fees());
+		let r = first(&obs(0, in_mempool(2.0, true)));
 		assert!(r.low_fee && r.unconfirmed_parents);
 		let s = summarize(&[r]);
 		assert_eq!(s.warnings, vec![Warning::NotGuaranteed, Warning::LowFee, Warning::UnconfirmedParents]);
@@ -389,48 +388,50 @@ mod test {
 
 	#[test]
 	fn absence_needs_an_explicit_signal() {
-		let seen = classify(None, &obs(0, in_mempool(30.0, false)), &fees());
+		let seen = first(&obs(0, in_mempool(30.0, false)));
+		let next = |prev: &TxRecord, o: &TxObservation| classify(Some(prev), o, &fees()).unwrap();
 		// No answer from bitcoind: nothing changes.
-		let r = classify(Some(&seen), &obs(0, Mempool::Unknown), &fees());
+		let r = next(&seen, &obs(0, Mempool::Unknown));
 		assert_eq!(r.status, TxStatus::Seen);
 		// One "not in mempool" answer is not enough.
-		let r = classify(Some(&seen), &obs(0, Mempool::NotIn), &fees());
+		let r = next(&seen, &obs(0, Mempool::NotIn));
 		assert_eq!(r.status, TxStatus::Seen);
 		assert_eq!(r.absent_count, 1);
 		// Back in the mempool resets the count.
-		let back = classify(Some(&r), &obs(0, in_mempool(30.0, false)), &fees());
+		let back = next(&r, &obs(0, in_mempool(30.0, false)));
 		assert_eq!(back.absent_count, 0);
 		// Two in a row: gone, dropped.
-		let r = classify(Some(&r), &obs(0, Mempool::NotIn), &fees());
+		let r = next(&r, &obs(0, Mempool::NotIn));
 		assert_eq!(r.status, TxStatus::Gone);
 		assert!(!r.replaced);
 		// Replaced by a transaction that does not pay the sale.
 		let mut o = obs(0, Mempool::NotIn);
 		o.foreign_conflicts = true;
-		let r = classify(Some(&classify(Some(&seen), &o, &fees())), &o, &fees());
+		let r = next(&next(&seen, &o), &o);
 		assert_eq!(r.status, TxStatus::Gone);
 		assert!(r.replaced);
 		// A conflict with a confirmed transaction is explicit at once.
 		let mut o = obs(-1, Mempool::Unknown);
 		o.foreign_conflicts = true;
-		let r = classify(Some(&seen), &o, &fees());
+		let r = next(&seen, &o);
 		assert_eq!((r.status, r.replaced), (TxStatus::Gone, true));
 	}
 
 	#[test]
 	fn a_reorg_uncounts_a_confirmed_payment() {
-		let c = classify(None, &obs(2, Mempool::Unknown), &fees());
+		// Only for counting toward a sale still open: a paid sale stays paid
+		// (see sale_stages).
+		let c = first(&obs(2, Mempool::Unknown));
 		assert_eq!(c.status, TxStatus::Confirmed);
-		let r = classify(Some(&c), &obs(0, in_mempool(30.0, false)), &fees());
+		let r = classify(Some(&c), &obs(0, in_mempool(30.0, false)), &fees()).unwrap();
 		assert_eq!(r.status, TxStatus::Seen);
-		let r = classify(Some(&c), &obs(0, Mempool::Unknown), &fees());
+		let r = classify(Some(&c), &obs(0, Mempool::Unknown), &fees()).unwrap();
 		assert_eq!(r.status, TxStatus::Seen, "no confirmation: it no longer counts");
 	}
 
-	fn summary(confirmed: u64, seen: u64, min_conf: Option<i64>, replaced: bool) -> Summary {
+	fn summary(confirmed: u64, seen: u64, replaced: bool) -> Summary {
 		Summary {
-			confirmed: Amount::from_sat(confirmed), seen: Amount::from_sat(seen),
-			min_confirmations: min_conf, warnings: vec![], replaced,
+			confirmed: Amount::from_sat(confirmed), seen: Amount::from_sat(seen), warnings: vec![], replaced,
 		}
 	}
 
@@ -438,39 +439,33 @@ mod test {
 	fn sale_stages() {
 		let a = Amount::from_sat(1000);
 		// Seen in the mempool: in progress, never paid.
-		let t = next_onchain_state(Open, a, false, true, false, &summary(0, 1000, None, false), 3);
+		let t = next_onchain_state(Open, a, true, false, &summary(0, 1000, false));
 		assert_eq!(t.state, Some(InProgress));
 		assert!(!t.counts_as_paid);
 		// Below the amount: stays open.
-		let t = next_onchain_state(Open, a, false, true, false, &summary(0, 999, None, false), 3);
+		let t = next_onchain_state(Open, a, true, false, &summary(0, 999, false));
 		assert_eq!(t.state, None);
 		// An in-progress sale outlives its expiry.
-		let t = next_onchain_state(InProgress, a, false, true, true, &summary(0, 1000, None, false), 3);
+		let t = next_onchain_state(InProgress, a, true, true, &summary(0, 1000, false));
 		assert_eq!(t.state, None);
-		// Paid at 1 confirmation, final at 3.
-		let t = next_onchain_state(InProgress, a, false, true, true, &summary(1000, 0, Some(1), false), 3);
-		assert_eq!((t.state, t.counts_as_paid, t.is_final), (Some(Paid), true, false));
-		let t = next_onchain_state(Paid, a, true, true, true, &summary(1000, 0, Some(3), false), 3);
-		assert_eq!((t.state, t.is_final), (None, true));
-		// A reorg after paid: payment issue, then resolved.
-		let t = next_onchain_state(Paid, a, true, true, true, &summary(0, 1000, None, false), 3);
-		assert_eq!(t.state, Some(PaymentIssue));
-		let t = next_onchain_state(PaymentIssue, a, true, true, true, &summary(1000, 0, Some(1), false), 3);
-		assert_eq!(t.state, Some(Paid));
-		// A sale paid by its invoice ignores its address.
-		let t = next_onchain_state(Paid, a, false, true, true, &summary(0, 0, None, false), 3);
-		assert_eq!(t.state, None);
+		// Paid at 1 confirmation, for good.
+		let t = next_onchain_state(InProgress, a, true, true, &summary(1000, 0, false));
+		assert_eq!((t.state, t.counts_as_paid), (Some(Paid), true));
+		// A paid sale never changes, even if its payment leaves the chain.
+		for gone in [summary(0, 1000, false), summary(0, 0, true), summary(1000, 0, false)] {
+			assert_eq!(next_onchain_state(Paid, a, false, true, &gone), Transition::default());
+		}
 		// Replaced: back to open, or expired, with a notice.
-		let t = next_onchain_state(InProgress, a, false, true, false, &summary(0, 0, None, true), 3);
+		let t = next_onchain_state(InProgress, a, true, false, &summary(0, 0, true));
 		assert_eq!((t.state, t.notice), (Some(Open), Some(Notice::PaymentReplaced)));
-		let t = next_onchain_state(InProgress, a, false, true, true, &summary(0, 0, None, false), 3);
+		let t = next_onchain_state(InProgress, a, true, true, &summary(0, 0, false));
 		assert_eq!((t.state, t.notice), (Some(Expired), Some(Notice::PaymentDropped)));
 		// An Ark payment awaiting delivery is not undone by the address.
-		let t = next_onchain_state(InProgress, a, false, false, false, &summary(0, 0, None, false), 3);
+		let t = next_onchain_state(InProgress, a, false, false, &summary(0, 0, false));
 		assert_eq!(t.state, None);
 		// Ended sales do not change: a later payment is a late payment.
 		for s in [Expired, Canceled] {
-			let t = next_onchain_state(s, a, false, true, true, &summary(1000, 0, Some(1), false), 3);
+			let t = next_onchain_state(s, a, true, true, &summary(1000, 0, false));
 			assert_eq!(t, Transition::default());
 		}
 	}

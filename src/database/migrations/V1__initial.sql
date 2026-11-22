@@ -41,13 +41,19 @@ CREATE TABLE store (
 	nym_id BIGINT NOT NULL UNIQUE,
 	name TEXT NOT NULL,
 	ark_address TEXT NOT NULL UNIQUE,
+	-- The unblinded mailbox of the owner's wallet, from posd's signed
+	-- registration. Nothing uses it.
+	mailbox_id TEXT NOT NULL,
 	-- The public descriptor of the on-chain account the wallet chose.
 	onchain_descriptor TEXT NOT NULL,
 	-- The next derivation index to hand out for an on-chain sale. The
 	-- owner's wallet scans the store account up to it.
 	next_onchain_index BIGINT NOT NULL DEFAULT 0,
 	currency TEXT NOT NULL,
-	onchain_min_sat BIGINT NOT NULL,
+	-- The Argon2id hash, with its salt, of the PIN that unlocks the list of
+	-- a cashier screen's own sales. NULL: no PIN, and the list stays hidden.
+	cashier_pin_hash TEXT,
+	onchain_min_sat BIGINT NOT NULL CHECK (onchain_min_sat BETWEEN 0 AND 2100000000000000),
 	registration_timestamp BIGINT NOT NULL,
 	registration_signature TEXT NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -62,6 +68,7 @@ BEGIN
 	END IF;
 	IF NEW.nym_id IS DISTINCT FROM OLD.nym_id
 		OR NEW.ark_address IS DISTINCT FROM OLD.ark_address
+		OR NEW.mailbox_id IS DISTINCT FROM OLD.mailbox_id
 		OR NEW.onchain_descriptor IS DISTINCT FROM OLD.onchain_descriptor
 		OR NEW.registration_timestamp IS DISTINCT FROM OLD.registration_timestamp
 		OR NEW.registration_signature IS DISTINCT FROM OLD.registration_signature
@@ -115,8 +122,8 @@ CREATE INDEX lnurl_invoice_nym_idx ON lnurl_invoice (nym_id, id DESC);
 
 -- in-progress: a payment is seen but does not count yet: an on-chain payment
 -- in the mempool, or an Ark payment the Ark server has not delivered.
--- payment-issue: a counted on-chain payment went away in a reorg.
-CREATE TYPE sale_state AS ENUM ('open', 'in-progress', 'paid', 'payment-issue', 'expired', 'canceled');
+-- paid: for good, as in posd: a delivered invoice, or a confirmed payment.
+CREATE TYPE sale_state AS ENUM ('open', 'in-progress', 'paid', 'expired', 'canceled');
 CREATE TYPE payment_rail AS ENUM ('lightning', 'ark', 'onchain');
 
 CREATE TABLE sale (
@@ -128,7 +135,8 @@ CREATE TABLE sale (
 	store_id BIGINT NOT NULL REFERENCES store(id),
 	-- A name typed on the cashier screen. The service never verifies it.
 	cashier_name TEXT,
-	amount_sat BIGINT NOT NULL,
+	-- At most 21,000,000 BTC, checked before the sale is reserved.
+	amount_sat BIGINT NOT NULL CHECK (amount_sat BETWEEN 1 AND 2100000000000000),
 	fiat_amount TEXT,
 	currency TEXT,
 	btc_price TEXT,
@@ -145,12 +153,19 @@ CREATE TABLE sale (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	expires_at TIMESTAMPTZ NOT NULL,
 	paid_at TIMESTAMPTZ,
-	-- Paid by an invoice, or by on-chain payments with 3 confirmations.
-	final_at TIMESTAMPTZ,
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX sale_store_id_idx ON sale (store_id, id DESC);
 CREATE INDEX sale_watch_idx ON sale (state, expires_at);
+
+-- Wrong cashier PINs in a row, per store and per source, and the lock they
+-- put on further checks.
+CREATE TABLE pin_failure (
+	scope TEXT PRIMARY KEY,
+	failures INT NOT NULL DEFAULT 0,
+	locked_until TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- Shared rate-limit counters: hits per bucket, such as callbacks per nym.
 CREATE TABLE rate_limit_event (
@@ -184,7 +199,9 @@ CREATE TABLE sale_payment (
 	-- The derivation index of the address. Each on-chain sale takes the
 	-- store's next index, and no index is ever handed out twice.
 	onchain_index BIGINT,
-	onchain_address TEXT,
+	-- An address belongs to one sale, even when two stores registered the
+	-- same descriptor, so a payment to it counts for that sale only.
+	onchain_address TEXT UNIQUE,
 	-- The amount this rail delivered: the invoice amount once delivered, or
 	-- the sum of the confirmed outputs to the address.
 	received_sat BIGINT NOT NULL DEFAULT 0,

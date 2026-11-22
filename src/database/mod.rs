@@ -58,12 +58,9 @@ pub enum SaleState {
 	Open,
 	#[postgres(name = "in-progress")]
 	InProgress,
+	/// Paid, for good: by a delivered invoice or a confirmed payment.
 	#[postgres(name = "paid")]
 	Paid,
-	/// A counted on-chain payment went away in a reorg. The sale is held
-	/// until the payment confirms again.
-	#[postgres(name = "payment-issue")]
-	PaymentIssue,
 	#[postgres(name = "expired")]
 	Expired,
 	#[postgres(name = "canceled")]
@@ -76,7 +73,6 @@ impl SaleState {
 			SaleState::Open => "open",
 			SaleState::InProgress => "in-progress",
 			SaleState::Paid => "paid",
-			SaleState::PaymentIssue => "payment-issue",
 			SaleState::Expired => "expired",
 			SaleState::Canceled => "canceled",
 		}
@@ -107,7 +103,6 @@ impl FromStr for SaleState {
 			"open" => SaleState::Open,
 			"in-progress" => SaleState::InProgress,
 			"paid" => SaleState::Paid,
-			"payment-issue" => SaleState::PaymentIssue,
 			"expired" => SaleState::Expired,
 			"canceled" => SaleState::Canceled,
 			_ => anyhow::bail!("unknown sale state: {}", s),
@@ -181,11 +176,14 @@ pub struct Store {
 	pub onchain_min_sat: i64,
 	/// The next derivation index of an on-chain sale.
 	pub next_onchain_index: i64,
+	/// Whether the owner set a cashier PIN. The hash is never loaded here.
+	pub cashier_pin_set: bool,
 }
 
 /// The columns of a store joined with its nym as `n`.
 pub const STORE_COLUMNS: &str = "s.id, s.nym_id, n.name AS nym, s.name, s.ark_address, \
-	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.next_onchain_index";
+	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.next_onchain_index, \
+	s.cashier_pin_hash IS NOT NULL AS cashier_pin_set";
 
 impl Store {
 	pub fn from_row(row: &Row) -> Store {
@@ -199,6 +197,7 @@ impl Store {
 			currency: row.get("currency"),
 			onchain_min_sat: row.get("onchain_min_sat"),
 			next_onchain_index: row.get("next_onchain_index"),
+			cashier_pin_set: row.get("cashier_pin_set"),
 		}
 	}
 }
@@ -228,7 +227,6 @@ pub struct Sale {
 	pub created_at: DateTime<Utc>,
 	pub expires_at: DateTime<Utc>,
 	pub paid_at: Option<DateTime<Utc>>,
-	pub final_at: Option<DateTime<Utc>>,
 	pub lightning_invoice: Option<String>,
 	pub onchain_address: Option<String>,
 }
@@ -239,7 +237,7 @@ pub const SALE_SELECT: &str = "
 		s.currency, s.btc_price, s.memo, s.state, s.progress, s.notice, s.paid_rail,
 		s.received_sat, coalesce(oc.pending_sat, 0) AS seen_sat,
 		coalesce(oc.warnings, '{}') AS warnings, s.created_at, s.expires_at, s.paid_at,
-		s.final_at, ln.invoice AS lightning_invoice, oc.onchain_address
+		ln.invoice AS lightning_invoice, oc.onchain_address
 	FROM sale s
 	LEFT JOIN sale_payment ln ON ln.sale_id = s.id AND ln.rail = 'lightning'
 	LEFT JOIN sale_payment oc ON oc.sale_id = s.id AND oc.rail = 'onchain'
@@ -267,7 +265,6 @@ impl Sale {
 			created_at: row.get("created_at"),
 			expires_at: row.get("expires_at"),
 			paid_at: row.get("paid_at"),
-			final_at: row.get("final_at"),
 			lightning_invoice: row.get("lightning_invoice"),
 			onchain_address: row.get("onchain_address"),
 		}

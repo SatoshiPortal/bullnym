@@ -20,6 +20,12 @@ path = "src/bin/bullnym/main.rs"
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+required-features = ["test-overrides"]
+
+[features]
+# Lets the integration tests change behavior that no config can change
+# (see TestOverrides). The service binary is never built with it.
+test-overrides = []
 
 [dependencies]
 # Scuttle crates, pinned to a release tag (see README.md).
@@ -28,6 +34,7 @@ bark-server-rpc = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scu
 bark-bitcoin-ext = { git = "https://github.com/SatoshiPortal/scuttle", tag = "scuttle-1.0.0-rc.6" }
 
 anyhow = { version = "1.0", features = ["backtrace"] }
+argon2 = "0.5.3"
 axum = { version = "0.8.4", features = ["macros", "tokio", "http1", "query", "json"], default-features = false }
 bb8 = "0.9.0"
 bb8-postgres = "0.9.0"

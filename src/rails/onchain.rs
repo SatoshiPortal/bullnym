@@ -291,6 +291,56 @@ mod test {
 		assert!(StoreDescriptor::parse("tr(nonsense)").is_err());
 	}
 
+	/// posd's validation, unchanged: what it accepts and refuses at
+	/// registration, and the accepted descriptors that yield no address.
+	#[test]
+	fn descriptor_validation_is_posds() {
+		let secp = Secp256k1::new();
+		let xpriv = Xpriv::new_master(Network::Regtest, &[7u8; 32]).unwrap();
+		let tpub = Xpub::from_priv(&secp, &xpriv).to_string();
+		let main_xpriv = Xpriv::new_master(Network::Bitcoin, &[7u8; 32]).unwrap();
+		let xpub = Xpub::from_priv(&secp, &main_xpriv).to_string();
+		let ok = |d: String| StoreDescriptor::parse(&d).unwrap();
+
+		// Accepted, with addresses: every script type with an address form,
+		// with or without origin info.
+		for d in [
+			format!("tr({}/0/*)", tpub),
+			format!("wpkh([d34db33f/84'/1'/0']{}/0/*)", tpub),
+			format!("sh(wpkh({}/0/*))", tpub),
+			format!("pkh({}/0/*)", tpub),
+			format!("wsh(multi(1,{}/0/*,{}/1/*))", tpub, tpub),
+		] {
+			assert!(ok(d.clone()).address(0, Network::Regtest).is_ok(), "{}", d);
+		}
+		// The key's network is not checked: a mainnet xpub gives regtest
+		// addresses on regtest.
+		assert!(ok(format!("wpkh({}/0/*)", xpub)).address(0, Network::Regtest).unwrap()
+			.to_string().starts_with("bcrt1"));
+
+		// Accepted, but no address can be derived, not even the first: a
+		// bare script has no address form. A sale then offers no on-chain
+		// payment (posd refused the whole sale) and the index stays free.
+		let bare = ok(format!("pk({}/0/*)", tpub));
+		assert!(bare.address(0, Network::Regtest).is_err());
+		let bare = ok(format!("multi(1,{}/0/*)", tpub));
+		assert!(bare.address(0, Network::Regtest).is_err());
+		// Indexes from 2^31 on are hardened, which a public key cannot derive.
+		assert!(ok(format!("tr({}/0/*)", tpub)).address(1 << 31, Network::Regtest).is_err());
+
+		// Refused at registration.
+		for (d, why) in [
+			(format!("tr({}/0/0)", tpub), "not ranged"),
+			(format!("tr({}/<0;1>/*)", tpub), "multipath"),
+			(format!("tr({}/0/*')", tpub), "hardened wildcard"),
+			(format!("tr({}/0/*)", xpriv), "private key"),
+			("tr(nonsense)".to_string(), "not a descriptor"),
+			(format!("addr({})", ok(format!("tr({}/0/*)", tpub)).address(0, Network::Regtest).unwrap()), "addr"),
+		] {
+			assert!(StoreDescriptor::parse(&d).is_err(), "{}", why);
+		}
+	}
+
 	#[test]
 	fn reads_btc_values() {
 		assert_eq!(btc_value(&json!(0.00035)).unwrap(), Amount::from_sat(35_000));

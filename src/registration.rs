@@ -10,12 +10,20 @@
 //!
 //! - A [NymRegistration] creates the Lightning Address.
 //! - A [StoreRegistration] creates the store of a nym. It is posd's store
-//!   registration, with `nym` added and `mailbox_id` removed.
+//!   registration, with `nym` added.
+//!
+//! The Ark address of both must be one the Ark server accepts as the
+//! destination hint of a forwarded invoice: for this server and network,
+//! paying a public key, with exactly one server mailbox delivery. The
+//! server also unblinds the mailbox with its own key, which the service
+//! cannot do.
 
 use std::str::FromStr;
 
 use ark::VtxoPolicy;
 use ark::address::VtxoDelivery;
+use ark::mailbox::MailboxIdentifier;
+use bitcoin::Network;
 use bitcoin::secp256k1::{PublicKey, schnorr};
 use serde::{Deserialize, Serialize};
 
@@ -34,9 +42,13 @@ pub enum RegistrationError {
 	LineBreak(&'static str),
 	#[error("not a valid Ark address")]
 	BadAddress,
+	#[error("not a valid mailbox id")]
+	BadMailbox,
+	#[error("the Ark address is for another network")]
+	NetworkMismatch,
 	#[error("the Ark address is for another Ark server")]
 	ServerMismatch,
-	#[error("the Ark address must pay a public key and name a server mailbox")]
+	#[error("the Ark address must pay a public key and have exactly one server mailbox delivery")]
 	UnsupportedAddress,
 	#[error("the signature is not valid for the Ark address")]
 	BadSignature,
@@ -56,22 +68,27 @@ fn check_fields(fields: &[(&'static str, &str)]) -> Result<(), RegistrationError
 	Ok(())
 }
 
-/// Parses an Ark address that the service can pay: an address of the
-/// server with `server_pubkey`, paying a public key, with delivery to the
-/// server mailbox. The address carries the mailbox only in blinded form,
-/// which is all payments need: the service never asks for the unblinded
-/// mailbox id.
+/// Parses an Ark address that the service can pay, with the checks the
+/// Ark server makes on the destination hint of a forwarded invoice: an
+/// address for `network`, of the server with `server_pubkey`, paying a
+/// public key, with exactly one delivery, to the server mailbox. The
+/// address carries the mailbox only in blinded form, which is all payments
+/// need.
 pub fn parse_owner_address(
 	address: &str,
 	server_pubkey: PublicKey,
+	network: Network,
 ) -> Result<ark::Address, RegistrationError> {
 	let address = ark::Address::from_str(address).map_err(|_| RegistrationError::BadAddress)?;
+	if address.is_testnet() != (network != Network::Bitcoin) {
+		return Err(RegistrationError::NetworkMismatch);
+	}
 	if !address.is_for_server(server_pubkey) {
 		return Err(RegistrationError::ServerMismatch);
 	}
 	let pubkey_policy = matches!(address.policy(), VtxoPolicy::Pubkey(_));
-	let mailbox = address.delivery().iter().any(|d| matches!(d, VtxoDelivery::ServerMailbox { .. }));
-	if !pubkey_policy || !mailbox {
+	let one_mailbox = matches!(address.delivery(), [VtxoDelivery::ServerMailbox { .. }]);
+	if !pubkey_policy || !one_mailbox {
 		return Err(RegistrationError::UnsupportedAddress);
 	}
 	Ok(address)
@@ -117,26 +134,30 @@ impl NymRegistration {
 		&self,
 		signature: &schnorr::Signature,
 		server_pubkey: PublicKey,
+		network: Network,
 	) -> Result<ark::Address, RegistrationError> {
 		check_fields(&[
 			("nym", &self.nym),
 			("ark_address", &self.ark_address),
 			("silent_payment_address", &self.silent_payment_address),
 		])?;
-		let address = parse_owner_address(&self.ark_address, server_pubkey)?;
+		let address = parse_owner_address(&self.ark_address, server_pubkey, network)?;
 		verify_signature(&address, &self.message(), signature)?;
 		Ok(address)
 	}
 }
 
-/// The registration of a store, as in posd, with `nym` added and
-/// `mailbox_id` removed.
+/// The registration of a store, as in posd, with `nym` added last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreRegistration {
 	/// The store's display name.
 	pub name: String,
 	/// The nym's registered Ark address.
 	pub ark_address: String,
+	/// The unblinded mailbox of the owner's wallet, as in posd. The service
+	/// stores it and does not use it: payments need only the blinded
+	/// mailbox in the Ark address.
+	pub mailbox_id: String,
 	/// The public descriptor of the on-chain account the wallet chose.
 	pub onchain_descriptor: String,
 	pub currency: String,
@@ -149,29 +170,36 @@ pub struct StoreRegistration {
 impl StoreRegistration {
 	pub fn message(&self) -> String {
 		format!(
-			"{}\nname:{}\nark_address:{}\nonchain_descriptor:{}\ncurrency:{}\ntimestamp:{}\nnym:{}",
-			STORE_REGISTRATION_HEADER, self.name, self.ark_address, self.onchain_descriptor,
-			self.currency, self.timestamp, self.nym,
+			"{}\nname:{}\nark_address:{}\nmailbox_id:{}\nonchain_descriptor:{}\ncurrency:{}\n\
+			timestamp:{}\nnym:{}",
+			STORE_REGISTRATION_HEADER, self.name, self.ark_address, self.mailbox_id,
+			self.onchain_descriptor, self.currency, self.timestamp, self.nym,
 		)
 	}
 
-	/// Checks the fields, the address and the signature. The service checks
-	/// the timestamp, the descriptor, the currency and the nym itself.
+	/// Checks the fields, the address, the form of the mailbox id and the
+	/// signature. The service checks the timestamp, the descriptor, the
+	/// currency and the nym itself. As in posd, nothing checks that the
+	/// mailbox id belongs to the address.
 	pub fn verify(
 		&self,
 		signature: &schnorr::Signature,
 		server_pubkey: PublicKey,
-	) -> Result<ark::Address, RegistrationError> {
+		network: Network,
+	) -> Result<(ark::Address, MailboxIdentifier), RegistrationError> {
 		check_fields(&[
 			("name", &self.name),
 			("ark_address", &self.ark_address),
+			("mailbox_id", &self.mailbox_id),
 			("onchain_descriptor", &self.onchain_descriptor),
 			("currency", &self.currency),
 			("nym", &self.nym),
 		])?;
-		let address = parse_owner_address(&self.ark_address, server_pubkey)?;
+		let address = parse_owner_address(&self.ark_address, server_pubkey, network)?;
+		let mailbox = MailboxIdentifier::from_str(&self.mailbox_id)
+			.map_err(|_| RegistrationError::BadMailbox)?;
 		verify_signature(&address, &self.message(), signature)?;
-		Ok(address)
+		Ok((address, mailbox))
 	}
 }
 
@@ -179,7 +207,6 @@ impl StoreRegistration {
 mod test {
 	use super::*;
 
-	use ark::mailbox::MailboxIdentifier;
 	use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
 
 	fn server() -> (PublicKey, PublicKey) {
@@ -203,6 +230,10 @@ mod test {
 			.into_address().unwrap()
 	}
 
+	fn mailbox_id() -> String {
+		MailboxIdentifier::from_pubkey(owner_key().public_key()).to_string()
+	}
+
 	fn nym_registration(address: &ark::Address) -> NymRegistration {
 		NymRegistration {
 			nym: "cafe".into(),
@@ -216,6 +247,7 @@ mod test {
 		StoreRegistration {
 			name: "Café Uvita".into(),
 			ark_address: address.to_string(),
+			mailbox_id: mailbox_id(),
 			onchain_descriptor: "tr(xpub/0/*)".into(),
 			currency: "CRC".into(),
 			timestamp: 1795190400,
@@ -232,13 +264,12 @@ mod test {
 			silent_payment_address:tsp1placeholder\ntimestamp:1795190400",
 			address,
 		));
-		// posd's message without mailbox_id, with nym added last.
+		// posd's message, in posd's order, with nym added last.
 		assert_eq!(store_registration(&address).message(), format!(
-			"scuttle-pos registration v1\nname:Café Uvita\nark_address:{}\n\
+			"scuttle-pos registration v1\nname:Café Uvita\nark_address:{}\nmailbox_id:{}\n\
 			onchain_descriptor:tr(xpub/0/*)\ncurrency:CRC\ntimestamp:1795190400\nnym:cafe",
-			address,
+			address, mailbox_id(),
 		));
-		assert!(!store_registration(&address).message().contains("mailbox"));
 	}
 
 	#[test]
@@ -247,21 +278,80 @@ mod test {
 		let address = owner_address(server, mailbox);
 		let reg = nym_registration(&address);
 		let sig = ark::message::sign(&owner_key(), reg.message().as_bytes());
-		assert_eq!(reg.verify(&sig, server).unwrap().to_string(), address.to_string());
+		assert_eq!(reg.verify(&sig, server, NET).unwrap().to_string(), address.to_string());
 
 		// Any change to a signed field breaks the signature.
 		let mut other = reg.clone();
 		other.nym = "cafe2".into();
-		assert_eq!(other.verify(&sig, server), Err(RegistrationError::BadSignature));
+		assert_eq!(other.verify(&sig, server, NET), Err(RegistrationError::BadSignature));
 
 		// Another key's signature.
 		let thief = Keypair::from_seckey_slice(&Secp256k1::new(), &[9u8; 32]).unwrap();
 		let sig = ark::message::sign(&thief, reg.message().as_bytes());
-		assert_eq!(reg.verify(&sig, server), Err(RegistrationError::BadSignature));
+		assert_eq!(reg.verify(&sig, server, NET), Err(RegistrationError::BadSignature));
 
 		let store = store_registration(&address);
 		let sig = ark::message::sign(&owner_key(), store.message().as_bytes());
-		assert!(store.verify(&sig, server).is_ok());
+		let (a, mailbox) = store.verify(&sig, server, NET).unwrap();
+		assert_eq!((a.to_string(), mailbox.to_string()), (address.to_string(), mailbox_id()));
+		// The mailbox id is signed.
+		let mut other = store.clone();
+		other.mailbox_id = MailboxIdentifier::from_pubkey(thief.public_key()).to_string();
+		assert_eq!(other.verify(&sig, server, NET).err(), Some(RegistrationError::BadSignature));
+		let mut other = store.clone();
+		other.mailbox_id = "02zz".into();
+		assert_eq!(other.verify(&sig, server, NET).err(), Some(RegistrationError::BadMailbox));
+	}
+
+	const NET: Network = Network::Regtest;
+
+	#[test]
+	fn the_address_must_be_a_usable_hint() {
+		let (server, mailbox) = server();
+		let key = owner_key();
+		let parse = |a: &ark::Address, net| parse_owner_address(&a.to_string(), server, net);
+		let good = owner_address(server, mailbox);
+		assert!(parse(&good, Network::Regtest).is_ok());
+		assert!(parse(&good, Network::Signet).is_ok());
+		// A test address on mainnet.
+		assert_eq!(parse(&good, Network::Bitcoin).err(), Some(RegistrationError::NetworkMismatch));
+		// A mainnet address on a test network.
+		let main = ark::Address::builder()
+			.server_pubkey(server)
+			.pubkey_policy(key.public_key())
+			.mailbox(mailbox, MailboxIdentifier::from_pubkey(key.public_key()), &key).unwrap()
+			.into_address().unwrap();
+		assert_eq!(parse(&main, Network::Regtest).err(), Some(RegistrationError::NetworkMismatch));
+		assert!(parse(&main, Network::Bitcoin).is_ok());
+		// No server mailbox, or a second delivery next to it.
+		let other = VtxoDelivery::Unknown { delivery_type: 0x7f, data: vec![1, 2, 3] };
+		let no_mailbox = ark::Address::builder()
+			.testnet(true)
+			.server_pubkey(server)
+			.pubkey_policy(key.public_key())
+			.delivery(other.clone())
+			.into_address().unwrap();
+		assert_eq!(parse(&no_mailbox, Network::Regtest).err(), Some(RegistrationError::UnsupportedAddress));
+		let mailbox_and_other = ark::Address::builder()
+			.testnet(true)
+			.server_pubkey(server)
+			.pubkey_policy(key.public_key())
+			.mailbox(mailbox, MailboxIdentifier::from_pubkey(key.public_key()), &key).unwrap()
+			.delivery(other)
+			.into_address().unwrap();
+		assert_eq!(parse(&mailbox_and_other, Network::Regtest).err(), Some(RegistrationError::UnsupportedAddress));
+		let blinded = match good.delivery() {
+			[d @ VtxoDelivery::ServerMailbox { .. }] => d.clone(),
+			other => panic!("unexpected delivery {:?}", other),
+		};
+		let two = ark::Address::builder()
+			.testnet(true)
+			.server_pubkey(server)
+			.pubkey_policy(key.public_key())
+			.delivery(blinded.clone())
+			.delivery(blinded)
+			.into_address().unwrap();
+		assert_eq!(parse(&two, Network::Regtest).err(), Some(RegistrationError::UnsupportedAddress));
 	}
 
 	#[test]
@@ -272,21 +362,24 @@ mod test {
 
 		let mut reg = nym_registration(&address);
 		reg.nym = "a\nark_address:x".into();
-		assert_eq!(reg.verify(&sig, server), Err(RegistrationError::LineBreak("nym")));
+		assert_eq!(reg.verify(&sig, server, NET), Err(RegistrationError::LineBreak("nym")));
 		let mut reg = store_registration(&address);
 		reg.currency = String::new();
-		assert_eq!(reg.verify(&sig, server), Err(RegistrationError::Empty("currency")));
+		assert_eq!(reg.verify(&sig, server, NET).err(), Some(RegistrationError::Empty("currency")));
+		let mut reg = store_registration(&address);
+		reg.mailbox_id = String::new();
+		assert_eq!(reg.verify(&sig, server, NET).err(), Some(RegistrationError::Empty("mailbox_id")));
 		let mut reg = store_registration(&address);
 		reg.nym = "x\r".into();
-		assert_eq!(reg.verify(&sig, server), Err(RegistrationError::LineBreak("nym")));
+		assert_eq!(reg.verify(&sig, server, NET).err(), Some(RegistrationError::LineBreak("nym")));
 
 		let mut reg = nym_registration(&address);
 		reg.ark_address = "tark1placeholder".into();
-		assert_eq!(reg.verify(&sig, server), Err(RegistrationError::BadAddress));
+		assert_eq!(reg.verify(&sig, server, NET), Err(RegistrationError::BadAddress));
 
 		// An address of another Ark server.
 		let other_server = SecretKey::from_slice(&[7u8; 32]).unwrap().public_key(&Secp256k1::new());
 		let reg = nym_registration(&owner_address(other_server, mailbox));
-		assert_eq!(reg.verify(&sig, server), Err(RegistrationError::ServerMismatch));
+		assert_eq!(reg.verify(&sig, server, NET), Err(RegistrationError::ServerMismatch));
 	}
 }
