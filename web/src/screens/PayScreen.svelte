@@ -149,15 +149,6 @@
 						</p>
 					{/if}
 				</div>
-			{:else if sale.state === 'payment-issue'}
-				<TerminalPanel
-					icon="!"
-					tone="err"
-					title="Payment issue"
-					detail="A confirmed bitcoin payment for this sale was undone by a chain reorganization. It is not counted until it confirms again. The owner sees it in the history."
-					actionLabel="New Sale"
-					onaction={newSale}
-				/>
 			{:else if sale.state === 'expired' && sale.late_payment}
 				<TerminalPanel
 					icon="!"

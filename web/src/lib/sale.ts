@@ -26,8 +26,6 @@ export function stateLabel(state: SaleState): string {
 			return 'In progress'
 		case 'paid':
 			return 'Paid'
-		case 'payment-issue':
-			return 'Payment issue'
 		case 'expired':
 			return 'Expired'
 		case 'canceled':
@@ -40,8 +38,6 @@ export function stageLabel(sale: Sale): string {
 	switch (sale.state) {
 		case 'in-progress':
 			return sale.progress === 'ark' ? 'In progress' : 'In progress, not guaranteed'
-		case 'paid':
-			return sale.final ? 'Paid · final' : 'Paid'
 		case 'expired':
 		case 'canceled':
 			return sale.late_payment ? `${stateLabel(sale.state)} · late payment` : stateLabel(sale.state)

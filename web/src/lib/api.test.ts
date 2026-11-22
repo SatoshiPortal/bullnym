@@ -70,6 +70,21 @@ describe('PosClient', () => {
 		expect(err.message).toBe('sale is not open')
 	})
 
+	it('checks the cashier PIN with the service', async () => {
+		const { fetch, calls } = fakeFetch([json({ ok: true })])
+		await new PosClient({ fetch, link: PUBLIC }).checkPin('2468')
+		expect(calls[0]!.url).toBe('/api/v1/checkout/cafe/pin')
+		expect(calls[0]!.init.method).toBe('POST')
+		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ pin: '2468' })
+	})
+
+	it('reads how long a refused PIN locks checks', async () => {
+		const { fetch } = fakeFetch([json({ error: 'wrong PIN', retry_after: 4 }, 401)])
+		const err = await new PosClient({ fetch, link: PUBLIC }).checkPin('0000').catch((e) => e)
+		expect(err).toBeInstanceOf(ApiError)
+		expect([err.status, err.message, err.retryAfter]).toEqual([401, 'wrong PIN', 4])
+	})
+
 	it('maps a network failure to status 0', async () => {
 		const fetch = (async () => {
 			throw new TypeError('Failed to fetch')

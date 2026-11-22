@@ -35,7 +35,6 @@ function sale(overrides: Partial<Sale> = {}): Sale {
 		progress: null,
 		warnings: [],
 		notice: null,
-		final: false,
 		late_payment: false,
 		cashier_name: 'Front till',
 		...overrides,
@@ -52,14 +51,15 @@ describe('sale presentation', () => {
 
 	it('labels each state', () => {
 		expect(stateLabel('in-progress')).toBe('In progress')
-		expect(stateLabel('payment-issue')).toBe('Payment issue')
+		expect(stateLabel('paid')).toBe('Paid')
 		expect(stateLabel('canceled')).toBe('Canceled')
 	})
 
 	it('never calls a payment in progress paid', () => {
 		expect(stageLabel(sale({ state: 'in-progress', progress: 'onchain' }))).toBe('In progress, not guaranteed')
 		expect(stageLabel(sale({ state: 'in-progress', progress: 'ark' }))).toBe('In progress')
-		expect(stageLabel(sale({ state: 'paid', final: true }))).toBe('Paid · final')
+		// Paid at 1 confirmation is final: there is no later stage.
+		expect(stageLabel(sale({ state: 'paid', paid_rail: 'onchain' }))).toBe('Paid')
 		expect(stageLabel(sale({ state: 'expired', late_payment: true }))).toBe('Expired · late payment')
 	})
 

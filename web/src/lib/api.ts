@@ -3,7 +3,7 @@
 // A cashier link names the store: no device token. The store's history and
 // CSV are on the owner API, which the owner's wallet calls.
 
-export type SaleState = 'open' | 'in-progress' | 'paid' | 'payment-issue' | 'expired' | 'canceled'
+export type SaleState = 'open' | 'in-progress' | 'paid' | 'expired' | 'canceled'
 export type PaidRail = 'lightning' | 'ark' | 'onchain'
 export type Warning = 'not-guaranteed' | 'low-fee' | 'unconfirmed-parents' | 'replaced'
 
@@ -30,7 +30,6 @@ export interface Sale {
 	progress: 'onchain' | 'ark' | null
 	warnings: Warning[]
 	notice: 'payment-replaced' | 'payment-dropped' | null
-	final: boolean
 	late_payment: boolean
 	cashier_name: string | null
 }
@@ -41,6 +40,8 @@ export interface Store {
 	currency: string
 	onchain_min_sat: number
 	lightning_address: string
+	/** Whether the owner set a cashier PIN. Without one, the list of this device's sales stays hidden. */
+	cashier_pin_set: boolean
 }
 
 /** The store behind a cashier link. */
@@ -63,11 +64,12 @@ export class ApiError extends Error {
 	constructor(
 		readonly status: number,
 		message: string,
+		/** Seconds until the service takes the request again, when it says so. */
+		readonly retryAfter: number = 0,
 	) {
 		super(message)
 		this.name = 'ApiError'
 	}
-
 }
 
 export type Fetch = typeof fetch
@@ -131,6 +133,15 @@ export class PosClient {
 		return this.json('POST', `/api/v1/sales/${encodeURIComponent(id)}/cancel`)
 	}
 
+	/**
+	 * Asks the service whether `pin` is the store's cashier PIN. Resolves on
+	 * a match; a wrong or locked PIN throws an ApiError (401 or 429) whose
+	 * `retryAfter` says how long checks are locked.
+	 */
+	async checkPin(pin: string): Promise<void> {
+		await this.request('POST', `${this.linkPath()}/pin`, { pin })
+	}
+
 	private async json<T>(
 		method: string,
 		path: string,
@@ -171,17 +182,23 @@ export class PosClient {
 			opts.signal?.removeEventListener('abort', onAbort)
 		}
 
-		if (!res.ok) throw new ApiError(res.status, await errorMessage(res))
+		if (!res.ok) {
+			const { message, retryAfter } = await errorDetails(res)
+			throw new ApiError(res.status, message, retryAfter)
+		}
 		return res
 	}
 }
 
-async function errorMessage(res: Response): Promise<string> {
+async function errorDetails(res: Response): Promise<{ message: string; retryAfter: number }> {
+	let message = `Request failed (HTTP ${res.status})`
+	let retryAfter = 0
 	try {
-		const body = (await res.json()) as { error?: unknown }
-		if (typeof body.error === 'string' && body.error) return body.error
+		const body = (await res.json()) as { error?: unknown; retry_after?: unknown }
+		if (typeof body.error === 'string' && body.error) message = body.error
+		if (typeof body.retry_after === 'number' && body.retry_after > 0) retryAfter = body.retry_after
 	} catch {
 		/* not JSON */
 	}
-	return `Request failed (HTTP ${res.status})`
+	return { message, retryAfter }
 }

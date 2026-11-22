@@ -35,7 +35,7 @@
 					<div class="min-w-0">
 						<div class="flex items-baseline gap-2">
 							<span class="font-black tabular-nums">{saleAmountLabel(row, (a, c) => formatFiat(a, c))}</span>
-							{#if row.state !== 'paid' || row.final}
+							{#if row.state !== 'paid'}
 								<span class="text-xs font-semibold text-[#776b5a] dark:text-[#b9aa91]">{stageLabel(row)}</span>
 							{/if}
 						</div>
