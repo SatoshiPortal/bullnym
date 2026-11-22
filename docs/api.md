@@ -77,13 +77,6 @@ timestamp:<timestamp>
 
 The response is `{"nym": Nym}`.
 
-### Lookup
-
-`GET /api/v1/nym/<nym>` returns `{"nym", "registered", "available",
-"lightning_address", "has_store", "checkout_url"}`, or `{"nym",
-"registered": false, "available": false, "reason"}` for a name that cannot
-be registered.
-
 ### LNURL (LUD-06, LUD-16, LUD-22)
 
 - `GET /.well-known/lnurlp/<nym>` returns the pay request, with
@@ -200,7 +193,6 @@ serves the nym and its store.
 |---|---|---|
 | `GET /api/v1/owner/nym` | | `{"nym": Nym}` |
 | `PATCH /api/v1/owner/nym` | `display_name` (empty removes it) | `{"nym": Nym}` |
-| `GET /api/v1/owner/nym/payments?before=<id>&limit=<n>` | | `{"payments": [...]}`: the Lightning payments to the Lightning Address |
 | `GET /api/v1/owner/store` | | Owner store |
 | `PATCH /api/v1/owner/store` | any of `name`, `currency`, `onchain_min_sat` (at most 2,100,000,000,000,000) | Owner store |
 | `PUT /api/v1/owner/store/cashier-pin` | `{"pin": "<4 to 12 digits>"}` | Owner store. Sets or changes the cashier PIN |
@@ -210,8 +202,7 @@ serves the nym and its store.
 `from` and `to` are dates (`2026-11-20`, in UTC) or RFC 3339 times. A date
 as `to` includes that whole day. The CSV columns are: `id, created_at,
 paid_at, state, paid_rail, amount_sat, received_sat, fiat_amount, currency,
-btc_price, memo, cashier_name, seen_sat, progress, warnings, notice,
-late_payment`.
+btc_price, memo, seen_sat, progress, warnings, notice, late_payment`.
 
 The owner's wallet calls these endpoints; the service has no owner page.
 
@@ -226,7 +217,7 @@ token and no login. The same page is the public checkout. Its API prefix is
 |---|---|---|
 | `GET <prefix>` | | `{"store": Store}`. Viewing allocates nothing |
 | `GET <prefix>/rate` | | `{"currency", "btc_price", "fetched_at"}` |
-| `POST <prefix>/sales` | `{"fiat_amount": "12.50"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) and `cashier_name` (64 characters, never verified) | `Sale` |
+| `POST <prefix>/sales` | `{"fiat_amount": "12.50"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) | `Sale` |
 | `GET /api/v1/sales/<id>` | | `Sale` |
 | `GET /api/v1/sales/<id>?wait=<state>` | | `Sale`, when the state is not `<state>` or after 25 s |
 | `POST /api/v1/sales/<id>/cancel` | | `Sale`; `409` unless the sale is open and no payment is arriving |
@@ -253,7 +244,7 @@ matched:
   `retry_after` and a `Retry-After` header, and the PIN is not checked. A
   right PIN clears no count. A count is forgotten a day after its last wrong
   PIN, and a store's count when the owner sets a new PIN.
-- Checks are also limited per source per minute (`pin_checks_per_minute`).
+- Checks are also limited per source per hour (`pin_checks_per_hour`, 10).
 
 The list is a convenience of the screen: anyone with the browser's storage
 can read the remembered sale ids, and a sale id alone opens its sale.
@@ -281,8 +272,7 @@ can read the remembered sale ids, and a sale id alone opens its sale.
   "progress": "onchain",
   "warnings": ["not-guaranteed", "low-fee"],
   "notice": null,
-  "late_payment": false,
-  "cashier_name": "Front till"
+  "late_payment": false
 }
 ```
 
@@ -313,12 +303,15 @@ can read the remembered sale ids, and a sale id alone opens its sale.
     only on the Ark server's positive evidence: HTLCs granted (Lightning) or
     its delivery report (Ark); until then the sale keeps its state.
   - `paid`: Lightning delivered by barkd, Ark delivered (S4), or on-chain
-    with 1 confirmation. Paid is final, as in posd: the sale stays paid, and
-    the service stops observing it.
+    with 1 confirmation. Paid is final, as in posd: the sale stays paid
+    whatever its address shows later.
   - `expired` or `canceled`. A payment after that is a late payment
     (`late_payment`): it shows on this sale and never pays another one,
-    because no address is handed out twice. The address of such a sale is
-    watched for 7 days after the sale was created.
+    because no address is handed out twice.
+- As in posd, a sale's address is watched for 7 days after the sale was
+  created, whatever its state: an extra payment to a paid sale counts in
+  its `received_sat`, above `amount_sat` (an overpayment), and a payment
+  to an ended sale is a late payment.
 - `received_sat` counts only delivered invoices and confirmed outputs;
   `seen_sat` is the unconfirmed amount, never counted. Nothing sets the
   paid time or rail before a payment counts, and nothing marks a sale paid

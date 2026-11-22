@@ -20,8 +20,6 @@
 #                                     cashier screen its own sales
 #   owner-sales [n]                   the store's latest sales
 #   owner-csv [from] [to]             CSV export (dates YYYY-MM-DD)
-#   payments [n]                      Lightning payments to the Lightning
-#                                     Address
 #
 # Cashier (the store's link; the web app at https://<host>/<nym> is the
 # real one)
@@ -114,7 +112,7 @@ get_sale() { api GET "/api/v1/sales/$1"; }
 show_sale() {
 	jq '{id, state, progress, warnings, notice, amount_sat, fiat_amount, currency, memo,
 		received_sat, seen_sat, paid_rail, paid_at, late_payment, expires_at,
-		cashier_name, onchain_address, payment_request}'
+		onchain_address, payment_request}'
 }
 
 # A query parameter of a BIP 321 URI.
@@ -234,15 +232,11 @@ cashier-pin)
 	;;
 owner-sales)
 	api GET "/api/v1/owner/sales?limit=${1:-10}" "$(owner_token)" \
-		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.warnings | join(","))\t\(.cashier_name // "")\t\(.memo // "")"'
+		| jq -r '.sales[] | "\(.id)\t\(.state)\t\(.amount_sat) sat\t\(.fiat_amount // "-") \(.currency // "")\t\(.paid_rail // "-")\t\(.warnings | join(","))\t\(.memo // "")"'
 	;;
 owner-csv)
 	q=""; [ -n "${1:-}" ] && q="from=$1"; [ -n "${2:-}" ] && q="$q&to=$2"
 	api GET "/api/v1/owner/sales.csv?$q" "$(owner_token)"
-	;;
-payments)
-	api GET "/api/v1/owner/nym/payments?limit=${1:-10}" "$(owner_token)" \
-		| jq -r '.payments[] | "\(.payment_hash)\t\(.state)\t\(.amount_sat) sat\t\(.created_at)"'
 	;;
 
 # Cashier

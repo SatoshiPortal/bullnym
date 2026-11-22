@@ -74,7 +74,7 @@ owner=$(api POST /api/v1/owner/login "" "$(jq -n --arg a "$address" --arg c "$ch
 	'{ark_address: $a, challenge: $c, signature: $s}')" | jq -r .token)
 
 echo "== sale 1, paid over Lightning by the external node"
-sale=$(api POST "/api/v1/checkout/$NYM/sales" "" '{"amount_sat": 21000, "memo": "smoke lightning", "cashier_name": "Smoke till"}')
+sale=$(api POST "/api/v1/checkout/$NYM/sales" "" '{"amount_sat": 21000, "memo": "smoke lightning"}')
 id=$(echo "$sale" | jq -r .id)
 lncli cln-external xpay "$(echo "$sale" | jq -r .lightning_invoice)" >/dev/null
 wait_state "$id" paid
