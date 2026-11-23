@@ -246,6 +246,13 @@ export const uxJourneys = {
 		await row.waitFor()
 		if (!(await row.innerText()).includes('Paid')) errors.push('Settled sale has no status text')
 		if ((await page.locator('main').innerText()).includes('low-fee')) errors.push('Internal warning code visible')
+		await page.emulateMedia({ colorScheme: 'dark' })
+		await row.hover()
+		const fill = await row.evaluate(async (el) => {
+			await Promise.all(el.getAnimations().map((animation) => animation.finished))
+			return getComputedStyle(el).backgroundColor
+		})
+		if (Number(fill.match(/\d+/)?.[0]) > 140) errors.push('Dark history hover has a pale background')
 		await checkpoint(page, 'history-rows', true)
 		await page.locator('a[href="#/receipt/waiting"]').click()
 		await page.getByText('Waiting for payment').first().waitFor()
