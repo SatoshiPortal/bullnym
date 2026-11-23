@@ -53,7 +53,7 @@ export async function screenStates({ page, fixture }, inspect) {
 	fixture.intercept = undefined
 
 	const states = [
-		['small', { amount_sat: 400 }, /offered from/],
+		['small', { amount_sat: 400 }, /below the minimum/],
 		['partial', { seen_sat: 100 }, /short of the amount/],
 		['reopened', { notice: 'payment-dropped' }, /Payment dropped/],
 		['bitcoin', { onchain_address: 'bcrt1qexample', onchain_request: 'bitcoin:bcrt1qexample?amount=0.0006' }, /Waiting for payment/],
@@ -66,9 +66,9 @@ export async function screenStates({ page, fixture }, inspect) {
 	for (const [id, data, text] of states) {
 		fixture.sales.set(id, sale(id, data))
 		await page.goto(path('#/pay/' + id))
+		if (id === 'small' || id === 'bitcoin') await page.getByRole('tab', { name: 'On-chain' }).click()
 		await page.getByText(text).first().waitFor()
-		if (id === 'bitcoin') await page.getByRole('tab', { name: 'Bitcoin' }).click()
-		if (['small', 'partial', 'reopened', 'bitcoin'].includes(id)) await page.getByRole('img', { name: /payment code/ }).waitFor()
+		if (['partial', 'reopened', 'bitcoin'].includes(id)) await page.getByRole('img', { name: /payment code/ }).waitFor()
 		await inspect('pay-' + id)
 	}
 	for (const [id, expected] of [['missing', 'Receipt not found.'], ['small', 'Waiting for payment'], ['chain', 'In progress, not guaranteed'], ['late', 'Expired · late payment'], ['settled', 'Receipt ready.']]) {

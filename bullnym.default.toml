@@ -81,6 +81,8 @@ expiry_secs = 600
 # The on-chain minimum of a new store, in sats, at most 2100000000000000. The
 # owner can change it per store. Below it, Bitcoin cannot be added to a sale.
 default_onchain_min_sat = 50000
+# A configured dollar amount applies to newly registered stores.
+# default_onchain_min_usd = "50.00"
 # How often the watcher checks open sales, in milliseconds. On-chain
 # addresses are checked every fifth time.
 poll_interval_ms = 2000

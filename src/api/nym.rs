@@ -118,7 +118,10 @@ pub async fn register(
 
 /// `GET /api/v1/owner/nym`.
 pub async fn get_own(State(app): State<Arc<App>>, owner: Owner) -> Json<Value> {
-	let store = owner.store.as_ref().map(|s| StoreView::new(&app, s));
+	let store = match &owner.store {
+		Some(s) => Some(StoreView::new(&app, s).await),
+		None => None,
+	};
 	Json(json!({ "nym": NymView::new(&app, &owner.nym, store) }))
 }
 
@@ -147,6 +150,10 @@ pub async fn update_own(
 		UPDATE nym n SET display_name = $2, updated_at = NOW() WHERE n.id = $1 RETURNING {}
 	", NYM_COLUMNS), &[&owner.nym.id, &display_name]).await?;
 	let nym = Nym::from_row(&row);
-	let store = owner.store.as_ref().map(|s| StoreView::new(&app, s));
+	drop(conn);
+	let store = match &owner.store {
+		Some(s) => Some(StoreView::new(&app, s).await),
+		None => None,
+	};
 	Ok(Json(json!({ "nym": NymView::new(&app, &nym, store) })))
 }

@@ -54,6 +54,149 @@ async fn owner_csv(store: &Store) -> String {
 		.bearer_auth(&store.owner.token).send().await.unwrap().text().await.unwrap()
 }
 
+async fn wait_for_blocked_checkout(svc: &Service, editor: i32) {
+	let probe = svc.app.public.db.conn().await.unwrap();
+	tokio::time::timeout(Duration::from_secs(20), async {
+		loop {
+			let waiting: bool = probe.query_one(
+				"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+				&[&editor],
+			).await.unwrap().get(0);
+			if waiting { break; }
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}).await.expect("the checkout must wait for the owner transaction");
+}
+
+#[tokio::test]
+async fn store_bitcoin_minimum_uses_usd_and_preserves_issued_addresses() {
+	use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+	use axum::{Json, Router, routing::post};
+	use tokio::sync::Notify;
+
+	let quoting = Arc::new(AtomicBool::new(true));
+	let feed = quoting.clone();
+	let slow = Arc::new(AtomicBool::new(false));
+	let hold_usd = slow.clone();
+	let entered = Arc::new(Notify::new());
+	let release = Arc::new(Notify::new());
+	let quote_entered = entered.clone();
+	let quote_release = release.clone();
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let price_url = format!("http://{}", listener.local_addr().unwrap());
+	let rates = Router::new().route("/", post(move |Json(req): Json<Value>| {
+		let online = feed.load(Ordering::SeqCst);
+		let hold = hold_usd.load(Ordering::SeqCst);
+		let entered = quote_entered.clone();
+		let release = quote_release.clone();
+		async move {
+			if req["params"]["element"]["toCurrency"] == "CRC" {
+				return Json(json!({ "result": { "element": { "indexPrice": 6_250_000_000u64, "precision": 2 } } }));
+			}
+			assert_eq!(req["params"]["element"]["toCurrency"], "USD");
+			if hold {
+				entered.notify_one();
+				release.notified().await;
+			}
+			Json(if online {
+				json!({ "result": { "element": { "indexPrice": 30_000_000, "precision": 2 } } })
+			} else {
+				json!({ "error": "price unavailable" })
+			})
+		}
+	}));
+	let server = tokio::spawn(async move { axum::serve(listener, rates).await.unwrap(); });
+	let ctx = TestContext::new("bullnym/store_bitcoin_minimum_uses_usd").await;
+	let store = store_setup_with(&ctx, |cfg| {
+		cfg.price.url = price_url;
+		cfg.price.fixed_btc_price = None;
+		cfg.price.cache_secs = 0;
+	}).await;
+	let svc = &store.svc;
+	let owner = Some(store.owner.token.as_str());
+	let settings = "/api/v1/owner/store";
+	let checkout = "/api/v1/checkout/cafe";
+	let old = svc.ok(Method::GET, settings, owner, None).await;
+	assert_eq!(old["currency"], "CRC");
+	assert_eq!(old["onchain_min_sat"], 50_000);
+	assert!(old["onchain_min_usd"].is_null());
+	let invalid = svc.call(Method::PATCH, settings, owner, Some(json!({"onchain_min_usd":"1.001"}))).await;
+	assert_eq!(invalid.0, StatusCode::BAD_REQUEST);
+	let policy = svc.ok(Method::PATCH, settings, owner, Some(json!({"onchain_min_usd":"50"}))).await;
+	assert_eq!(policy["onchain_min_usd"], "50.00");
+	assert_eq!(policy["onchain_min_sat"], 16_667);
+	let legacy_edit = svc.call(Method::PATCH, settings, owner, Some(json!({"onchain_min_sat":100}))).await;
+	assert_eq!(legacy_edit.0, StatusCode::CONFLICT);
+	let small = store.new_sale(json!({"amount_sat":16_666})).await;
+	let alloc = |sale: &Value| format!("/api/v1/sales/{}/onchain", sale["id"].as_str().unwrap());
+	assert_eq!(svc.call(Method::POST, &alloc(&small), None, None).await.0, StatusCode::BAD_REQUEST);
+	let exact = store.new_sale(json!({"amount_sat":16_667})).await;
+	let issued = store.add_onchain(&exact).await;
+	assert!(issued["onchain_address"].is_string());
+	assert_eq!(issued["lightning_request"], exact["lightning_request"]);
+
+	// The cashier still sees the old cutoff while the owner's edit is uncommitted.
+	let other = store.new_sale(json!({"amount_sat":16_667})).await;
+	let mut conn = svc.app.public.db.conn().await.unwrap();
+	let tx = conn.transaction().await.unwrap();
+	tx.execute("UPDATE store SET onchain_min_usd_cents = 6000", &[]).await.unwrap();
+	let editor: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+	let commit_edit = async {
+		wait_for_blocked_checkout(svc, editor).await;
+		tx.commit().await.unwrap();
+	};
+	let url = alloc(&other);
+	let (refused, ()) = tokio::join!(svc.call(Method::POST, &url, None, None), commit_edit);
+	assert_eq!(refused.0, StatusCode::CONFLICT);
+	drop(conn);
+
+	// The USD oracle goes quiet while the sale expires. Its row remains writable.
+	let expiring = store.new_sale(json!({"amount_sat":70_000})).await;
+	let expires_url = alloc(&expiring);
+	slow.store(true, Ordering::SeqCst);
+	let expire = async {
+		entered.notified().await;
+		let conn = svc.app.public.db.conn().await.unwrap();
+		tokio::time::timeout(Duration::from_secs(2), conn.execute(
+			"UPDATE sale SET expires_at = clock_timestamp() WHERE public_id = $1",
+			&[&expiring["id"].as_str().unwrap()],
+		)).await.expect("a waiting price quote must release the sale row").unwrap();
+		release.notify_one();
+	};
+	let (expired, ()) = tokio::join!(svc.call(Method::POST, &expires_url, None, None), expire);
+	assert_eq!(expired.0, StatusCode::CONFLICT);
+
+	// Keep a real USD request open until the CRC endpoint responds. This checks
+	// independent price lookups without treating normal checkout latency as a lock.
+	let local_rate = async {
+		entered.notified().await;
+		let rate = svc.ok(Method::GET, "/api/v1/checkout/cafe/rate", None, None);
+		assert_eq!(tokio::time::timeout(Duration::from_secs(8), rate).await
+			.expect("CRC must be served while the USD oracle is still waiting")["currency"], "CRC");
+		release.notify_one();
+	};
+	let (held, ()) = tokio::join!(svc.app.price.quote("USD"), local_rate);
+	assert_eq!(held.unwrap().currency, "USD");
+	let (first, second) = tokio::time::timeout(Duration::from_secs(8), async {
+		tokio::join!(svc.ok(Method::GET, checkout, None, None), svc.ok(Method::GET, checkout, None, None))
+	}).await.expect("both checkouts must display Lightning during a slow USD outage");
+	for view in [first, second] { assert!(view["store"]["onchain_min_sat"].is_null()); }
+	release.notify_waiters();
+	slow.store(false, Ordering::SeqCst);
+	quoting.store(false, Ordering::SeqCst);
+	let checkout = svc.ok(Method::GET, checkout, None, None).await;
+	assert_eq!(checkout["store"]["onchain_min_usd"], "60.00");
+	assert!(checkout["store"]["onchain_min_sat"].is_null());
+	let lightning = store.new_sale(json!({"fiat_amount":"43750.00", "expected_currency":"CRC"})).await;
+	assert_eq!(lightning["amount_sat"], 70_000);
+	assert!(lightning["lightning_request"].is_string());
+	assert_eq!(svc.call(Method::POST, &alloc(&lightning), None, None).await.0, StatusCode::SERVICE_UNAVAILABLE);
+	assert_eq!(store.add_onchain(&exact).await["onchain_address"], issued["onchain_address"]);
+	let final_store = svc.ok(Method::GET, settings, owner, None).await;
+	assert_eq!(final_store["next_onchain_index"], old["next_onchain_index"].as_i64().unwrap() + 1);
+	server.abort();
+}
+
 #[tokio::test]
 async fn fiat_sale_keeps_the_cashiers_currency() {
 	let ctx = TestContext::new("bullnym/fiat_sale_keeps_the_cashiers_currency").await;
@@ -72,17 +215,7 @@ async fn fiat_sale_keeps_the_cashiers_currency() {
 		&[]).await.unwrap();
 	let editor: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
 	let edit = async {
-		let probe = svc.app.public.db.conn().await.unwrap();
-		tokio::time::timeout(Duration::from_secs(20), async {
-			loop {
-				let waiting: bool = probe.query_one(
-					"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
-					&[&editor],
-				).await.unwrap().get(0);
-				if waiting { break; }
-				tokio::time::sleep(Duration::from_millis(20)).await;
-			}
-		}).await.expect("the fiat reservation waited for the owner edit");
+		wait_for_blocked_checkout(svc, editor).await;
 		tx.commit().await.unwrap();
 	};
 	let ((status, _), ()) = tokio::join!(svc.call(Method::POST, checkout, None, Some(usd.clone())), edit);
