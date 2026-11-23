@@ -61,7 +61,13 @@ export class Fixture {
 		currency: 'USD',
 		cashier_pin_set: false,
 		lightning_address: 'cafe@example.test',
-		onchain_min_sat: 50000,
+		onchain_min_usd: '50.00',
+	}
+	usdPriceCentsPerBtc = 10_000_000
+	get storeView() {
+		const minimumCents = Math.round(Number(this.store.onchain_min_usd) * 100)
+		const cutoff = this.usdPriceCentsPerBtc > 0 ? Math.ceil(minimumCents * 100_000_000 / this.usdPriceCentsPerBtc) : null
+		return { ...this.store, onchain_min_sat: cutoff }
 	}
 	sales = new Map()
 	calls = []
@@ -95,8 +101,8 @@ export class Fixture {
 
 	async respond({ path, method, body, query }) {
 		const missing = { status: 404, json: { error: 'not found' } }
-		if (path === '/api/v1/checkout/other') return { json: { store: { ...this.store, nym: 'other', name: 'Other shop' } } }
-		if (path === '/api/v1/checkout/cafe') return { json: { store: this.store } }
+		if (path === '/api/v1/checkout/other') return { json: { store: { ...this.storeView, nym: 'other', name: 'Other shop' } } }
+		if (path === '/api/v1/checkout/cafe') return { json: { store: this.storeView } }
 		if (path === '/api/v1/checkout/cafe/rate')
 			return { json: { currency: this.store.currency, btc_price: '100000', fetched_at: new Date().toISOString() } }
 		if (path.endsWith('/pin')) {
@@ -126,7 +132,8 @@ export class Fixture {
 		if (match[2] && row.state !== 'open') return { status: 409, json: { error: 'sale closed' } }
 		if (match[2] === 'cancel') row.state = 'canceled'
 		if (match[2] === 'onchain') {
-			if (row.amount_sat < this.store.onchain_min_sat) return { status: 400, json: { error: 'Below minimum' } }
+			if (this.storeView.onchain_min_sat === null) return { status: 503, json: { error: 'USD quote unavailable' } }
+			if (row.amount_sat < this.storeView.onchain_min_sat) return { status: 400, json: { error: 'Below minimum' } }
 			row.onchain_address ??= 'bcrt1qfixture' + row.id.toLowerCase()
 			row.onchain_request =
 				'bitcoin:' +

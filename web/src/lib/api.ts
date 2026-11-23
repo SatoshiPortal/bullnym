@@ -42,7 +42,10 @@ export interface Store {
 	name: string
 	nym: string
 	currency: string
-	onchain_min_sat: number
+	/** Configured in US dollars, in decimal major units. Older services omit it. */
+	onchain_min_usd?: string
+	/** Read-only satoshi cutoff for the service’s USD quote. */
+	onchain_min_sat: number | null
 	lightning_address: string
 	/** Whether the owner set a cashier PIN. Without one, the list of this device's sales stays hidden. */
 	cashier_pin_set: boolean

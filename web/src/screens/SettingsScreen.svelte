@@ -1,7 +1,7 @@
 <script lang="ts">
 	// After bullnym's SettingsScreen (nostr-pos's Settings look). The owner
 	// manages the store from the wallet, so this screen shows the setup.
-	import { formatSats } from '$lib/money'
+	import { formatFiat } from '$lib/money'
 	import { session } from '$lib/session.svelte'
 	import { router } from '$lib/router.svelte'
 	import BullFooter from '$lib/components/BullFooter.svelte'
@@ -32,7 +32,7 @@
 			</div>
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">On-chain from</dt>
-				<dd class="min-w-0 wrap-anywhere text-right font-semibold">{store ? formatSats(store.onchain_min_sat) : '—'}</dd>
+				<dd class="min-w-0 wrap-anywhere text-right font-semibold">{store?.onchain_min_usd != null ? formatFiat(store.onchain_min_usd, 'USD') + ' USD' : 'USD minimum unavailable'}</dd>
 			</div>
 		</dl>
 		<p class="mt-3 text-xs text-[#776b5a] dark:text-[#b9aa91]">

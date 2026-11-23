@@ -125,11 +125,11 @@ export const stateEdges = {
 		}
 		try {
 			await open(page, '#/pay/' + row.id)
-			await button(page, 'Bitcoin').click()
+			await page.getByRole('tab', { name: 'On-chain' }).click()
 			await button(page, 'Continue').click()
 			await button(page, 'Adding').waitFor()
 			Object.assign(row, { onchain_address: 'bcrt1qfixture', onchain_request: 'bitcoin:bcrt1qfixture?amount=0.0006' })
-			await page.getByRole('tab', { name: 'Bitcoin' }).click()
+			await page.getByRole('tab', { name: 'On-chain' }).click()
 			await button(page, 'Copy Bitcoin address').waitFor()
 		} finally { rejectRequest() }
 		const poll = (r) => r.url().includes('/superseded?wait=')
@@ -178,11 +178,11 @@ export const stateEdges = {
 		const row = sale('deadline', { expires_at: new Date(now + 60000).toISOString() })
 		fixture.sales.set(row.id, row)
 		await open(page, '#/pay/deadline')
-		await button(page, 'Bitcoin').click()
+		await page.getByRole('tab', { name: 'On-chain' }).click()
 		await page.getByRole('dialog').waitFor()
 		await page.clock.fastForward(61000)
 		assert.equal(await page.getByRole('dialog').count(), 0, 'deadline should dismiss an unconfirmed allocation')
-		assert.equal(await button(page, 'Bitcoin').count(), 0)
+		await page.getByText('The payment time has elapsed.', { exact: false }).waitFor()
 		await page.getByText(/Checking the payment status/).waitFor()
 		Object.assign(row, { state: 'in-progress', progress: 'ark' })
 		await page.getByText(/Ark payment is being delivered/).waitFor()
@@ -221,10 +221,12 @@ export const stateEdges = {
 			await open(page, '#/pay/' + row.id)
 			await button(page, 'Cancel sale').click()
 			await button(page, 'Canceling…').waitFor()
-			assert(await button(page, 'Bitcoin').isDisabled(), 'cannot begin allocating an address while canceling')
+			await page.getByRole('tab', { name: 'On-chain' }).click()
+			assert.equal(await page.getByRole('dialog').count(), 0, 'cannot allocate an address while canceling')
+			await page.getByRole('tab', { name: 'Lightning' }).click()
 		} finally { finish() }
 		await page.getByText(/Cancellation refused/).waitFor()
-		await button(page, 'Bitcoin').click()
+		await page.getByRole('tab', { name: 'On-chain' }).click()
 		await page.getByRole('dialog').waitFor()
 	},
 	async HISTORY_REFRESH({ page, fixture }) {
