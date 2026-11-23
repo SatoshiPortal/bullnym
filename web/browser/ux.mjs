@@ -72,6 +72,24 @@ export const uxJourneys = {
 		await context.setOffline(false)
 		await page.getByRole('tab', { name: 'Sats' }).waitFor()
 	},
+	async CASHIER_BACK({ page, fixture }) {
+		fixture.store.cashier_pin_set = true
+		fixture.sales.set('keep', sale('keep'))
+		await open(page, '#/pay/keep')
+		for (const link of ['Settings', 'Recent sales']) {
+			await page.getByRole('link', { name: link }).click()
+			await page.getByRole('link', { name: /Back/ }).click()
+			await page.waitForURL('**#/pay/keep')
+			assert.equal(await decodeQr(page), fixture.sales.get('keep').lightning_request)
+		}
+		await page.getByRole('link', { name: 'Recent sales' }).click()
+		await page.getByRole('link', { name: 'Settings' }).click()
+		await page.getByRole('link', { name: /Back/ }).click()
+		await page.getByText('Cashier PIN').waitFor()
+		await page.getByRole('link', { name: /Back/ }).click()
+		assert.equal(await decodeQr(page), fixture.sales.get('keep').lightning_request)
+		assert.equal(fixture.calls.filter((c) => c.method === 'POST').length, 0)
+	},
 	async RECEIPT_BACK({ page, fixture }) {
 		fixture.sales.set('direct', sale('direct'))
 		await page.goto(origin)

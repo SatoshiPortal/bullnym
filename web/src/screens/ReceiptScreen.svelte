@@ -45,7 +45,7 @@
 
 <main class="receipt-screen min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
 	<div class="no-print mx-auto mb-5 flex max-w-xl flex-wrap items-center justify-between gap-2">
-		<button class="inline-flex min-h-12 items-center gap-2 rounded-md font-bold" onclick={() => history.state?.receiptParent ? history.back() : router.go('/')}>← Back</button>
+		<button class="inline-flex min-h-12 items-center gap-2 rounded-md font-bold" onclick={() => router.back()}>← Back</button>
 		<div class="flex gap-2">
 			{#if isPaid}
 				<Button variant="secondary" onclick={() => window.print()}><Printer size={18} />Print</Button>
