@@ -17,6 +17,8 @@ export async function checkpoint(page, label, screenshot = false) {
 			return {
 				parent: index.get(el.parentElement) ?? null, tag: el.localName, role: el.getAttribute('role'), text,
 				name: el.getAttribute('aria-label') ?? el.getAttribute('alt'),
+				href: el.getAttribute('href'), selected: el.getAttribute('aria-selected'),
+				tabIndex: el.getAttribute('tabindex'), focus: el === document.activeElement,
 				class: el.getAttribute('class'), disabled: el.matches(':disabled'),
 				display: css.display, visibility: css.visibility, overflow: [css.overflowX, css.overflowY],
 				box: [box.x, box.y, box.width, box.height].map(Math.round),

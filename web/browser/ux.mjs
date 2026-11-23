@@ -41,6 +41,21 @@ function finish(errors) {
 	assert.deepEqual(errors, [])
 }
 export const uxJourneys = {
+	async BRAND_LINK({ page, context }) {
+		await context.route('https://bullbitcoin.com/**', (r) => r.fulfill({ contentType: 'text/html', body: '<title>Brand destination</title>' }))
+		for (const url of [origin, origin + '/cafe', origin + '/cafe#/settings', origin + '/cafe#/history']) {
+			await page.goto(url)
+			const logo = page.getByRole('link', { name: 'Bull Bitcoin', exact: true })
+			assert.equal(await logo.getAttribute('href'), 'https://bullbitcoin.com')
+			const pending = context.waitForEvent('page')
+			await logo.click()
+			const destination = await pending
+			await destination.waitForURL('https://bullbitcoin.com/')
+			assert(await destination.evaluate(() => window.opener === null))
+			await destination.close()
+			assert.equal(page.url(), new URL(url).href)
+		}
+	},
 	async SCREEN_STATES(options) {
 		const errors = []
 		await screenStates(options, (state) => layout(options.page, state, errors))
