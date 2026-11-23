@@ -4,7 +4,6 @@
 	import { router } from '$lib/router.svelte'
 	import { ChevronRight } from 'lucide-svelte'
 	import type { Sale } from '$lib/api'
-	import { formatFiat } from '$lib/money'
 	import { railLabel, saleAmountLabel, stageLabel, stateBorderTone, warningText } from '$lib/sale'
 
 	let { rows }: { rows: Sale[] } = $props()
@@ -36,7 +35,7 @@
 				>
 					<div class="min-w-0">
 						<div class="flex flex-wrap items-baseline gap-2">
-							<span class="font-black tabular-nums">{saleAmountLabel(row, (a, c) => formatFiat(a, c))}</span>
+							<span class="font-black tabular-nums">{saleAmountLabel(row)}</span>
 							<span class="text-xs font-semibold text-[#675c4c] dark:text-[#b9aa91]">{stageLabel(row)}</span>
 						</div>
 						<div class="mt-0.5 truncate text-xs text-[#675c4c] dark:text-[#b9aa91]">

@@ -1,3 +1,5 @@
+/// <reference lib="es2023.intl" />
+
 // Currency formatting, ported from bullnym (pwa/lib/money.ts). posd sends
 // fiat amounts and prices as decimal strings in major units.
 
@@ -5,7 +7,7 @@
  * Minor-unit digits typed and shown for a currency. The colón has cents in
  * ISO 4217, but nobody prices in them, so it is entered as whole colones.
  */
-const PRECISION_OVERRIDES: Record<string, number> = { CRC: 0 }
+const PRECISION_OVERRIDES: Record<string, number> = { CRC: 0, COP: 0 }
 
 export function currencyPrecision(currency: string): number {
 	const override = PRECISION_OVERRIDES[currency.toUpperCase()]
@@ -19,7 +21,8 @@ export function currencyPrecision(currency: string): number {
 
 /** Format a major-unit fiat amount, for example ("8500", "CRC") → "₡8,500". */
 export function formatFiat(amount: string | number, currency: string, precision = currencyPrecision(currency)): string {
-	const value = typeof amount === 'string' ? Number(amount) : amount
+	// Intl accepts decimal strings directly, preserving cents on large receipts.
+	const value = amount as number | `${number}`
 	try {
 		return new Intl.NumberFormat(undefined, {
 			style: 'currency',

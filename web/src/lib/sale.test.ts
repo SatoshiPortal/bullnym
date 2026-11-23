@@ -95,9 +95,8 @@ describe('sale presentation', () => {
 	})
 
 	it('headlines fiat for a fiat sale and sats otherwise', () => {
-		const fmt = (a: string, c: string) => `${c} ${a}`
-		expect(saleAmountLabel(sale(), fmt)).toBe('USD 12.50')
-		expect(saleAmountLabel(sale({ fiat_amount: null, currency: null }), fmt)).toBe(
+		expect(saleAmountLabel(sale())).toBe(new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD' }).format(12.5))
+		expect(saleAmountLabel(sale({ fiat_amount: null, currency: null }))).toBe(
 			`${new Intl.NumberFormat().format(35000)} sats`,
 		)
 	})

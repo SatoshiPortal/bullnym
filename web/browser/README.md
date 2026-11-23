@@ -1,6 +1,6 @@
 # Cashier HTML, CSS and journey audit
 
-From `web/`, with Node.js 22+, npm and `zbarimg` on PATH, run
+From `web/`, with Node.js 22+, npm, `zbarimg` and PostgreSQL server binaries discoverable through `pg_config`, run
 
 ```sh
 npm ci
@@ -34,6 +34,33 @@ With `AUDIT=1`, each case writes a DOM inventory at checkpoints and completion. 
 | History gate | No cashier PIN, locked, typing, checking, refused, backoff, hourly limit, unlocked, removal or leave | Device-only explanation, masked count, keypad, waiting/recovery, local rows on success. Departing invalidates an outstanding check. | Lock on route exit, reload and document departure. Attempt budgets belong to the service. | HISTORY, LIMIT, PIN_BACKOFF, PIN_LEAVE, DARK_CONTROLS, SCREEN_STATES |
 | History list | Unlock, load rows, partial failure, retry, external tab creates sale, empty store/profile | Amount, text status, date, known rail and memo. Payment warnings use cashier language. Tap a row to inspect its receipt. | Per-store sale IDs live in profile storage. With storage denied the page retains IDs until reload. | HISTORY, HISTORY_RETRY, STORAGE, TWO_TABS, CASHIER_HISTORY |
 | Settings and brand | Tap Settings or navigate directly. Back to checkout. | Read-only store name, currency, Lightning address and on-chain minimum, owner-wallet explanation and Bull Bitcoin link. Back returns to the cashier screen that opened Settings, including an active QR. | Refetched store data. External logo link opens a new browsing context. | ROUTES, TYPE_AND_NAV, NARROW_CONTENT, SCREEN_STATES, BRAND_LINK |
+
+## State combinations and cross-screen transitions
+
+| Owner and entry | What the cashier sees and can do | Exit, refresh and persistence | Browser cases |
+|---|---|---|---|
+| Checkout metadata fetch fails after a successful visit | Keep the last store settings during retry. | Retry refreshes the name, currency and PIN configuration even when the cashier stays on the same screen. Reload starts a fresh fetch. | STORE_REFRESH_RETRY |
+| Quote poll returns a different denomination while typing | Discard the incompatible quote immediately and refresh the checkout. A confirmed denomination change clears the fiat draft and preserves the memo. | The next matching quote enables a new amount. Drafts are document-local. | QUOTE_DENOMINATION_RACE, CURRENCY_CHANGE |
+| Sale entered in each supported currency | The keypad offers whole units for CRC and COP and cents for USD, CAD, EUR, ARS and MXN. Issued sale amounts retain their recorded fractional value across Payment, Receipt and History. | The service records the amount submitted. The register starts a fresh draft on return. | CURRENCY_SCALE, RECORDED_FIAT |
+| Creation response is lost | The cashier sees that creation could not be confirmed and can check the owner’s sales before retrying. | A reconnect never repeats the POST. Without a returned ID the browser cannot recover the sale through local history. | CREATE_RESPONSE_LOST |
+| Memo reaches the service's 200 Unicode character limit | A valid memo can be submitted intact. Adding another character gives an inline error and disables Charge. | Shortening the draft re-enables Charge. The accepted memo survives in the sale record. | MEMO_BOUNDARY |
+| Open sale reaches its displayed deadline | Show that the cashier is waiting for a status update. Close an unsubmitted Bitcoin allocation dialog. The already-issued request stays available while the service reports open. | Only the service moves the sale to pending or a terminal state. Reload reads the sale and recomputes its countdown. | OPEN_DEADLINE, SALE_OPEN |
+| Cancel submission or a concurrent Bitcoin allocation | Cancel in flight disables the new-address action. On a refused cancellation, the cashier can select Bitcoin again. A late error cannot overwrite an address already assigned by another request. | An ordinary cancellation returns to the keypad. A cancellation with observed funds stays on its outcome with separate received and unconfirmed amounts. | CANCEL_COMPETING, CANCEL_WITH_FUNDS, ALLOCATION_SUPERSEDED |
+| Unlocked history remains open, refreshes, or reconnects | Refresh while visible each minute. Transient failures mark the list incomplete and retain known rows. A missing or foreign record is unavailable in this store. | Successful refresh clears the error. History and Receipt share accepted revisions for the same sale. The PIN gate still locks on exit or reload. | HISTORY_REFRESH, HISTORY_MISSING, HISTORY_SCOPE, HISTORY_REVISION |
+| Native share is open on a paid receipt | Share is disabled during the OS operation. A failed share gives feedback. | Completion, cancellation or failure releases the action. Reload opens an idle receipt. | SHARE_PENDING, RECEIPT_ACTIONS |
+| Confirmed and unconfirmed funds on the same sale | The receipt distinguishes current credit and unconfirmed funds. Partial and pending payment screens show both where present. A paid sale whose credit falls reports both the recorded sale total and current credit. | Each accepted service revision updates the amount. The sale stays paid after a reorganization. | SALE_OPEN, SALE_PENDING, SALE_PAID, SALE_ENDED |
+| Paid on-chain address at its observation deadline | An eligible extra payment updates the receipt. At the boundary the recorded receipt remains final. | SEVEN_DAY_RECEIPT evaluates the production address-selection SQL in PostgreSQL one microsecond before, exactly at, and one microsecond after seven days. A fixture applies a 10,000-sat update to the selected sale and reloads each receipt. | SEVEN_DAY_RECEIPT |
+
+The sale matrix uses 53 named records. Every record is opened in Payment, Receipt and PIN-unlocked Recent sales. The individual fixture names appear in the payment and receipt checkpoints.
+
+| Case | Records | Combinations |
+|---|---:|---|
+| SALE_OPEN | 24 | 12 combinations of below, at or above the current threshold, assigned or unassigned address, and future or elapsed deadline. Another 12 combine no notice, dropped or replaced with no funds, unconfirmed only, received only or both. |
+| SALE_PENDING | 11 | All eight subsets of low-fee, unconfirmed-parent and replacement warnings for a pending Bitcoin payment. Three pending Ark cases have zero, partial or full Bitcoin observation after invoice expiry. |
+| SALE_PAID | 10 | Unknown, Lightning, Ark or Bitcoin method with exact credit or excess. Two Bitcoin records represent a reorganization leaving zero or partial credit. |
+| SALE_ENDED | 8 | Expired or canceled crossed with no funds, unconfirmed only, received only or both. |
+
+The sale matrix covers these equivalence classes. The other journey cases exercise the route, lifecycle, keyboard, failure, storage and network orders. The frontend receives sale status from the service. A frontend fixture can establish how a status renders and which actions it enables. Actual wallet settlement requires the separate regtest.
 
 ## Element review
 

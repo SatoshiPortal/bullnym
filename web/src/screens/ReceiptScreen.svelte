@@ -5,7 +5,7 @@
 	import { untrack } from 'svelte'
 	import { Printer, RotateCw, Share2 } from 'lucide-svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
-	import { formatFiat, formatSats, shortId } from '$lib/money'
+	import { formatSats, shortId } from '$lib/money'
 	import { router } from '$lib/router.svelte'
 	import { isLive, railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
 	import { followSale } from '$lib/follow-sale.svelte'
@@ -18,16 +18,18 @@
 	const reader = untrack(() => followSale(id))
 	const sale = $derived(reader.sale)
 	const canShare = typeof navigator.share === 'function'
-	let shareError = $state('')
+	let sharing = $state<'idle' | 'pending' | 'failed'>('idle')
 	const isPaid = $derived(sale?.state === 'paid')
 	const dateLabel = $derived(sale ? new Date(sale.paid_at ?? sale.created_at).toLocaleString() : '—')
 
 	async function share() {
-		shareError = ''
+		if (sharing === 'pending') return
+		sharing = 'pending'
 		try {
 			await navigator.share({ title: 'Receipt', url: location.href })
+			sharing = 'idle'
 		} catch (e) {
-			if (!(e instanceof DOMException && e.name === 'AbortError')) shareError = 'Could not share the receipt.'
+			sharing = e instanceof DOMException && e.name === 'AbortError' ? 'idle' : 'failed'
 		}
 	}
 
@@ -49,14 +51,14 @@
 		<div class="flex gap-2">
 			{#if isPaid}
 				<Button variant="secondary" onclick={() => window.print()}><Printer size={18} />Print</Button>
-				{#if canShare}<Button variant="ghost" onclick={share}><Share2 size={18} />Share</Button>{/if}
+				{#if canShare}<Button variant="ghost" disabled={sharing === 'pending'} onclick={share}><Share2 size={18} />Share</Button>{/if}
 			{:else}
 				<Button variant="secondary" onclick={() => router.go('/')}><RotateCw size={18} />New sale</Button>
 			{/if}
 		</div>
 	</div>
 
-	{#if shareError}<p class="no-print" role="alert">{shareError}</p>{/if}
+	{#if sharing === 'failed'}<p class="no-print" role="alert">Could not share the receipt.</p>{/if}
 	{#if reader.kind === 'retrying'}<p role="status" class="no-print text-center">Reconnecting…</p>{/if}
 	{#if reader.kind === 'missing'}
 		<p class="py-20 text-center">Receipt not found.</p>
@@ -71,9 +73,10 @@
 			methodLabel={sale.paid_rail ? railLabel(sale.paid_rail) : null}
 			statusLabel={stageLabel(sale)}
 			receivedLabel={formatSats(sale.received_sat)}
+			unconfirmedLabel={sale.seen_sat > 0 ? formatSats(sale.seen_sat) : null}
 			overpaidLabel={sale.received_sat > sale.amount_sat ? formatSats(sale.received_sat - sale.amount_sat) : null}
 			expectedSatsLabel={sale.fiat_amount !== null ? formatSats(sale.amount_sat) : null}
-			amountFiatLabel={saleAmountLabel(sale, (a, c) => formatFiat(a, c))}
+			amountFiatLabel={saleAmountLabel(sale)}
 			note={sale.memo ?? undefined}
 			saleIdShort={shortId(sale.id)}
 		/>

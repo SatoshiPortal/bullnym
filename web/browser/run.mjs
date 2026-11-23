@@ -1,5 +1,7 @@
 import { checkpoint } from './checkpoint.mjs'
 import { uxJourneys } from './ux.mjs'
+import { stateEdges } from './state-edges.mjs'
+import { saleStates } from './sale-states.mjs'
 import { chromium, firefox } from 'playwright'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
@@ -23,7 +25,7 @@ for (const engine of (process.env.ENGINES ?? 'chromium,firefox').split(',')) {
 	try {
 		for (const size of (process.env.SIZES ?? 'desktop,mobile').split(',')) {
 			const viewport = size === 'mobile' ? { width: 390, height: 844 } : { width: 1280, height: 800 }
-			for (const [id, run] of Object.entries({ ...journeys, ...uxJourneys })) {
+			for (const [id, run] of Object.entries({ ...journeys, ...uxJourneys, ...stateEdges, ...saleStates })) {
 				if (process.env.CASES && !process.env.CASES.split(',').includes(id)) continue
 				const fixture = new Fixture()
 				const contexts = []

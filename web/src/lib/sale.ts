@@ -3,6 +3,7 @@
 // A payment the service has seen but cannot count yet is "in progress":
 // amber, with plain words that it is not guaranteed. Only a paid sale is
 // green.
+import { currencyPrecision, formatFiat } from './money'
 import type { PaidRail, Sale, SaleState, Warning } from './api'
 
 export function railLabel(rail: PaidRail | null): string {
@@ -144,8 +145,12 @@ export function receiptNumber(id: string): string {
 }
 
 /** The headline amount: fiat when the sale was keyed in fiat, else sats. */
-export function saleAmountLabel(sale: Sale, format: (amount: string, currency: string) => string): string {
-	if (sale.fiat_amount !== null && sale.currency) return format(sale.fiat_amount, sale.currency)
+export function saleAmountLabel(sale: Sale): string {
+	if (sale.fiat_amount !== null && sale.currency) {
+		const fraction = sale.fiat_amount.split('.')[1] ?? ''
+		const places = Math.max(currencyPrecision(sale.currency), /[1-9]/.test(fraction) ? fraction.length : 0)
+		return formatFiat(sale.fiat_amount, sale.currency, places)
+	}
 	return `${new Intl.NumberFormat().format(sale.amount_sat)} sats`
 }
 
