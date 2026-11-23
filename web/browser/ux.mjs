@@ -144,13 +144,29 @@ export const uxJourneys = {
 		if (await digit.evaluate((el) => Number(getComputedStyle(el).opacity)) >= 1) errors.push('Locked keypad still looks enabled')
 		finish(errors)
 	},
-	async KEYPAD_TYPE({ page }) {
+	async KEYPAD_TYPE({ page, fixture }) {
 		await open(page, '')
-		const size = await page.getByRole('button', { name: 'Add 1', exact: true })
-			.evaluate((el) => parseFloat(getComputedStyle(el).fontSize))
-		assert(size >= 28, 'Keypad digit rendered at ' + size + 'px')
+		const fontSize = (element) => element.evaluate((el) => parseFloat(getComputedStyle(el).fontSize))
+		const digit = page.getByRole('button', { name: 'Add 1', exact: true })
+		assert.equal(await fontSize(digit), 16, 'Original cashier keypad numeral')
 		const chargeFont = await page.getByRole('button', { name: 'Charge' }).evaluate((el) => getComputedStyle(el).fontFamily)
-		assert.match(chargeFont, /Bebas Neue/)
+		assert.equal(chargeFont, await page.locator('body').evaluate((el) => getComputedStyle(el).fontFamily))
+		for (const n of '6000') await key(page, n)
+		const width = page.viewportSize().width
+		assert.equal(await fontSize(page.getByText('$6,000', { exact: true })), Math.min(120, Math.max(40, width / 10)))
+		const row = sale('type-sample')
+		fixture.sales.set(row.id, row)
+		await open(page, '#/pay/type-sample')
+		const amount = page.getByText('60,000 sats', { exact: true })
+		await page.evaluate(() => document.fonts.ready)
+		assert.equal(await fontSize(amount), 72, 'Original waiting amount')
+		row.state = 'in-progress'
+		row.progress = 'onchain'
+		await page.getByText(/in the mempool/).waitFor()
+		assert.equal(await fontSize(amount), 72, 'Original pending amount')
+		Object.assign(row, paid, { received_sat: 60000 })
+		await page.getByRole('heading', { name: 'Paid' }).waitFor()
+		assert.equal(await fontSize(amount), 60, 'Original paid amount')
 	},
 	async COPY_LEGIBILITY({ page, fixture }) {
 		await page.emulateMedia({ colorScheme: 'light' })
@@ -206,6 +222,12 @@ export const uxJourneys = {
 		await open(page, '#/pay/live')
 		await page.getByText(note).waitFor()
 		await layout(page, 'pay-long', errors)
+		const amount = page.getByRole('heading', { name: '999,999,999 sats' })
+		assert(await amount.evaluate((el) => parseFloat(getComputedStyle(el).fontSize) < 72))
+		await page.setViewportSize({ width: 1280, height: 800 })
+		await page.waitForFunction(() => getComputedStyle(document.querySelector('main h1')).fontSize === '72px')
+		await page.setViewportSize({ width: 320, height: 568 })
+		await page.waitForFunction(() => parseFloat(getComputedStyle(document.querySelector('main h1')).fontSize) < 72)
 		const qr = await page.getByRole('img', { name: 'Lightning payment code' }).boundingBox()
 		if (!qr || qr.x < 0 || qr.x + qr.width > 321) errors.push('Payment QR clipped')
 		assert.equal(await decodeQr(page), live.lightning_request)

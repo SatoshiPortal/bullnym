@@ -49,6 +49,12 @@ body {
 }
 
 button,
+input,
+textarea {
+	font: inherit;
+}
+
+button,
 a,
 [role='button'] {
 	touch-action: manipulation;
@@ -72,13 +78,6 @@ a,
 }
 .scrollbar-none::-webkit-scrollbar {
 	display: none;
-}
-
-.payment-amount {
-	max-width: 100%;
-	overflow-wrap: anywhere;
-	text-align: center;
-	font-size: clamp(2rem, 10vw, 4.5rem);
 }
 
 .manual-copy {

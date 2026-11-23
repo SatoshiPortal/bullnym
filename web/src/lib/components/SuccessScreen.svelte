@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { fitAmount } from '$lib/fit-amount'
 	// Ported from bullnym (pwa/lib/components/SuccessScreen.svelte).
 	import confetti from 'canvas-confetti'
 	import Button from './Button.svelte'
@@ -68,7 +69,7 @@
 		✓
 	</div>
 	<h1 class="font-display text-3xl">Paid</h1>
-	<p class="payment-amount font-display tabular-nums tracking-display leading-none text-[#211f1a] dark:text-[#fff6e8]">
+	<p use:fitAmount={amountLabel} class="w-full [contain:inline-size] whitespace-nowrap text-center text-6xl font-display tabular-nums tracking-display leading-none text-[#211f1a] dark:text-[#fff6e8]">
 		{amountLabel}
 	</p>
 	{#if rail}
