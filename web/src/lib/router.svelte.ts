@@ -8,20 +8,19 @@ function parseHash(): string {
 
 const state = $state({ path: parseHash() })
 
-window.addEventListener('hashchange', (event) => {
-	const from = new URL(event.oldURL).hash
-	if (parseHash().startsWith('/receipt/') && (from === '#/history' || from.startsWith('#/pay/'))) {
-		history.replaceState({ ...history.state, receiptParent: true }, '')
-	}
-	state.path = parseHash()
-})
+window.addEventListener('hashchange', () => { state.path = parseHash() })
 
 export const router = {
 	get path(): string {
 		return state.path
 	},
 	go(path: string): void {
-		location.hash = '#' + path
+		if (path.startsWith('/receipt/') && (state.path === '/history' || state.path.startsWith('/pay/'))) {
+			history.pushState({ receiptParent: true }, '', '#' + path)
+			state.path = path
+		} else {
+			location.hash = '#' + path
+		}
 	},
 	/** Match "/pay/:id" style patterns; returns params or null. */
 	match(pattern: string): Record<string, string> | null {

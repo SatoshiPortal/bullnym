@@ -49,12 +49,6 @@ body {
 }
 
 button,
-input,
-textarea {
-	font: inherit;
-}
-
-button,
 a,
 [role='button'] {
 	touch-action: manipulation;
@@ -80,31 +74,50 @@ a,
 	display: none;
 }
 
+.payment-amount {
+	max-width: 100%;
+	overflow-wrap: anywhere;
+	text-align: center;
+	font-size: clamp(2rem, 10vw, 4.5rem);
+}
+
+.manual-copy {
+	display: grid;
+	gap: .35rem;
+	margin-top: .5rem;
+	text-align: start;
+	font-size: .875rem;
+}
+
+.manual-copy input {
+	width: 100%;
+	min-height: 2.75rem;
+	border: 1px solid currentColor;
+	border-radius: .5rem;
+	padding: .5rem;
+	font-family: monospace;
+}
+
 @media print {
-	body {
+	html, body, #app, body.paper-80 .receipt-screen {
+		min-width: 0;
+		min-height: 0;
+		overflow: visible;
 		background: white;
 		color: black;
 	}
 
-	.no-print {
-		display: none !important;
-	}
+	.no-print { display: none !important; }
 
-	.receipt-paper {
-		box-shadow: none !important;
-		border: 0 !important;
-	}
-
-	body.paper-58 .receipt-paper,
+	body.paper-80 .receipt-screen { padding: 0; }
 	body.paper-80 .receipt-paper {
 		width: 100%;
-		max-width: none;
-		margin: 0;
-		padding: 0.5rem;
-	}
-
-	body.paper-a4 .receipt-paper {
-		max-width: 80mm;
+		max-width: 72mm;
 		margin: 0 auto;
+		padding: 0;
+		background: white;
+		color: black;
+		border: 0;
+		box-shadow: none;
 	}
 }

@@ -7,7 +7,7 @@
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
 	import { formatFiat, formatSats, shortId } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
+	import { isLive, railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
 	import { followSale } from '$lib/follow-sale.svelte'
 	import { session } from '$lib/session.svelte'
 	import Button from '$lib/components/Button.svelte'
@@ -32,19 +32,19 @@
 	}
 
 	$effect(() => {
-		document.body.classList.add('paper-80mm')
+		document.body.classList.add('paper-80')
 		const style = document.createElement('style')
-		style.textContent = '@media print { @page { size: 80mm auto; margin: 5mm; } }'
+		style.textContent = '@media print { @page { margin: 4mm; } }'
 		document.head.appendChild(style)
 		return () => {
-			document.body.classList.remove('paper-80mm')
+			document.body.classList.remove('paper-80')
 			style.remove()
 		}
 	})
 </script>
 
-<main class="min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
-	<div class="no-print mx-auto mb-5 flex max-w-xl items-center justify-between">
+<main class="receipt-screen min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
+	<div class="no-print mx-auto mb-5 flex max-w-xl flex-wrap items-center justify-between gap-2">
 		<button class="inline-flex min-h-12 items-center gap-2 rounded-md font-bold" onclick={() => history.state?.receiptParent ? history.back() : router.go('/')}>← Back</button>
 		<div class="flex gap-2">
 			{#if isPaid}
@@ -56,8 +56,8 @@
 		</div>
 	</div>
 
-	 {#if shareError}<p role="alert">{shareError}</p>{/if}
-	{#if reader.kind === 'retrying'}<p role="status" class="text-center">Reconnecting…</p>{/if}
+	{#if shareError}<p class="no-print" role="alert">{shareError}</p>{/if}
+	{#if reader.kind === 'retrying'}<p role="status" class="no-print text-center">Reconnecting…</p>{/if}
 	{#if reader.kind === 'missing'}
 		<p class="py-20 text-center">Receipt not found.</p>
 	{:else if reader.kind === 'loading'}
@@ -68,9 +68,11 @@
 			posName="Checkout"
 			receiptNumber={receiptNumber(sale.id)}
 			{dateLabel}
-			methodLabel={railLabel(sale.paid_rail)}
+			methodLabel={sale.paid_rail ? railLabel(sale.paid_rail) : null}
 			statusLabel={stageLabel(sale)}
-			amountSatsLabel={formatSats(sale.state === 'paid' ? sale.received_sat : sale.amount_sat)}
+			receivedLabel={formatSats(sale.received_sat)}
+			overpaidLabel={sale.received_sat > sale.amount_sat ? formatSats(sale.received_sat - sale.amount_sat) : null}
+			expectedSatsLabel={sale.fiat_amount !== null ? formatSats(sale.amount_sat) : null}
 			amountFiatLabel={saleAmountLabel(sale, (a, c) => formatFiat(a, c))}
 			note={sale.memo ?? undefined}
 			saleIdShort={shortId(sale.id)}
@@ -82,7 +84,10 @@
 				}`}
 			>
 				<p class="font-display text-5xl uppercase tracking-display leading-none">{stageLabel(sale)}</p>
-				<p class="mt-1 text-sm">{isPaid ? 'Receipt ready.' : 'Start a new sale.'}</p>
+				{#if isPaid}<p class="mt-1 text-sm">Receipt ready.</p>
+				{:else if isLive(sale.state)}
+					<Button variant="secondary" href={`#/pay/${id}`}>View payment</Button>
+				{/if}
 			</div>
 		</div>
 	{/if}

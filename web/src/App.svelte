@@ -1,7 +1,7 @@
 <script lang="ts">
 	// Terminal shell. The store's link ("/<nym>") opens the terminal on any
 	// device, with no pairing; the app is hash-routed like bullnym's POS.
-	import { untrack } from 'svelte'
+	import { tick, untrack } from 'svelte'
 	import { ApiError } from '$lib/api'
 	import { router } from '$lib/router.svelte'
 	import { client, session } from '$lib/session.svelte'
@@ -45,6 +45,26 @@
 
 	const payId = $derived(router.match('/pay/:id')?.id)
 	const receiptId = $derived(router.match('/receipt/:id')?.id)
+
+	$effect(() => {
+		const name = session.checkout?.store.name ?? 'Point of sale'
+		const screen = payId ? 'Payment' : receiptId ? 'Receipt' :
+			router.path === '/history' ? 'Recent sales' : router.path === '/settings' ? 'Settings' : ''
+		document.title = screen ? screen + ' · ' + name : name
+	})
+	let previousPath = router.path
+	$effect(() => {
+		const path = router.path
+		if (path === previousPath) return
+		previousPath = path
+		tick().then(() => {
+			if (router.path !== path) return
+			const main = document.querySelector('main')
+			main?.setAttribute('tabindex', '-1')
+			main?.focus({ preventScroll: true })
+			window.scrollTo(0, 0)
+		})
+	})
 </script>
 
 {#if !session.link}
