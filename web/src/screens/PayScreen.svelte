@@ -8,7 +8,7 @@
 	import { ApiError } from '$lib/api'
 	import { formatFiat, formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
+	import { canAddBitcoin, countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
 	import { followSale } from '$lib/follow-sale.svelte'
 	import { client, session } from '$lib/session.svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
@@ -16,6 +16,7 @@
 	import ConfirmDialog from '$lib/components/ConfirmDialog.svelte'
 	import CopyRow from '$lib/components/CopyRow.svelte'
 	import HeaderLinks from '$lib/components/HeaderLinks.svelte'
+	import ChoiceTabs from '$lib/components/ChoiceTabs.svelte'
 	import QrCard from '$lib/components/QrCard.svelte'
 	import SuccessScreen from '$lib/components/SuccessScreen.svelte'
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte'
@@ -49,11 +50,11 @@
 
 	let selected = $state<'lightning' | 'bitcoin'>('lightning')
 	let option = $state<'idle' | 'confirm' | 'requesting' | 'failed'>('idle')
-	const eligible = $derived(!!sale && !!session.checkout && sale.amount_sat >= session.checkout.store.onchain_min_sat)
+	const eligible = $derived(canAddBitcoin(sale, session.checkout?.store.onchain_min_sat ?? null))
 	const qrValue = $derived(selected === 'bitcoin' && sale?.onchain_request ? sale.onchain_request : sale?.lightning_request)
 
 	$effect(() => {
-		if (sale?.state !== 'open') option = 'idle'
+		if (!eligible) option = 'idle'
 	})
 
 	function chooseBitcoin() {
@@ -63,7 +64,7 @@
 		}
 	}
 	async function addBitcoin() {
-		if (option !== 'confirm' || sale?.state !== 'open') return
+		if (option !== 'confirm' || !eligible) return
 		option = 'requesting'
 		try {
 			const next = await client().addOnchain(id)
@@ -102,7 +103,7 @@
 					onclick={sale?.state === 'open' ? cancel : newSale}
 					disabled={sale?.state === 'open' && cancelState === 'sending'}
 				>
-					← {sale?.state === 'open' ? 'Cancel sale' : 'New sale'}
+					{sale?.state === 'open' ? (cancelState === 'sending' ? 'Canceling…' : 'Cancel sale') : '← New sale'}
 				</button>
 				<HeaderLinks />
 			</header>
@@ -150,7 +151,7 @@
 				<TerminalPanel icon="×" tone="err" title="Canceled" detail="This sale was canceled." actionLabel="Back" onaction={newSale} />
 			{:else if sale.state === 'in-progress'}
 				<div class="mx-auto flex max-w-md flex-col items-center gap-5 py-6 text-center">
-					<p class="font-display text-7xl tabular-nums tracking-display leading-none">{amountLabel}</p>
+					<h1 class="payment-amount font-display tabular-nums tracking-display leading-none">{amountLabel}</h1>
 					<BullSpinner size={72} label="Payment in progress" />
 					<div class="rounded-md bg-[#fff0c7] px-5 py-4 text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]" role="status">
 						<p class="font-semibold">{progress?.title}. It is not paid yet.</p>
@@ -164,7 +165,7 @@
 			{:else}
 				<div class="mx-auto flex w-full max-w-md flex-col items-center gap-5">
 					<div class="flex w-full flex-col items-center gap-1">
-						<p class="font-display text-7xl tabular-nums tracking-display leading-none">{amountLabel}</p>
+						<h1 class="payment-amount font-display tabular-nums tracking-display leading-none">{amountLabel}</h1>
 						{#if sale.fiat_amount !== null}
 							<p class="text-sm tabular-nums text-[#776b5a] dark:text-[#b9aa91]">{formatSats(sale.amount_sat)}</p>
 						{/if}
@@ -173,7 +174,7 @@
 							Waiting for payment{remaining ? ` · ${remaining}` : ''}
 						</p>
 						{#if sale.memo}
-							<p class="text-center text-sm text-[#776b5a] dark:text-[#b9aa91]">{sale.memo}</p>
+							<p class="w-full wrap-anywhere whitespace-pre-wrap text-center text-sm text-[#776b5a] dark:text-[#b9aa91]">{sale.memo}</p>
 						{/if}
 					</div>
 
@@ -189,41 +190,29 @@
 					{/if}
 
 					{#if sale.onchain_request}
-						<div class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]" role="tablist" aria-label="Payment code">
-							{#each [['lightning', 'Lightning'], ['bitcoin', 'Bitcoin']] as [value, label] (value)}
-								<button
-									type="button"
-									role="tab"
-									aria-selected={selected === value}
-									class={`min-h-9 rounded-md px-4 font-semibold transition ${
-										selected === value
-											? 'bg-[#fffaf0] text-[#1f513a] shadow-sm dark:bg-[#161512] dark:text-[#8bc8a4]'
-											: 'text-[#5f5547] dark:text-[#c9bca7]'
-									}`}
-									onclick={() => (selected = value as 'lightning' | 'bitcoin')}
-								>
-									{label}
-								</button>
-							{/each}
-						</div>
+						<ChoiceTabs label="Payment code" panel="payment-code" value={selected}
+							choices={[{ value: 'lightning', label: 'Lightning' }, { value: 'bitcoin', label: 'Bitcoin' }]}
+							onchange={(value) => (selected = value)} />
 					{/if}
 
-					{#if qrValue}
-						<QrCard
-							value={qrValue}
-							label={selected === 'bitcoin' && sale.onchain_request ? 'Bitcoin payment code' : 'Lightning payment code'}
-						/>
-					{/if}
-
-					<div class="flex w-full flex-col gap-2">
-						{#if selected === 'bitcoin' && sale.onchain_address}
-							<CopyRow label="Bitcoin address" value={sale.onchain_address} />
-						{:else if sale.lightning_invoice}
-							<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
+					<div class="flex w-full min-w-0 flex-col gap-5" id="payment-code" role={sale.onchain_request ? 'tabpanel' : undefined} aria-labelledby={sale.onchain_request ? 'payment-code-' + selected : undefined}>
+						{#if qrValue}
+							<QrCard
+								value={qrValue}
+								label={selected === 'bitcoin' && sale.onchain_request ? 'Bitcoin payment code' : 'Lightning payment code'}
+							/>
 						{/if}
+
+						<div class="flex w-full flex-col gap-2">
+							{#if selected === 'bitcoin' && sale.onchain_address}
+								<CopyRow label="Bitcoin address" value={sale.onchain_address} />
+							{:else if sale.lightning_invoice}
+								<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
+							{/if}
+						</div>
 					</div>
 					{#if option === 'failed'}
-						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">Could not add Bitcoin. Check the sale and try again.</p>
+						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]" role="alert">Could not add Bitcoin. Check the sale and try again.</p>
 					{/if}
 					{#if !sale.onchain_request && sale.state === 'open'}
 						{#if eligible}

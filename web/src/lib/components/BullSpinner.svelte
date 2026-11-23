@@ -3,12 +3,11 @@
 	let { size = 48, label }: { size?: number; label?: string } = $props()
 </script>
 
-<div class="inline-flex flex-col items-center gap-3 text-[#211f1a] dark:text-[#fff6e8]">
+<div role="status" class="inline-flex flex-col items-center gap-3 text-[#211f1a] dark:text-[#fff6e8]">
 	<svg
 		viewBox="0 0 2975 2512"
 		xmlns="http://www.w3.org/2000/svg"
-		role="img"
-		aria-label="Loading"
+		aria-hidden="true"
 		style={`width:${size}px;height:${size}px`}
 		class="pointer-events-none select-none"
 	>
@@ -63,5 +62,8 @@
 	}
 	svg path#br {
 		animation-delay: 0.15s;
+	}
+	@media (prefers-reduced-motion: reduce) {
+		svg path { animation: none; }
 	}
 </style>

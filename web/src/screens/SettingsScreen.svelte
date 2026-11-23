@@ -19,11 +19,11 @@
 		<dl class="space-y-3 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] p-5 text-sm dark:border-[#3a342a] dark:bg-[#211f1a]">
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">Store</dt>
-				<dd class="text-right font-semibold">{store?.name ?? '—'}</dd>
+				<dd class="min-w-0 wrap-anywhere text-right font-semibold">{store?.name ?? '—'}</dd>
 			</div>
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">Currency</dt>
-				<dd class="text-right font-semibold">{store?.currency ?? '—'}</dd>
+				<dd class="min-w-0 wrap-anywhere text-right font-semibold">{store?.currency ?? '—'}</dd>
 			</div>
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">Lightning address</dt>
@@ -31,7 +31,7 @@
 			</div>
 			<div class="flex justify-between gap-4">
 				<dt class="text-[#776b5a] dark:text-[#b9aa91]">On-chain from</dt>
-				<dd class="text-right font-semibold">{store ? formatSats(store.onchain_min_sat) : '—'}</dd>
+				<dd class="min-w-0 wrap-anywhere text-right font-semibold">{store ? formatSats(store.onchain_min_sat) : '—'}</dd>
 			</div>
 		</dl>
 		<p class="mt-3 text-xs text-[#776b5a] dark:text-[#b9aa91]">

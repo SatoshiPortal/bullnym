@@ -17,15 +17,18 @@
 	aria-label={`Copy ${label}`}
 >
 	<span class="min-w-0">
-		<span class="block text-xs font-semibold uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">{label}</span>
+		<span class="block text-xs font-semibold uppercase tracking-[0.12em] text-[#675c4c] dark:text-[#b9aa91]">{label}</span>
 		<span class="block truncate font-mono">{shortId(value)}</span>
 	</span>
 	{#if copy.forValue(value) === 'copied'}
+		<span class="text-sm font-semibold">Copied</span>
 		<Check size={18} class="shrink-0 text-[#1f513a] dark:text-[#8bc8a4]" />
 	{:else}
 		<Copy size={18} class="shrink-0" />
 	{/if}
 </button>
 {#if copy.forValue(value) === 'manual'}
-	<label>Copy {label} manually<input readonly {value} onfocus={(event) => event.currentTarget.select()} /></label>
+	<label class="manual-copy">Copy {label} manually<input readonly {value} onfocus={(event) => event.currentTarget.select()} /></label>
 {/if}
+
+<span class="sr-only" role="status">{copy.forValue(value) === 'copied' ? label + ' copied' : ''}</span>

@@ -20,15 +20,22 @@
 		oncancel: () => void
 	} = $props()
 	let dialog: HTMLDialogElement
-	onMount(() => { dialog.showModal() })
+	onMount(() => {
+		const opener = document.activeElement
+		dialog.showModal()
+		return () => {
+			dialog.close()
+			if (opener instanceof HTMLElement && opener.isConnected) opener.focus()
+		}
+	})
 </script>
 
-<dialog bind:this={dialog} aria-labelledby="confirm-title"
+<dialog bind:this={dialog} aria-labelledby="confirm-title" aria-describedby="confirm-detail"
 	oncancel={(event) => { event.preventDefault(); if (!busy) oncancel() }}
 	class="m-auto w-full max-w-sm rounded-lg border border-[#d7c8b4] bg-[#fffaf0] p-5 text-[#211f1a] shadow-lg backdrop:bg-black/40 dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#fff6e8]"
 >
 		<h2 id="confirm-title" class="font-display text-2xl uppercase tracking-display leading-none">{title}</h2>
-		<p class="mt-3 text-sm">{text}</p>
+		<p id="confirm-detail" class="mt-3 text-sm">{text}</p>
 		<div class="mt-5 grid grid-cols-2 gap-3">
 			<Button variant="secondary" disabled={busy} onclick={oncancel}>Cancel</Button>
 			<Button disabled={busy} onclick={onconfirm}>{busy ? 'Adding' : confirmLabel}</Button>

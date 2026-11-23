@@ -2,7 +2,7 @@
 	// Ported from bullnym's KeypadScreen (nostr-pos's Keypad layout): header
 	// with the store name and History/Settings buttons, a big amount, the
 	// keypad, a memo, and the Charge button pinned at the bottom.
-	import { onDestroy } from 'svelte'
+	import { onDestroy, untrack } from 'svelte'
 	import { ApiError, type Rate } from '$lib/api'
 	import { applyAmountInput } from '$lib/amount-input'
 	import { currencyPrecision, fiatToSats, formatFiat, formatRate, formatSats, normalizeFiat } from '$lib/money'
@@ -13,6 +13,7 @@
 	import BullFooter from '$lib/components/BullFooter.svelte'
 	import Button from '$lib/components/Button.svelte'
 	import HeaderLinks from '$lib/components/HeaderLinks.svelte'
+	import ChoiceTabs from '$lib/components/ChoiceTabs.svelte'
 	import Keypad from '$lib/components/Keypad.svelte'
 
 	const RATE_REFRESH_MS = 60_000
@@ -23,6 +24,7 @@
 	let unit = $state<'fiat' | 'sat'>('fiat')
 	let amount = $state('')
 	let memo = $state('')
+	let denominationNotice = $state('')
 	let active = true
 	onDestroy(() => { active = false })
 	type Submission = { kind: 'editing' | 'creating' } | { kind: 'error'; message: string }
@@ -37,6 +39,13 @@
 	const precision = $derived(unit === 'sat' ? 0 : currencyPrecision(currency))
 
 	$effect(() => {
+		const expected = currency
+		quote = { kind: 'loading' }
+		// A fiat draft belongs to the denomination on which it was entered.
+		if (untrack(() => unit === 'fiat' && amount !== '')) {
+			amount = ''
+			denominationNotice = 'The store currency changed. Enter the amount in ' + expected + '.'
+		}
 		let stopped = false
 		let generation = 0
 		let last: Rate | null = null
@@ -44,6 +53,7 @@
 			const request = ++generation
 			try {
 				const next = await client().rate()
+				if (next.currency !== expected) throw Error('Rate currency changed')
 				if (!stopped && request === generation) {
 					last = next
 					quote = { kind: 'current', rate: next }
@@ -74,12 +84,14 @@
 
 	function applyInput(key: string) {
 		if (creating) return
+		denominationNotice = ''
 		submission = { kind: 'editing' }
 		amount = applyAmountInput(amount, key, precision)
 	}
 
 	function setUnit(next: 'fiat' | 'sat') {
 		if (creating || unit === next) return
+		denominationNotice = ''
 		submission = { kind: 'editing' }
 		unit = next
 		amount = ''
@@ -121,26 +133,13 @@
 			<div class="mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-y-auto scrollbar-none">
 				<div class="my-auto flex w-full flex-col gap-3 sm:gap-5">
 					<div class="flex justify-end">
-						<div class="inline-flex rounded-md bg-[#eadfce] p-0.5 text-xs dark:bg-[#2c2922]" role="tablist" aria-label="Amount unit">
-							{#each [['fiat', currency], ['sat', 'Sats']] as [value, label] (value)}
-								<button
-									type="button"
-									role="tab"
-									disabled={creating}
-									aria-selected={unit === value}
-									class={`min-h-9 rounded-md px-4 font-semibold transition ${
-										unit === value
-											? 'bg-[#fffaf0] text-[#1f513a] shadow-sm dark:bg-[#161512] dark:text-[#8bc8a4]'
-											: 'text-[#5f5547] dark:text-[#c9bca7]'
-									}`}
-									onclick={() => setUnit(value as 'fiat' | 'sat')}
-								>
-									{label}
-								</button>
-							{/each}
-						</div>
+						<ChoiceTabs label="Amount unit" panel="amount-entry" value={unit} disabled={creating}
+							choices={[{ value: 'fiat', label: currency }, { value: 'sat', label: 'Sats' }]} onchange={setUnit} />
 					</div>
-					<AmountDisplay amount={amount || '0'} unit={unit === 'sat' ? 'sat' : currency} {precision} {hint} />
+					<div role="tabpanel" id="amount-entry" aria-labelledby={'amount-entry-' + unit}>
+						<AmountDisplay amount={amount || '0'} unit={unit === 'sat' ? 'sat' : currency} {precision} {hint} />
+					</div>
+					{#if denominationNotice}<p role="status" class="text-sm">{denominationNotice}</p>{/if}
 					<Keypad disabled={creating} {precision} onInput={applyInput} />
 					<label class="flex shrink-0 flex-col gap-1.5">
 						<span class="text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">Memo</span>
@@ -163,7 +162,7 @@
 						{/if}
 					</div>
 					{#if errorMsg}
-						<p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
+						<p role="alert" class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
 					{/if}
 					<BullFooter />
 				</div>

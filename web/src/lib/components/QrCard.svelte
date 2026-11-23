@@ -47,6 +47,6 @@
 		</Button>
 	</div>
 	{#if copy.forValue(value) === 'manual'}
-		<label>Copy this payment request manually<input readonly {value} onfocus={(event) => event.currentTarget.select()} /></label>
+		<label class="manual-copy">Copy this payment request manually<input readonly {value} onfocus={(event) => event.currentTarget.select()} /></label>
 	{/if}
 </div>

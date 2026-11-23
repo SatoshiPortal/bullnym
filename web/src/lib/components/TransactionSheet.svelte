@@ -1,10 +1,11 @@
 <script lang="ts">
 	// Ported from bullnym, which ported nostr-pos's TransactionSheet: the same
 	// markup and classes over posd sales.
+	import { router } from '$lib/router.svelte'
 	import { ChevronRight } from 'lucide-svelte'
 	import type { Sale } from '$lib/api'
 	import { formatFiat } from '$lib/money'
-	import { railLabel, saleAmountLabel, stageLabel, stateBorderTone } from '$lib/sale'
+	import { railLabel, saleAmountLabel, stageLabel, stateBorderTone, warningText } from '$lib/sale'
 
 	let { rows }: { rows: Sale[] } = $props()
 
@@ -23,28 +24,31 @@
 		<p
 			class="rounded-lg border border-[#d7c8b4] bg-[#fffaf0] py-12 text-center text-sm text-[#776b5a] dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]"
 		>
-			Completed sales will appear here.
+			Sales made on this device will appear here.
 		</p>
 	{:else}
 		<div class="space-y-1.5">
 			{#each rows as row (row.id)}
 				<a
-					class={`grid grid-cols-[1fr_auto] items-center gap-3 rounded-lg border-l-4 bg-[#fbf4e8] px-4 py-3 transition hover:bg-[#f3e7d6] dark:bg-[#26231d] ${stateBorderTone(row.state)}`}
+					class={`grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border-l-4 bg-[#fbf4e8] px-4 py-3 transition hover:bg-[#f3e7d6] dark:bg-[#26231d] ${stateBorderTone(row.state)}`}
 					href={`#/receipt/${row.id}`}
+					onclick={(event) => {
+						if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+						event.preventDefault()
+						router.go('/receipt/' + row.id)
+					}}
 				>
 					<div class="min-w-0">
-						<div class="flex items-baseline gap-2">
+						<div class="flex flex-wrap items-baseline gap-2">
 							<span class="font-black tabular-nums">{saleAmountLabel(row, (a, c) => formatFiat(a, c))}</span>
-							{#if row.state !== 'paid'}
-								<span class="text-xs font-semibold text-[#776b5a] dark:text-[#b9aa91]">{stageLabel(row)}</span>
-							{/if}
+							<span class="text-xs font-semibold text-[#776b5a] dark:text-[#b9aa91]">{stageLabel(row)}</span>
 						</div>
 						<div class="mt-0.5 truncate text-xs text-[#776b5a] dark:text-[#b9aa91]">
-							{when(row)} &middot; {railLabel(row.paid_rail)}{row.memo ? ` · ${row.memo}` : ''}
+							{when(row)}{row.paid_rail ? ' · ' + railLabel(row.paid_rail) : ''}{row.memo ? ` · ${row.memo}` : ''}
 						</div>
 						{#if row.state === 'in-progress' && row.warnings.length > 0}
-							<div class="mt-0.5 truncate text-xs font-semibold text-[#725315] dark:text-[#f0d38a]">
-								{row.warnings.join(' · ')}
+							<div class="mt-0.5 text-xs font-semibold text-[#725315] dark:text-[#f0d38a]">
+								{row.warnings.map(warningText).join(' ')}
 							</div>
 						{/if}
 					</div>

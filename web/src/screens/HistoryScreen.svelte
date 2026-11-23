@@ -48,15 +48,20 @@
 		window.addEventListener('storage', storage)
 		window.addEventListener('online', load)
 		window.addEventListener('focus', load)
-		window.addEventListener('pagehide', lock)
 		return () => {
 			window.removeEventListener('storage', storage)
 			window.removeEventListener('online', load)
 			window.removeEventListener('focus', load)
-			window.removeEventListener('pagehide', lock)
 		}
 	})
 
+	$effect(() => {
+		const leave = () => {
+			if (gate.kind !== 'waiting') lock()
+		}
+		window.addEventListener('pagehide', leave)
+		return () => window.removeEventListener('pagehide', leave)
+	})
 	async function load() {
 		const request = ++generation
 		const ids = localSaleIds()
@@ -97,7 +102,7 @@
 
 		<div class="mb-5">
 			<h1 class="font-display text-4xl uppercase tracking-display leading-none">Recent sales</h1>
-			<p class="mt-1 text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
+			<p class="mt-1 wrap-anywhere text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">
 				{session.checkout?.store.name ?? ''}
 			</p>
 		</div>
@@ -112,14 +117,15 @@
 					<div class="font-display text-xs uppercase tracking-[0.18em] text-[#776b5a] dark:text-[#b9aa91]">Cashier PIN</div>
 					<div
 						class="mt-1 min-h-[1em] font-display tabular-nums tracking-[0.3em] text-[clamp(2.5rem,10vw,4.5rem)] leading-[0.95]"
-						aria-label={`${pin.length} digits typed`}
+						role="status" aria-live="polite" aria-atomic="true"
 					>
-						{'•'.repeat(pin.length) || '—'}
+						<span aria-hidden="true">{'•'.repeat(pin.length) || '—'}</span>
+						<span class="sr-only">{pin.length} digits typed</span>
 					</div>
 				</div>
 				<Keypad disabled={gate.kind === 'checking' || gate.kind === 'waiting'} precision={null} onInput={(key) => (pin = applyPinInput(pin, key))} />
 				{#if gate.kind === 'refused' || gate.kind === 'waiting'}
-					<p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{gate.message}</p>
+					<p role="alert" class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{gate.message}</p>
 				{/if}
 				<Button disabled={gate.kind === 'checking' || gate.kind === 'waiting' || pin.length < MIN_PIN_DIGITS} onclick={unlock}>
 					{gate.kind === 'checking' ? 'Checking' : 'Show sales'}
