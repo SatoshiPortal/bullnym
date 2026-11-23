@@ -805,15 +805,18 @@ async fn reserved_sales_stay_private_and_seen_payments_never_expire() {
 	// Two open sales long past expiry and grace, with barkd unreachable.
 	// One had a payment arriving when it was last read: it never expires on
 	// a failed read. The other has no such evidence and expires.
+	// Each sale and its invoice in one statement, so the watcher never sees
+	// one without the other.
 	for (id, hash, seen) in [("seen", "cc", "NOW()"), ("unseen", "dd", "NULL")] {
 		svc.sql(&format!("
-			INSERT INTO sale (public_id, store_id, amount_sat, expires_at, created_at, issued_at)
-			SELECT '{id}', id, 2000, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'
-			FROM store
-		")).await.unwrap();
-		svc.sql(&format!("
+			WITH s AS (
+				INSERT INTO sale (public_id, store_id, amount_sat, expires_at, created_at, issued_at)
+				SELECT '{id}', id, 2000, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day',
+					NOW() - INTERVAL '1 day'
+				FROM store RETURNING id
+			)
 			INSERT INTO sale_payment (sale_id, rail, payment_hash, invoice, arriving_at)
-			SELECT id, 'lightning', '{}', 'lnbcrt1{id}', {seen} FROM sale WHERE public_id = '{id}'
+			SELECT id, 'lightning', '{}', 'lnbcrt1{id}', {seen} FROM s
 		", hash.repeat(32))).await.unwrap();
 	}
 	// A reservation left behind long ago, never issued, is deleted.
