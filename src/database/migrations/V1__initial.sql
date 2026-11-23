@@ -151,6 +151,9 @@ CREATE TABLE sale (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	expires_at TIMESTAMPTZ NOT NULL,
 	paid_at TIMESTAMPTZ,
+	-- When the sale's invoice was stored. Before, the sale is only reserved:
+	-- nobody sees it, and it is deleted if its invoice cannot be made.
+	issued_at TIMESTAMPTZ,
 	updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX sale_store_id_idx ON sale (store_id, id DESC);
@@ -211,6 +214,10 @@ CREATE TABLE sale_payment (
 	-- When barkd first showed an Ark transfer of this invoice awaiting
 	-- delivery. The sale stays in progress for it until barkd settles it.
 	awaiting_delivery_at TIMESTAMPTZ,
+	-- When barkd first reported a payment of this invoice arriving or
+	-- delivered while its sale was expiring. The sale then never expires
+	-- without barkd saying the invoice ended unpaid.
+	arriving_at TIMESTAMPTZ,
 	settled_at TIMESTAMPTZ,
 	UNIQUE (sale_id, rail)
 );

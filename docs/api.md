@@ -287,6 +287,7 @@ can read the remembered sale ids, and a sale id alone opens its sale.
   "onchain_address": "bc1p…",
   "paid_at": null,
   "paid_rail": null,
+  "updated_at": "2026-11-20T15:06:40Z",
   "received_sat": 0,
   "seen_sat": 60000,
   "progress": "onchain",
@@ -304,7 +305,11 @@ can read the remembered sale ids, and a sale id alone opens its sale.
   - `onchain_request` is `bitcoin:<address>?amount=<btc>`, and `null` until
     Bitcoin is added.
 - Without an invoice, because barkd or the Ark server is down, the sale is
-  refused with the fixed `503`.
+  refused with the fixed `503`. Until its invoice is stored a sale is only
+  reserved: no route shows it, nor the owner's history or CSV, and nothing
+  of it remains when the invoice fails.
+- `updated_at` is when the sale last changed. A client keeps the newer of
+  two snapshots, and never shows an ended sale as live again.
 - As in posd, each sale checks that its invoice names the store's Ark
   address as its hint. An invoice without it refuses the sale with `503`
   and `"the Ark server must allow Ark address hints: barkd returned the
@@ -323,14 +328,18 @@ can read the remembered sale ids, and a sale id alone opens its sale.
     `expires_at` until the payment confirms or explicitly goes away. An Ark
     payment stays `in-progress` until barkd settles it, with no deadline.
   - `paid`: an invoice barkd reports settled, or on-chain with 1
-    confirmation. barkd is the one source of truth for the invoice. The Ark
-    server only labels its rail afterwards: `lightning` if it granted HTLCs,
-    `ark` if not, and `paid_rail` stays `null` when the server cannot be
-    read. Paid is final, as in posd: the sale stays paid
-    whatever its address shows later.
+    confirmation. barkd is the one source of truth for the invoice: the
+    paid state is recorded first, and the Ark server labels the rail after,
+    `lightning` if it granted HTLCs, `ark` if not. `paid_rail` is `null`
+    until then, and the label is retried for 7 days when the server cannot
+    be read. Paid is final, as in posd: the sale stays paid, and an output
+    that confirmed stays credited, whatever its address shows later.
   - `expired` or `canceled`. A payment after that is a late payment
     (`late_payment`): it shows on this sale and never pays another one,
-    because no address is handed out twice.
+    because no address is handed out twice. An open sale past its expiry
+    for which barkd showed a payment arriving or awaiting delivery never
+    expires on a failed read or a restart, only on barkd's answer that the
+    invoice ended unpaid.
 - As in posd, a sale's address is watched for 7 days after the sale was
   created, whatever its state: an extra payment to a paid sale counts in
   its `received_sat`, above `amount_sat` (an overpayment), and a payment

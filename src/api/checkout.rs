@@ -259,7 +259,7 @@ pub async fn cancel_sale(
 	if let Some(hash) = watcher::invoice_hash(&app.public, sale.id).await? {
 		match watcher::cancel_invoice(&app.public, &hash).await {
 			Ok(()) => {},
-			Err(watcher::CancelError::PaymentArriving | watcher::CancelError::UnknownState) => {
+			Err(watcher::CancelError::PaymentArriving(_) | watcher::CancelError::UnknownState) => {
 				return Err(conflict("a payment is arriving for this sale"));
 			},
 			Err(watcher::CancelError::Unavailable(e)) => return Err(ApiError::Upstream(e)),

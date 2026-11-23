@@ -114,6 +114,23 @@ export function isLive(state: SaleState): boolean {
 	return state === 'open' || state === 'in-progress'
 }
 
+/**
+ * Whether a snapshot of sale `id` replaces the one shown. A screen never
+ * goes back: a snapshot of another sale, an older one, or a live one after
+ * the sale ended, from a late or reordered response, is ignored.
+ */
+export function acceptSale(current: Sale | null, next: Sale, id: string): boolean {
+	if (next.id !== id) return false
+	if (!current) return true
+	if (!isLive(current.state) && next.state !== current.state) return false
+	return Date.parse(next.updated_at) >= Date.parse(current.updated_at)
+}
+
+/** Whether Bitcoin can be added to the sale now: open, without an address, and at the store's minimum. */
+export function canAddBitcoin(sale: Sale | null, onchainMin: number | null): boolean {
+	return sale !== null && sale.state === 'open' && !sale.onchain_request && onchainMin !== null && sale.amount_sat >= onchainMin
+}
+
 /** "12-3456" from the last six characters of the sale ID, as in bullnym. */
 export function receiptNumber(id: string): string {
 	const clean = id.replace(/-/g, '').toUpperCase()
