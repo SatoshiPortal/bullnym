@@ -47,6 +47,27 @@ no funds and no private keys.
 The API is documented in [docs/api.md](docs/api.md), and
 `bullnym.default.toml` documents every setting.
 
+## Registration codes
+
+An operator with access to the service database can reserve a particular
+name or require codes for all new registrations. Set `DATABASE_URL` to that
+database in the operator's shell. For a service with extra reserved names,
+pass its config file with `--config` or set `BULLNYM_CONFIG` before issuing
+a name lock.
+
+```sh
+bullnym codes mint --count 50 --label "launch batch" --expires-days 30
+bullnym codes lock --nym alice --label "Alice" --expires-days 90
+bullnym codes list --unused
+bullnym codes revoke "$grant_id"
+```
+
+Minting or locking prints the secret code once. The database stores its hash.
+Listing returns grant IDs, operator notes, dates and the owner of a redeemed
+name. Use `--used` for redemptions or `--locked` for name reservations.
+A generic code is required only when `[registration] require_claim_code` is
+enabled. A live reservation always requires the code for that particular name.
+
 ## Requirements
 
 - **A Scuttle Ark server:**

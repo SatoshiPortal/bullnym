@@ -139,6 +139,7 @@ pub async fn test_config(
 		},
 		price: config::Price { url: String::new(), fixed_btc_price: Some(TEST_BTC_PRICE.into()), cache_secs: 60 },
 		nyms: Default::default(),
+		registration: Default::default(),
 		sales: config::Sales { poll_interval_ms: 200, ..Default::default() },
 		limits: Default::default(),
 		certification: Default::default(),
@@ -332,6 +333,11 @@ pub async fn sign(wallet: &bark::Wallet, message: &str, address: &ark::Address) 
 
 /// Registers `nym` for a new address of `wallet`.
 pub async fn register_nym(svc: &Service, wallet: &bark::Wallet, nym: &str) -> (ark::Address, (StatusCode, Value)) {
+	let (address, body) = signed_nym_request(wallet, nym).await;
+	(address, svc.call(Method::POST, "/api/v1/nym", None, Some(body)).await)
+}
+
+pub async fn signed_nym_request(wallet: &bark::Wallet, nym: &str) -> (ark::Address, Value) {
 	let address = wallet.new_address().await.unwrap();
 	let reg = NymRegistration {
 		nym: nym.into(),
@@ -340,10 +346,7 @@ pub async fn register_nym(svc: &Service, wallet: &bark::Wallet, nym: &str) -> (a
 		timestamp: chrono::Utc::now().timestamp() as u64,
 	};
 	let sig = sign(wallet, &reg.message(), &address).await;
-	let res = svc.call(Method::POST, "/api/v1/nym", None, Some(json!({
-		"registration": reg, "signature": sig,
-	}))).await;
-	(address, res)
+	(address, json!({ "registration": reg, "signature": sig }))
 }
 
 pub async fn register_store(

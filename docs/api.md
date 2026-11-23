@@ -57,6 +57,23 @@ check.
 }
 ```
 
+The request may include a top-level `claim_code` string alongside `registration`
+and `signature`. The signed message stays the same. The service ignores case,
+hyphens and whitespace in codes.
+
+A name reserved by the operator requires its matching code. For other names,
+registration is open by default. With `registration.require_claim_code = true`,
+any available name requires an unused generic code. Open registration ignores
+a supplied code for an unrestricted name. Successful redemption consumes the
+code in the same transaction as registration. A rejected registration leaves
+the code available.
+
+Missing required codes return HTTP 403 with `code` set to `ClaimCodeRequired`.
+An unknown, used, revoked, expired or incorrectly targeted code returns HTTP
+403 with `ClaimCodeInvalid`. Both responses include an `error` message.
+Existing name and address conflicts keep their HTTP 409 response. The
+service's reserved names and brand names always remain unavailable.
+
 The signed message:
 
 ```text

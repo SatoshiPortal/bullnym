@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod ark;
+pub mod claim_codes;
 pub mod config;
 pub mod database;
 pub mod error;

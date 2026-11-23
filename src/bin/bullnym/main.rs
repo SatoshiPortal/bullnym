@@ -7,6 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 use bullnym::config::Config;
 
+mod codes;
+
 
 #[derive(Parser)]
 #[command(name = "bullnym", version, about = "Lightning Address and store service for Ark wallets")]
@@ -24,6 +26,11 @@ enum Command {
 	Start,
 	/// Checks the config and prints it.
 	CheckConfig,
+	/// Manage single-use nym registration grants using DATABASE_URL.
+	Codes {
+		#[command(subcommand)]
+		action: codes::Action,
+	},
 }
 
 #[tokio::main]
@@ -42,13 +49,14 @@ async fn main() {
 
 async fn inner_main() -> anyhow::Result<()> {
 	let cli = Cli::parse();
-	let cfg = Config::load(cli.config.as_deref())?;
 	match cli.command {
 		Command::CheckConfig => {
+			let cfg = Config::load(cli.config.as_deref())?;
 			println!("{}", serde_json::to_string_pretty(&cfg)?);
 			Ok(())
 		},
-		Command::Start => start(cfg).await,
+		Command::Start => start(Config::load(cli.config.as_deref())?).await,
+		Command::Codes { action } => codes::run(action, cli.config.as_deref()).await,
 	}
 }
 

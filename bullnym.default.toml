@@ -62,6 +62,11 @@ cache_secs = 60
 # fixed_btc_price = "62500000.00"
 
 # The Lightning Address.
+[registration]
+# Require a single-use operator code for every new nym. A lock on a
+# specific name always requires its matching code.
+require_claim_code = false
+
 [nyms]
 # Names nobody can register, on top of the built-in route and brand names.
 reserved = []

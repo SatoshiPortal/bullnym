@@ -170,6 +170,12 @@ impl Nyms {
 	pub fn invoice_expiry(&self) -> Duration { Duration::from_secs(self.invoice_expiry_secs) }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Registration {
+	#[serde(default)]
+	pub require_claim_code: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
 	pub network: Network,
@@ -181,6 +187,8 @@ pub struct Config {
 	/// The bitcoind that watches on-chain payments.
 	pub bitcoind: crate::rails::onchain::BitcoindConfig,
 	pub price: Price,
+	#[serde(default)]
+	pub registration: Registration,
 	#[serde(default)]
 	pub nyms: Nyms,
 	#[serde(default)]
@@ -221,13 +229,24 @@ impl Default for Watcher {
 impl Config {
 	/// Loads a config file, then applies `BULLNYM__` environment variables, for
 	/// example `BULLNYM__POSTGRES__HOST`.
-	pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
+	fn settings(path: Option<&Path>) -> anyhow::Result<config::Config> {
 		let mut builder = config::Config::builder();
 		if let Some(path) = path {
 			builder = builder.add_source(config::File::from(path));
 		}
-		let cfg: Config = builder.add_source(config::Environment::with_prefix("BULLNYM").separator("__"))
-			.build().context("failed to read the config")?
+		builder.add_source(config::Environment::with_prefix("BULLNYM").separator("__"))
+			.build().context("failed to read the config")
+	}
+
+	/// Name locks use the service's reservations without needing a running server.
+	pub fn reserved_nyms(path: Option<&Path>) -> anyhow::Result<Vec<String>> {
+		#[derive(Deserialize)]
+		struct Names { #[serde(default)] nyms: Nyms }
+		Ok(Self::settings(path)?.try_deserialize::<Names>()?.nyms.reserved)
+	}
+
+	pub fn load(path: Option<&Path>) -> anyhow::Result<Config> {
+		let cfg: Config = Self::settings(path)?
 			.try_deserialize().context("the config is not valid")?;
 		cfg.validate()?;
 		Ok(cfg)
@@ -272,6 +291,7 @@ mod test {
 				url: "http://c".into(), cookie: None, rpc_user: None, rpc_password: None, wallet: "w".into(),
 			},
 			price: Price { url: String::new(), fixed_btc_price: None, cache_secs: 1 },
+			registration: Registration::default(),
 			nyms,
 			sales,
 			limits: Default::default(),
