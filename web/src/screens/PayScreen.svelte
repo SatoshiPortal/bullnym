@@ -146,7 +146,10 @@
 					onaction={newSale}
 				/>
 			{:else if sale.state === 'expired'}
-				<TerminalPanel icon="×" tone="err" title="Expired" detail="This sale expired without payment. Returning..." />
+				<TerminalPanel icon="×" tone="err" title="Expired"
+					detail={sale.received_sat > 0
+						? `This sale expired with ${formatSats(sale.received_sat)} received. Returning...`
+						: 'This sale expired without payment. Returning...'} />
 			{:else if sale.state === 'canceled'}
 				<TerminalPanel icon="×" tone="err" title="Canceled" detail="This sale was canceled." actionLabel="Back" onaction={newSale} />
 			{:else if sale.state === 'in-progress'}
@@ -158,7 +161,7 @@
 						{#each progress?.lines ?? [] as line (line)}
 							<p class="mt-1 text-sm">{line}</p>
 						{/each}
-						<p class="mt-1 text-sm">You can start a new sale; this one stays in history and completes on its own.</p>
+						<p class="mt-1 text-sm">You can start a new sale. The owner can follow this payment in the wallet.</p>
 					</div>
 					<Button variant="secondary" onclick={newSale}>New Sale</Button>
 				</div>

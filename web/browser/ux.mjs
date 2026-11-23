@@ -1,3 +1,4 @@
+import { decodeQr } from './journeys.mjs'
 import { screenStates } from './screens.mjs'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
@@ -150,6 +151,9 @@ export const uxJourneys = {
 		await open(page, '#/pay/live')
 		await page.getByText(note).waitFor()
 		await layout(page, 'pay-long', errors)
+		const qr = await page.getByRole('img', { name: 'Lightning payment code' }).boundingBox()
+		if (!qr || qr.x < 0 || qr.x + qr.width > 321) errors.push('Payment QR clipped')
+		assert.equal(await decodeQr(page), live.lightning_request)
 		live.state = 'in-progress'
 		live.progress = 'onchain'
 		await page.getByText(/in the mempool/).waitFor()
@@ -167,6 +171,20 @@ export const uxJourneys = {
 		await page.getByText('Landscape memo').waitFor()
 		assert.equal(fixture.sales.get('sale-3').amount_sat, 999999999)
 		finish(errors)
+	},
+	async PARTIAL_EXPIRY({ page, fixture }) {
+		const row = sale('partial-expiry', { state: 'open', amount_sat: 60000, received_sat: 15000 })
+		fixture.sales.set(row.id, row)
+		await open(page, '#/pay/partial-expiry')
+		await page.getByText(/45,000 sats short/).waitFor()
+		row.state = 'expired'
+		await page.getByRole('heading', { name: 'Expired' }).or(page.getByText('Expired', { exact: true })).first().waitFor()
+		const detail = await page.locator('main').innerText()
+		assert.match(detail, /15,000 sats/)
+		assert.doesNotMatch(detail, /without payment/)
+		await page.getByRole('tab', { name: 'Sats' }).waitFor()
+		await open(page, '#/receipt/partial-expiry')
+		await page.locator('dd', { hasText: '15,000 sats' }).waitFor()
 	},
 	async RECEIPT_DETAILS({ page, fixture }) {
 		const errors = []
@@ -232,6 +250,7 @@ export const uxJourneys = {
 		await page.getByText(/Ark payment is being delivered/).waitFor()
 		const motion = await page.locator('main svg path').evaluateAll((paths) => paths.some((p) => getComputedStyle(p).animationName !== 'none'))
 		if (motion) errors.push('Pending spinner animates with reduced motion')
+		assert.doesNotMatch(await page.locator('main').innerText(), /completes on its own/)
 		await checkpoint(page, 'ark-pending', true)
 		Object.assign(row, paid)
 		await page.getByRole('button', { name: 'Receipt' }).waitFor()
