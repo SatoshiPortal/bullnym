@@ -386,6 +386,19 @@ export const journeys = {
 		await open(page, '#/settings')
 		await visible(page, '$25.99 USD')
 	},
+	async ONCHAIN_QUOTE_INTERRUPTED({ page, fixture }) {
+		const row = sale('price-interrupted', { amount_sat: 60000 })
+		fixture.sales.set(row.id, row)
+		await open(page, '#/pay/' + row.id)
+		await click(page, 'On-chain')
+		await page.getByRole('dialog').waitFor()
+		fixture.usdPriceCentsPerBtc = 0
+		await click(page, 'Continue')
+		await visible(page, 'On-chain eligibility is unavailable')
+		assert.equal(row.onchain_address, null)
+		await click(page, 'Lightning')
+		await button(page, 'Copy Lightning invoice').waitFor()
+	},
 	async ONCHAIN_USD_UPDATE({ page, fixture }) {
 		fixture.store.onchain_min_usd = '49.50'
 		const row = sale('policy', { amount_sat: 50000 })

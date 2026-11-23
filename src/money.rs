@@ -7,6 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use bitcoin::Amount;
+use num_bigint::BigUint;
 
 
 /// The largest amount in sats the service takes anywhere: a sale, a
@@ -48,6 +49,15 @@ pub struct DecimalError(String);
 
 const MAX_SCALE: u32 = 18;
 
+/// Parse a merchant's dollar minimum without rounding a fraction of a cent.
+pub fn parse_usd_cents(s: &str) -> Result<i64, DecimalError> {
+	let amount: Decimal = s.parse()?;
+	if amount.scale > 2 || amount.integer_part() >= MAX_FIAT_INTEGER {
+		return Err(DecimalError(s.to_owned()));
+	}
+	Ok((amount.value * 10u128.pow(2 - amount.scale)) as i64)
+}
+
 impl Decimal {
 	pub fn new(value: u128, scale: u32) -> Decimal {
 		Decimal { value, scale }
@@ -88,6 +98,17 @@ impl Decimal {
 		let den = btc_price.value.checked_mul(10u128.checked_pow(self.scale)?)?;
 		let sat = num.checked_add(den / 2)? / den;
 		Some(Amount::from_sat(u64::try_from(sat).ok()?))
+	}
+
+	/// At this USD/BTC price, the first whole satoshi amount that meets the dollar minimum.
+	pub fn sats_for_usd_cents(&self, cents: i64) -> Option<u64> {
+		if self.is_zero() { return None; }
+		// There are 10^6 sats per cent at a price of one dollar per bitcoin.
+		// A high-precision price can require more than 128 bits before division.
+		let scale = 10u128.checked_pow(6u32.checked_add(self.scale)?)?;
+		let numerator = BigUint::from(u64::try_from(cents).ok()?) * scale;
+		let price = BigUint::from(self.value);
+		u64::try_from((numerator + &price - 1u32) / price).ok()
 	}
 }
 
@@ -161,6 +182,23 @@ mod test {
 		assert_eq!(d("1").fiat_to_sat(&d("300000")), Some(Amount::from_sat(333)));
 		assert_eq!(d("2").fiat_to_sat(&d("300000")), Some(Amount::from_sat(667)));
 		assert_eq!(d("1").fiat_to_sat(&d("0")), None);
+	}
+
+	#[test]
+	fn dollar_minimum_is_exact_cents_and_rounds_sats_up() {
+		assert_eq!(parse_usd_cents("25.99"), Ok(2599));
+		assert_eq!(parse_usd_cents("25.9"), Ok(2590));
+		assert_eq!(parse_usd_cents("0"), Ok(0));
+		for s in ["0.001", "-1", "1000000000000000", "NaN"] {
+			assert!(parse_usd_cents(s).is_err());
+		}
+		assert_eq!(d("300000").sats_for_usd_cents(1), Some(4));
+		assert_eq!(d("100000.00").sats_for_usd_cents(2599), Some(25_990));
+		assert_eq!(d("0").sats_for_usd_cents(2599), None);
+		let large = parse_usd_cents("4000000000000.00").unwrap();
+		for rate in ["300000", "300000.000000000000000000", "300000.000000000000000001"] {
+			assert_eq!(d(rate).sats_for_usd_cents(large), Some(1_333_333_333_333_334));
+		}
 	}
 
 	#[test]

@@ -79,6 +79,9 @@ pub struct Sales {
 	/// The on-chain minimum for a new store, in sats.
 	#[serde(default = "default_onchain_min_sat")]
 	pub default_onchain_min_sat: u64,
+	/// When configured, new stores use this USD amount for the on-chain minimum.
+	#[serde(default)]
+	pub default_onchain_min_usd: Option<String>,
 	/// How often the watcher checks open sales.
 	#[serde(default = "default_poll_interval_ms")]
 	pub poll_interval_ms: u64,
@@ -114,6 +117,7 @@ impl Default for Sales {
 		Sales {
 			expiry_secs: default_sale_expiry_secs(),
 			default_onchain_min_sat: default_onchain_min_sat(),
+			default_onchain_min_usd: None,
 			poll_interval_ms: default_poll_interval_ms(),
 			onchain_watch_secs: default_onchain_watch_secs(),
 			low_fee_ratio: default_low_fee_ratio(),
@@ -240,6 +244,9 @@ impl Config {
 		}
 		if self.sales.default_onchain_min_sat > MAX_SAT {
 			anyhow::bail!("sales.default_onchain_min_sat must be at most {} (21,000,000 BTC)", MAX_SAT);
+		}
+		if let Some(usd) = &self.sales.default_onchain_min_usd {
+			crate::money::parse_usd_cents(usd).context("invalid sales.default_onchain_min_usd")?;
 		}
 		Ok(())
 	}

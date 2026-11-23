@@ -79,7 +79,7 @@
 			option = 'idle'
 		} catch (error) {
 			if (eligible && option === 'requesting') option = 'failed'
-			if (error instanceof ApiError && (error.status === 400 || error.status === 409)) void refreshCheckout()
+			if (error instanceof ApiError && [400, 409, 503].includes(error.status)) void refreshCheckout()
 			reader.refresh()
 		}
 	}

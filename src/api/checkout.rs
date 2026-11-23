@@ -60,7 +60,7 @@ pub async fn store(
 ) -> ApiResult<Json<Value>> {
 	check_lookup(&app, &caller, &nym).await?;
 	let store = store_of(&app, &nym).await?;
-	Ok(Json(json!({ "store": StoreView::new(&app, &store) })))
+	Ok(Json(json!({ "store": StoreView::new(&app, &store).await })))
 }
 
 /// `GET /api/v1/checkout/<nym>/rate`.
