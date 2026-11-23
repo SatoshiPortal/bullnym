@@ -82,7 +82,7 @@ pub async fn admit(tx: &tokio_postgres::Transaction<'_>, scopes: &[String]) -> a
 	}
 	let row = tx.query_one("
 		WITH locked AS (SELECT locked_until FROM pin_failure WHERE scope = ANY($1) ORDER BY scope FOR UPDATE)
-		SELECT coalesce(ceil(max(extract(epoch FROM locked_until - NOW()))), 0)::BIGINT AS secs FROM locked
+		SELECT coalesce(ceil(max(extract(epoch FROM locked_until - clock_timestamp()))), 0)::BIGINT AS secs FROM locked
 	", &[&sorted]).await?;
 	Ok(row.get::<_, i64>("secs").max(0))
 }
@@ -91,21 +91,23 @@ pub async fn admit(tx: &tokio_postgres::Transaction<'_>, scopes: &[String]) -> a
 /// in the transaction that admitted the check. Returns the longest lock, in
 /// seconds.
 pub async fn record_failure(tx: &tokio_postgres::Transaction<'_>, scopes: &[String]) -> anyhow::Result<i64> {
+	// Start the cooldown after verification. The transaction also includes
+	// time spent waiting for the counters and verifying the PIN hash.
 	let mut longest = 0;
 	for scope in scopes {
 		let failures: i32 = tx.query_one("
 			INSERT INTO pin_failure (scope, failures) VALUES ($1, 1)
 			ON CONFLICT (scope) DO UPDATE SET
 				failures = CASE
-					WHEN pin_failure.updated_at < NOW() - make_interval(secs => $2) THEN 1
+					WHEN pin_failure.updated_at < statement_timestamp() - make_interval(secs => $2) THEN 1
 					ELSE pin_failure.failures + 1
 				END,
-				updated_at = NOW()
+				updated_at = statement_timestamp()
 			RETURNING failures
 		", &[scope, &(FAILURE_MEMORY_SECS as f64)]).await?.get("failures");
 		let secs = lock_secs(failures);
 		tx.execute("
-			UPDATE pin_failure SET locked_until = NOW() + make_interval(secs => $2) WHERE scope = $1
+			UPDATE pin_failure SET locked_until = statement_timestamp() + make_interval(secs => $2) WHERE scope = $1
 		", &[scope, &(secs as f64)]).await?;
 		longest = longest.max(secs);
 	}
