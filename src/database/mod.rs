@@ -226,6 +226,7 @@ pub struct Sale {
 	pub created_at: DateTime<Utc>,
 	pub expires_at: DateTime<Utc>,
 	pub paid_at: Option<DateTime<Utc>>,
+	pub updated_at: DateTime<Utc>,
 	pub lightning_invoice: Option<String>,
 	pub onchain_address: Option<String>,
 }
@@ -236,7 +237,7 @@ pub const SALE_SELECT: &str = "
 		s.currency, s.btc_price, s.memo, s.state, s.progress, s.notice, s.paid_rail,
 		s.received_sat, coalesce(oc.pending_sat, 0) AS seen_sat,
 		coalesce(oc.warnings, '{}') AS warnings, s.created_at, s.expires_at, s.paid_at,
-		ln.invoice AS lightning_invoice, oc.onchain_address
+		s.updated_at, ln.invoice AS lightning_invoice, oc.onchain_address
 	FROM sale s
 	LEFT JOIN sale_payment ln ON ln.sale_id = s.id AND ln.rail = 'lightning'
 	LEFT JOIN sale_payment oc ON oc.sale_id = s.id AND oc.rail = 'onchain'
@@ -263,6 +264,7 @@ impl Sale {
 			created_at: row.get("created_at"),
 			expires_at: row.get("expires_at"),
 			paid_at: row.get("paid_at"),
+			updated_at: row.get("updated_at"),
 			lightning_invoice: row.get("lightning_invoice"),
 			onchain_address: row.get("onchain_address"),
 		}

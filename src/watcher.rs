@@ -105,6 +105,10 @@ pub async fn run_once(app: &App, check_onchain: bool) -> anyhow::Result<()> {
 			Ok(c) => changed |= c,
 			Err(e) => tracing::warn!("on-chain pass failed: {:#}", e),
 		}
+		match label_rails(app).await {
+			Ok(c) => changed |= c,
+			Err(e) => tracing::warn!("rail label pass failed: {:#}", e),
+		}
 	}
 	match expire_sales(app).await {
 		Ok(c) => changed |= c,
@@ -148,18 +152,9 @@ async fn observe(app: &App, p: &WatchedPayment) -> anyhow::Result<Option<Observa
 				// Settled by an Ark transfer, not yet in the owner's mailbox
 				// as barkd sees it: in progress until barkd settles it.
 				ForwardStatus::AwaitingDelivery => awaiting_delivery(p.sale_state, p.awaiting_delivery),
-				// barkd settled it: paid. The Ark server only labels the rail.
-				ForwardStatus::Delivered(amount) => {
-					// Only a Lightning payment gets HTLCs.
-					let via_ark = match app.ark.has_htlcs(hash).await {
-						Ok(htlcs) => Some(!htlcs),
-						Err(e) => {
-							tracing::warn!("invoice {} is paid; the Ark server could not say how: {:#}", hash, e);
-							None
-						},
-					};
-					Some(Observation::invoice(amount, true, false, via_ark))
-				},
+				// barkd settled it: paid. The rail is labeled once that is
+				// recorded (see [label_rails]).
+				ForwardStatus::Delivered(amount) => Some(Observation::invoice(amount, true, false, None)),
 				// Canceled or expired unpaid: stop checking it.
 				ForwardStatus::Gone => Some(Observation::invoice(Amount::ZERO, true, false, None)),
 			})
@@ -240,11 +235,51 @@ async fn record(app: &App, p: &WatchedPayment, obs: &Observation) -> anyhow::Res
 	tx.commit().await?;
 
 	if next == Some(SaleState::Paid) {
-		let rail = obs.paid_rail(p.rail).map_or("an unknown rail", |r| r.as_str());
-		tracing::info!("sale {} paid by {}", p.sale_public_id, rail);
+		tracing::info!("sale {} paid by its invoice", p.sale_public_id);
 		sale_ended(&app.watch, p.sale_id).await;
+		if let Some(hash) = &p.payment_hash {
+			if let Err(e) = label_rail(app, p.sale_id, hash).await {
+				tracing::warn!("sale {} is paid; the Ark server could not say how yet: {:#}", p.sale_public_id, e);
+			}
+		}
 	}
 	Ok(next.is_some())
+}
+
+/// Labels the rail of a sale paid by its invoice, from the Ark server: only
+/// a Lightning payment gets HTLCs, so an invoice without them was paid by
+/// an Ark transfer. The sale is paid already; the label never holds it
+/// back.
+async fn label_rail(app: &App, sale_id: i64, payment_hash: &str) -> anyhow::Result<()> {
+	let rail = if app.ark.has_htlcs(payment_hash).await? { Rail::Lightning } else { Rail::Ark };
+	let conn = app.watch.db.conn().await?;
+	conn.execute("
+		UPDATE sale SET paid_rail = $2, updated_at = NOW() WHERE id = $1 AND paid_rail IS NULL
+	", &[&sale_id, &rail]).await?;
+	Ok(())
+}
+
+/// Labels the sales paid by their invoice whose rail the Ark server could
+/// not give when they were paid, for 7 days.
+async fn label_rails(app: &App) -> anyhow::Result<bool> {
+	let rows = {
+		let conn = app.watch.db.conn().await?;
+		conn.query("
+			SELECT s.id, s.public_id, p.payment_hash FROM sale s
+			JOIN sale_payment p ON p.sale_id = s.id AND p.rail = 'lightning'
+			WHERE s.state = 'paid' AND s.paid_rail IS NULL AND s.paid_at > NOW() - INTERVAL '7 days'
+				AND p.settled_at IS NOT NULL AND p.received_sat > 0 AND p.payment_hash IS NOT NULL
+		", &[]).await?
+	};
+	let mut changed = false;
+	for row in rows {
+		let hash: String = row.get("payment_hash");
+		match label_rail(app, row.get("id"), &hash).await {
+			Ok(()) => changed = true,
+			Err(e) => tracing::debug!("sale {} has no rail label yet: {:#}", row.get::<_, String>("public_id"), e),
+		}
+	}
+	Ok(changed)
 }
 
 /// An on-chain payment the watcher follows.
@@ -256,6 +291,8 @@ struct WatchedAddress {
 	received_sat: i64,
 	pending_sat: i64,
 	warnings: Vec<String>,
+	/// The sale is paid: its confirmed outputs stay credited.
+	paid: bool,
 }
 
 /// The on-chain payments to follow, as in posd: every sale address for 7
@@ -268,7 +305,7 @@ async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 	let conn = app.watch.db.conn().await?;
 	let rows = conn.query("
 		SELECT p.id AS payment_id, s.id AS sale_id, s.public_id, p.onchain_address,
-			p.received_sat, p.pending_sat, p.warnings
+			p.received_sat, p.pending_sat, p.warnings, s.state = 'paid' AS paid
 		FROM sale_payment p
 		JOIN sale s ON s.id = p.sale_id
 		WHERE p.rail = 'onchain' AND (
@@ -285,6 +322,7 @@ async fn watched_addresses(app: &App) -> anyhow::Result<Vec<WatchedAddress>> {
 		received_sat: r.get("received_sat"),
 		pending_sat: r.get("pending_sat"),
 		warnings: r.get("warnings"),
+		paid: r.get("paid"),
 	}).collect())
 }
 
@@ -315,7 +353,10 @@ async fn watch_onchain(app: &App) -> anyhow::Result<bool> {
 		let mut records = Vec::with_capacity(all.len());
 		for txid in &all {
 			match app.watch.chain.observe_tx(txid, &address, &all).await {
-				Ok(obs) => records.extend(stages::classify(known.get(txid), &obs, &fees)),
+				Ok(obs) => records.extend(
+					stages::classify(known.get(txid), &obs, &fees)
+						.map(|r| stages::keep_credit(known.get(txid), r, w.paid)),
+				),
 				Err(e) => {
 					tracing::warn!("check of transaction {} failed: {:#}", txid, e);
 					if let Some(k) = known.get(txid) {
@@ -456,7 +497,7 @@ pub async fn invoice_hash(b: &Backends, sale_id: i64) -> anyhow::Result<Option<S
 pub enum CancelError {
 	/// barkd reports a payment arriving, settled by Ark, or delivered.
 	#[error("a payment is arriving")]
-	PaymentArriving,
+	PaymentArriving(ForwardStatus),
 	/// barkd reports a state the service does not know.
 	#[error("barkd reports a state this service does not know")]
 	UnknownState,
@@ -477,11 +518,11 @@ pub async fn cancel_invoice(b: &Backends, hash: &str) -> Result<(), CancelError>
 				Ok(ForwardStatus::Gone) => Ok(()),
 				Ok(ForwardStatus::Unpaid) | Err(_) => Err(CancelError::Unavailable(e)),
 				Ok(ForwardStatus::Unknown) => Err(CancelError::UnknownState),
-				Ok(_) => Err(CancelError::PaymentArriving),
+				Ok(status) => Err(CancelError::PaymentArriving(status)),
 			},
 		},
-		ForwardStatus::Arriving | ForwardStatus::AwaitingDelivery | ForwardStatus::Delivered(_) => {
-			Err(CancelError::PaymentArriving)
+		status @ (ForwardStatus::Arriving | ForwardStatus::AwaitingDelivery | ForwardStatus::Delivered(_)) => {
+			Err(CancelError::PaymentArriving(status))
 		},
 		ForwardStatus::Unknown => Err(CancelError::UnknownState),
 	}
@@ -510,12 +551,22 @@ pub async fn sale_ended(b: &Backends, sale_id: i64) {
 async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 	let rows = {
 		let conn = app.watch.db.conn().await?;
+		// A sale reserved but never issued, because the process stopped
+		// before its invoice was stored, was never seen: delete it.
+		conn.execute("
+			DELETE FROM sale_payment WHERE sale_id IN (SELECT id FROM sale
+				WHERE issued_at IS NULL AND expires_at < NOW() - make_interval(secs => $1))
+		", &[&DELIVERY_GRACE_SECS]).await?;
+		conn.execute("
+			DELETE FROM sale WHERE issued_at IS NULL AND expires_at < NOW() - make_interval(secs => $1)
+		", &[&DELIVERY_GRACE_SECS]).await?;
 		conn.query("
-			SELECT s.id, s.public_id, p.payment_hash,
-				s.expires_at < NOW() - make_interval(secs => $1) AS past_grace
+			SELECT s.id, s.public_id, p.id AS payment_id, p.payment_hash,
+				s.expires_at < NOW() - make_interval(secs => $1) AS past_grace,
+				(p.awaiting_delivery_at IS NOT NULL OR p.arriving_at IS NOT NULL) AS payment_seen
 			FROM sale s
 			LEFT JOIN sale_payment p ON p.sale_id = s.id AND p.rail = 'lightning' AND p.settled_at IS NULL
-			WHERE s.state = 'open' AND s.expires_at < NOW()
+			WHERE s.state = 'open' AND s.issued_at IS NOT NULL AND s.expires_at < NOW()
 		", &[&DELIVERY_GRACE_SECS]).await?
 	};
 	let mut changed = false;
@@ -524,7 +575,13 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 		let past_grace: bool = row.get("past_grace");
 		if let Some(hash) = row.get::<_, Option<String>>("payment_hash") {
 			let canceled = cancel_invoice(&app.watch, &hash).await;
-			if !expires_now(&canceled, past_grace) {
+			let seen = row.get::<_, Option<bool>>("payment_seen").unwrap_or(false);
+			if let Err(CancelError::PaymentArriving(status)) = &canceled {
+				// Remembered, so a later failed read or a restart never
+				// expires the sale.
+				remember_payment(app, row.get("payment_id"), *status).await?;
+			}
+			if !expires_now(&canceled, past_grace, seen) {
 				continue;
 			}
 			if let Err(e) = canceled {
@@ -542,14 +599,31 @@ async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 /// Whether an open sale past its expiry expires now, given how canceling
 /// its invoice went. barkd showing a payment arriving, awaiting delivery
 /// or delivered is positive evidence: the sale waits for it, however long.
-/// Without an answer, or with a state the service does not know, it waits
-/// up to the delivery grace.
-pub fn expires_now(canceled: &Result<(), CancelError>, past_grace: bool) -> bool {
+/// `seen`: barkd showed such a payment before; then only barkd's answer
+/// that the invoice ended unpaid expires the sale. Otherwise, without an
+/// answer, or with a state the service does not know, it waits up to the
+/// delivery grace.
+pub fn expires_now(canceled: &Result<(), CancelError>, past_grace: bool, seen: bool) -> bool {
 	match canceled {
 		Ok(()) => true,
-		Err(CancelError::PaymentArriving) => false,
-		Err(CancelError::UnknownState | CancelError::Unavailable(_)) => past_grace,
+		Err(CancelError::PaymentArriving(_)) => false,
+		Err(CancelError::UnknownState | CancelError::Unavailable(_)) => past_grace && !seen,
 	}
+}
+
+/// Records a payment barkd showed for an invoice while its sale was
+/// expiring: an Ark payment awaiting delivery as on every pass (which puts
+/// the sale in progress on the next one), any other as arriving.
+async fn remember_payment(app: &App, payment_id: i64, status: ForwardStatus) -> anyhow::Result<()> {
+	let column = match status {
+		ForwardStatus::AwaitingDelivery => "awaiting_delivery_at",
+		_ => "arriving_at",
+	};
+	let conn = app.watch.db.conn().await?;
+	conn.execute(&format!(
+		"UPDATE sale_payment SET {0} = coalesce({0}, NOW()) WHERE id = $1", column,
+	), &[&payment_id]).await?;
+	Ok(())
 }
 
 pub async fn expire_sale(conn: &impl GenericClient, sale_id: i64) -> anyhow::Result<u64> {
@@ -745,13 +819,20 @@ mod test {
 	#[test]
 	fn a_positive_pending_answer_never_expires_a_sale() {
 		let unavailable = || Err(CancelError::Unavailable(anyhow::anyhow!("barkd is down")));
-		assert!(!expires_now(&Err(CancelError::PaymentArriving), false));
-		assert!(!expires_now(&Err(CancelError::PaymentArriving), true));
-		assert!(!expires_now(&unavailable(), false));
-		assert!(expires_now(&unavailable(), true));
-		assert!(!expires_now(&Err(CancelError::UnknownState), false));
-		assert!(expires_now(&Err(CancelError::UnknownState), true));
-		assert!(expires_now(&Ok(()), false));
+		let arriving = || Err(CancelError::PaymentArriving(ForwardStatus::AwaitingDelivery));
+		for seen in [false, true] {
+			assert!(!expires_now(&arriving(), false, seen));
+			assert!(!expires_now(&arriving(), true, seen));
+			assert!(!expires_now(&unavailable(), false, seen));
+			assert!(!expires_now(&Err(CancelError::UnknownState), false, seen));
+			assert!(expires_now(&Ok(()), false, seen), "barkd says it ended unpaid");
+		}
+		assert!(expires_now(&unavailable(), true, false));
+		assert!(expires_now(&Err(CancelError::UnknownState), true, false));
+		// A payment seen before, then a failed read or a restart: the sale
+		// never expires on that.
+		assert!(!expires_now(&unavailable(), true, true));
+		assert!(!expires_now(&Err(CancelError::UnknownState), true, true));
 		// The next pass reads barkd's answer: in progress, and recorded.
 		let o = awaiting_delivery(SaleState::Open, false).unwrap();
 		assert_eq!(next_state(SaleState::Open, 1000, &o), Some(SaleState::InProgress));

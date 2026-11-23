@@ -274,6 +274,12 @@ impl Service {
 		}
 	}
 
+	/// Waits until the sale is paid with its rail labeled. The label comes
+	/// after the paid state is recorded.
+	pub async fn wait_paid_rail(&self, id: &str) -> Value {
+		self.wait_sale(id, SALE_TIMEOUT, |s| s["state"] == "paid" && !s["paid_rail"].is_null(), "paid, rail labeled").await
+	}
+
 	/// Runs a SQL statement on the service's database.
 	pub async fn sql(&self, statement: &str) -> Result<u64, tokio_postgres::Error> {
 		let conn = self.app.public.db.conn().await.unwrap();

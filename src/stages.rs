@@ -182,6 +182,16 @@ pub fn classify(prev: Option<&TxRecord>, obs: &TxObservation, fees: &FeePolicy) 
 	Some(rec)
 }
 
+/// What the service keeps about a transaction paying a paid sale: an
+/// output once confirmed stays credited, as the sale stays paid. A later
+/// answer that it has fewer confirmations, or none, changes neither.
+pub fn keep_credit(prev: Option<&TxRecord>, rec: TxRecord, paid: bool) -> TxRecord {
+	match prev {
+		Some(p) if paid && p.status == TxStatus::Confirmed && rec.status != TxStatus::Confirmed => p.clone(),
+		_ => rec,
+	}
+}
+
 /// A warning about an in-progress payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -437,6 +447,23 @@ mod test {
 		assert_eq!(r.status, TxStatus::Seen);
 		let r = classify(Some(&c), &obs(0, Mempool::Unknown), &fees()).unwrap();
 		assert_eq!(r.status, TxStatus::Seen, "no confirmation: it no longer counts");
+	}
+
+	#[test]
+	fn a_paid_sale_keeps_its_confirmed_credit() {
+		let first = TxRecord { txid: "a".into(), amount: Amount::from_sat(60_000), ..first(&obs(1, Mempool::Unknown)) };
+		// The first output reads unconfirmed again while a second one
+		// confirms: the paid sale keeps both, 70,000.
+		let again = classify(Some(&first), &obs(0, in_mempool(30.0, false)), &fees()).unwrap();
+		let kept = keep_credit(Some(&first), again.clone(), true);
+		assert_eq!(kept.status, TxStatus::Confirmed);
+		let second = TxRecord { txid: "b".into(), amount: Amount::from_sat(10_000), ..first.clone() };
+		assert_eq!(summarize(&[kept, second]).confirmed, Amount::from_sat(70_000));
+		// A sale not paid yet follows bitcoind: nothing counts unconfirmed.
+		assert_eq!(keep_credit(Some(&first), again.clone(), false).status, TxStatus::Seen);
+		// More confirmations replace the record as usual.
+		let deeper = classify(Some(&first), &obs(3, Mempool::Unknown), &fees()).unwrap();
+		assert_eq!(keep_credit(Some(&first), deeper.clone(), true), deeper);
 	}
 
 	fn summary(confirmed: u64, seen: u64, replaced: bool) -> Summary {

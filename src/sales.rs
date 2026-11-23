@@ -57,6 +57,9 @@ pub struct SaleView {
 	pub onchain_address: Option<String>,
 	pub paid_at: Option<DateTime<Utc>>,
 	pub paid_rail: Option<Rail>,
+	/// When the sale last changed. A client keeps the newer of two
+	/// snapshots of a sale.
+	pub updated_at: DateTime<Utc>,
 	/// Counted payments only: delivered invoices and confirmed outputs.
 	pub received_sat: i64,
 	/// Unconfirmed on-chain payments. They are shown and never counted.
@@ -92,6 +95,7 @@ impl From<Sale> for SaleView {
 			onchain_address: s.onchain_address,
 			paid_at: s.paid_at,
 			paid_rail: s.paid_rail,
+			updated_at: s.updated_at,
 			received_sat: s.received_sat,
 			seen_sat: s.seen_sat,
 			progress: s.progress.filter(|_| s.state == SaleState::InProgress),
@@ -358,10 +362,15 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 						return Err(ApiError::Misconfigured(e.to_string()));
 					},
 				}
-				let conn = app.public.db.conn().await?;
-				conn.execute("
+				// The invoice is stored and the sale issued together: only
+				// then can anyone see the sale.
+				let mut conn = app.public.db.conn().await?;
+				let tx = conn.transaction().await?;
+				tx.execute("
 					UPDATE sale_payment SET payment_hash = $2, invoice = $3 WHERE id = $1
 				", &[&slot, &hash, &invoice.to_string()]).await?;
+				tx.execute("UPDATE sale SET issued_at = NOW() WHERE id = $1", &[&res.sale_id]).await?;
+				tx.commit().await?;
 				true
 			},
 			Err(e) => {
@@ -394,7 +403,7 @@ pub async fn add_onchain(app: &App, public_id: &str) -> ApiResult<Sale> {
 	// Locking the sale serializes two calls for it.
 	let row = tx.query_opt("
 		SELECT id, store_id, state, amount_sat, expires_at <= NOW() AS past_expiry
-		FROM sale WHERE public_id = $1 FOR UPDATE
+		FROM sale WHERE public_id = $1 AND issued_at IS NOT NULL FOR UPDATE
 	", &[&public_id]).await?.ok_or_else(|| not_found("no such sale"))?;
 	let sale_id: i64 = row.get("id");
 	let has_address = tx.query_opt(
@@ -455,9 +464,11 @@ pub async fn get_sale_by_id(conn: &impl GenericClient, id: i64) -> anyhow::Resul
 }
 
 /// A sale by its public id. Holding the id is what lets a cashier follow
-/// and cancel a sale.
+/// and cancel a sale. A sale reserved but not issued yet does not exist.
 pub async fn get_sale(conn: &impl GenericClient, public_id: &str) -> ApiResult<Sale> {
-	let row = conn.query_opt(&format!("{} WHERE s.public_id = $1", SALE_SELECT), &[&public_id]).await?;
+	let row = conn.query_opt(
+		&format!("{} WHERE s.public_id = $1 AND s.issued_at IS NOT NULL", SALE_SELECT), &[&public_id],
+	).await?;
 	row.map(|r| Sale::from_row(&r)).ok_or_else(|| not_found("no such sale"))
 }
 
@@ -470,7 +481,7 @@ pub async fn list_sales(
 ) -> ApiResult<Vec<Sale>> {
 	let limit = limit.clamp(1, 100);
 	let rows = conn.query(&format!("{}
-		WHERE s.store_id = $1 AND ($2::TEXT IS NULL OR s.id < (
+		WHERE s.store_id = $1 AND s.issued_at IS NOT NULL AND ($2::TEXT IS NULL OR s.id < (
 			SELECT id FROM sale WHERE public_id = $2 AND store_id = $1))
 		ORDER BY s.id DESC LIMIT $3
 	", SALE_SELECT), &[&store_id, &before, &limit]).await?;
@@ -485,7 +496,8 @@ pub async fn sales_csv(
 	to: Option<DateTime<Utc>>,
 ) -> ApiResult<String> {
 	let rows = conn.query(&format!("{}
-		WHERE s.store_id = $1 AND ($2::TIMESTAMPTZ IS NULL OR s.created_at >= $2)
+		WHERE s.store_id = $1 AND s.issued_at IS NOT NULL
+			AND ($2::TIMESTAMPTZ IS NULL OR s.created_at >= $2)
 			AND ($3::TIMESTAMPTZ IS NULL OR s.created_at < $3)
 		ORDER BY s.id
 	", SALE_SELECT), &[&store_id, &from, &to]).await?;

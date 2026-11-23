@@ -82,7 +82,7 @@ async fn sale_paid_by_lightning() {
 
 	store.lightning.external.pay_bolt11(invoice).await;
 	let id = sale["id"].as_str().unwrap();
-	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+	let paid = store.svc.wait_paid_rail(id).await;
 	assert_eq!(paid["paid_rail"], "lightning");
 	assert!(paid.get("final").is_none(), "paid is final: no separate finality");
 
@@ -154,8 +154,10 @@ async fn sale_paid_by_ark() {
 		awaiting, delivered, settled, paid_at,
 		awaiting.zip(settled).map(|(a, s)| s.saturating_sub(a)),
 	);
-	assert_eq!(paid["paid_rail"], "ark", "payer chose {}", kind);
 	assert_eq!(paid["received_sat"], 30_000);
+	// The rail label follows the paid state.
+	let paid = store.svc.wait_paid_rail(id).await;
+	assert_eq!(paid["paid_rail"], "ark", "payer chose {}", kind);
 
 	// The invoice is settled: the sale cannot be paid twice.
 	let again = payer.parse_payment_request(qr).await.unwrap();
@@ -178,7 +180,7 @@ async fn payer_with_hints_off_pays_lightning() {
 	let sale = store.new_sale(json!({ "amount_sat": 25_000 })).await;
 	let id = sale["id"].as_str().unwrap();
 	pay(&payer, sale["lightning_request"].as_str().unwrap()).await;
-	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+	let paid = store.svc.wait_paid_rail(id).await;
 	assert_eq!(paid["paid_rail"], "lightning");
 }
 
@@ -237,8 +239,8 @@ async fn sale_paid_onchain_through_its_stages() {
 	tokio::time::sleep(Duration::from_secs(6)).await;
 	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
 	assert_eq!(after["state"], "paid", "{}", after);
+	assert_eq!(after["received_sat"], 60_000, "a confirmed output stays credited: {}", after);
 	rpc(node, None, "reconsiderblock", json!([tip])).await;
-	store.svc.wait_sale(id, SALE_TIMEOUT, |s| s["received_sat"] == 60_000, "counted again").await;
 
 	// As in posd, the address stays watched for 7 days: an extra payment
 	// counts on this sale, as an overpayment, and the sale stays paid.
@@ -751,8 +753,9 @@ async fn unknown_invoice_outcomes_stay_watched() {
 		SELECT id, '{}', 'lnbcrt1unknown', 1000, NOW() - INTERVAL '1 day' FROM nym WHERE name = 'cafe'
 	", "aa".repeat(32))).await.unwrap();
 	svc.sql("
-		INSERT INTO sale (public_id, store_id, amount_sat, state, expires_at, created_at)
-		SELECT 'unknown-outcome', id, 1000, 'expired', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'
+		INSERT INTO sale (public_id, store_id, amount_sat, state, expires_at, created_at, issued_at)
+		SELECT 'unknown-outcome', id, 1000, 'expired', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day',
+			NOW() - INTERVAL '1 day'
 		FROM store
 	").await.unwrap();
 	svc.sql(&format!("
@@ -769,6 +772,61 @@ async fn unknown_invoice_outcomes_stay_watched() {
 	let watched = bullnym::watcher::watched_payments(&svc.app).await.unwrap();
 	assert!(watched.iter().any(|p| p.sale_public_id == "unknown-outcome"),
 		"the sale invoice stays watched past its grace");
+}
+
+#[tokio::test]
+async fn reserved_sales_stay_private_and_seen_payments_never_expire() {
+	let ctx = TestContext::new("bullnym/reserved_sales_stay_private_and_seen_payments_never_expire").await;
+	let store = store_setup_with(&ctx, |cfg| cfg.sales.default_onchain_min_sat = 1000).await;
+	let svc = &store.svc;
+	let owner = Some(store.owner.token.as_str());
+	store.forwarder.stop().await.unwrap();
+
+	// A sale reserved under the caps, whose invoice is not stored yet: nobody
+	// sees it.
+	svc.sql("
+		INSERT INTO sale (public_id, store_id, amount_sat, expires_at)
+		SELECT 'reserved', id, 2000, NOW() + INTERVAL '10 minutes' FROM store
+	").await.unwrap();
+	svc.sql("INSERT INTO sale_payment (sale_id, rail) SELECT id, 'lightning' FROM sale WHERE public_id = 'reserved'")
+		.await.unwrap();
+	for (method, path) in [
+		(Method::GET, "/api/v1/sales/reserved"),
+		(Method::POST, "/api/v1/sales/reserved/onchain"),
+		(Method::POST, "/api/v1/sales/reserved/cancel"),
+	] {
+		let (status, _) = svc.call(method, path, None, None).await;
+		assert_eq!(status, StatusCode::NOT_FOUND, "{}", path);
+	}
+	let history = svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await;
+	assert!(history["sales"].as_array().unwrap().is_empty(), "{}", history);
+	assert!(!owner_csv(&store).await.contains("reserved"));
+
+	// Two open sales long past expiry and grace, with barkd unreachable.
+	// One had a payment arriving when it was last read: it never expires on
+	// a failed read. The other has no such evidence and expires.
+	for (id, hash, seen) in [("seen", "cc", "NOW()"), ("unseen", "dd", "NULL")] {
+		svc.sql(&format!("
+			INSERT INTO sale (public_id, store_id, amount_sat, expires_at, created_at, issued_at)
+			SELECT '{id}', id, 2000, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'
+			FROM store
+		")).await.unwrap();
+		svc.sql(&format!("
+			INSERT INTO sale_payment (sale_id, rail, payment_hash, invoice, arriving_at)
+			SELECT id, 'lightning', '{}', 'lnbcrt1{id}', {seen} FROM sale WHERE public_id = '{id}'
+		", hash.repeat(32))).await.unwrap();
+	}
+	// A reservation left behind long ago, never issued, is deleted.
+	svc.sql("
+		INSERT INTO sale (public_id, store_id, amount_sat, expires_at, created_at)
+		SELECT 'abandoned', id, 2000, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day' FROM store
+	").await.unwrap();
+	tokio::time::sleep(Duration::from_secs(8)).await;
+	assert_eq!(svc.ok(Method::GET, "/api/v1/sales/seen", None, None).await["state"], "open");
+	assert_eq!(svc.ok(Method::GET, "/api/v1/sales/unseen", None, None).await["state"], "expired");
+	assert_eq!(svc.sql("UPDATE sale SET state = state WHERE public_id = 'abandoned'").await.unwrap(), 0);
+	assert_eq!(svc.sql("UPDATE sale SET state = state WHERE public_id = 'reserved'").await.unwrap(), 1,
+		"a reservation within its time stays, hidden");
 }
 
 /// Sends `n` requests at once and counts the ones that succeed.
@@ -1015,9 +1073,9 @@ async fn allocation_progress_survives_an_occupied_range() {
 	let desc = bullnym::rails::onchain::StoreDescriptor::parse(&common::store_descriptor(42)).unwrap();
 	let address = |i: u32| desc.address(i, bitcoin::Network::Regtest).unwrap().to_string();
 	svc.sql("
-		INSERT INTO sale (public_id, store_id, amount_sat, state, expires_at, created_at)
+		INSERT INTO sale (public_id, store_id, amount_sat, state, expires_at, created_at, issued_at)
 		SELECT 'occupied-' || i, (SELECT id FROM store), 2000, 'expired',
-			NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days'
+			NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days', NOW() - INTERVAL '30 days'
 		FROM generate_series(0, 1001) AS i
 	").await.unwrap();
 	let values = (0..1002u32).map(|i| format!("('{}', {})", address(i), i)).collect::<Vec<_>>().join(",");
@@ -1133,7 +1191,7 @@ async fn qr_codes_and_copied_invoice() {
 	let qr = sale["lightning_request"].as_str().unwrap();
 	assert!(qr.starts_with("lightning:") && !qr.contains("bitcoin:"), "{}", qr);
 	let kind = pay(&payer, qr).await;
-	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+	let paid = store.svc.wait_paid_rail(id).await;
 	eprintln!("LIGHTNING_QR_OUTCOME the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
 	assert_eq!(paid["paid_rail"], rail);
 
@@ -1156,7 +1214,7 @@ async fn qr_codes_and_copied_invoice() {
 
 	// The invoice alone, copied from that sale, which still has it.
 	let kind = pay(&payer, sale["lightning_invoice"].as_str().unwrap()).await;
-	let paid = store.svc.wait_sale_state(id, "paid", SALE_TIMEOUT).await;
+	let paid = store.svc.wait_paid_rail(id).await;
 	eprintln!("COPIED_INVOICE_OUTCOME the payer chose {} and the sale was paid by {}", kind, paid["paid_rail"]);
 	assert_eq!(paid["paid_rail"], rail);
 }
