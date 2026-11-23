@@ -125,13 +125,13 @@ async fn sale_paid_by_ark() {
 	let paid = loop {
 		let sale = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
 		let barkd = store.svc.app.watch.forwarder.status(&hash).await.ok();
-		let server = store.svc.app.ark.receive(&hash).await.ok();
+		let server = common::server_delivered(&store.srv.ark_url(), &hash).await;
 		let t = start.elapsed().as_millis();
 		let barkd_settled = matches!(barkd, Some(ForwardStatus::Delivered(_)));
 		if barkd == Some(ForwardStatus::AwaitingDelivery) {
 			awaiting.get_or_insert(t);
 		}
-		if server.as_ref().is_some_and(|r| r.delivered == Some(true)) {
+		if server == Some(true) {
 			delivered.get_or_insert(t);
 		}
 		if barkd_settled {

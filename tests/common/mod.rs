@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -434,4 +435,32 @@ pub async fn owner_restores(ctx: &TestContext, store: &Store, at_least: Amount) 
 			"owner has {} spendable, expected at least {}", balance.spendable, at_least);
 		tokio::time::sleep(Duration::from_millis(500)).await;
 	}
+}
+
+/// `CheckLightningReceiveResponse` with the `delivered` field that S4 adds,
+/// which the pinned protocol types lack. The service never reads it; the
+/// tests read it to time the server's report against barkd's.
+#[derive(Clone, PartialEq, prost::Message)]
+struct CheckLightningReceiveResponse {
+	#[prost(bool, optional, tag = "5")]
+	delivered: Option<bool>,
+}
+
+/// Whether the Ark server at `url` reports the receive with `payment_hash`
+/// delivered (S4). `None` when it does not say, or cannot be read.
+pub async fn server_delivered(url: &str, payment_hash: &str) -> Option<bool> {
+	use server_rpc::RequestExt;
+	let hash = ark::lightning::PaymentHash::from_str(payment_hash).ok()?;
+	let channel = tonic::transport::Endpoint::from_shared(url.to_string()).ok()?.connect().await.ok()?;
+	let mut grpc = tonic::client::Grpc::new(channel);
+	grpc.ready().await.ok()?;
+	let mut req = tonic::Request::new(server_rpc::protos::CheckLightningReceiveRequest {
+		hash: hash.to_vec(), wait: false,
+	});
+	req.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE_EXPIRY_PAYOUT);
+	let path = http::uri::PathAndQuery::from_static("/bark_server.ArkService/CheckLightningReceive");
+	let codec = tonic_prost::ProstCodec::<
+		server_rpc::protos::CheckLightningReceiveRequest, CheckLightningReceiveResponse,
+	>::default();
+	grpc.unary(req, path, codec).await.ok()?.into_inner().delivered
 }
