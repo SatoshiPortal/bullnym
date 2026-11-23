@@ -1,17 +1,15 @@
 <script lang="ts">
-	// After bullnym's PayScreen and PayFlow: the amount, the Lightning QR
-	// code, and the payment state, kept current with the service's long-poll.
-	// Bitcoin is offered only when the merchant asks for it, after a
-	// confirmation; the screen then shows one QR at a time, with a switch. No
-	// QR combines Lightning and Bitcoin. A payment seen but not counted yet
-	// shows an amber "in progress" panel that says it is not guaranteed, with
-	// its warnings. Only a paid sale is green.
+	// After bullnym's PayScreen and PayFlow: the amount, one QR code for the
+	// selected rail, and the payment state, kept current with the service's long-poll.
+	// A payment seen but not counted yet shows an amber "in progress" panel
+	// that says it is not guaranteed, with its warnings. Only a paid sale is
+	// green.
 	import { untrack } from 'svelte'
-	import { ApiError, type Sale } from '$lib/api'
+	import { ApiError } from '$lib/api'
 	import { formatFiat, formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { acceptSale, canAddBitcoin, countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
-	import { cachedSale, rememberSale } from '$lib/sale-cache'
+	import { countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
+	import { followSale } from '$lib/follow-sale.svelte'
 	import { client, session } from '$lib/session.svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
 	import Button from '$lib/components/Button.svelte'
@@ -24,63 +22,11 @@
 
 	let { id }: { id: string } = $props()
 
-	const RETRY_MS = 2_000
-
-	let sale = $state<Sale | null>(untrack(() => cachedSale(id) ?? null))
-	let notFound = $state(false)
-	let offline = $state(false)
-	let canceling = $state(false)
+	const reader = untrack(() => followSale(id))
+	const sale = $derived(reader.sale)
+	const offline = $derived(reader.kind === 'retrying')
+	let cancelState = $state<'idle' | 'sending' | 'failed' | 'conflict'>('idle')
 	let nowMs = $state(Date.now())
-	// Which QR shows: Lightning, or Bitcoin once it was added.
-	let shown = $state<'lightning' | 'bitcoin'>('lightning')
-	let confirmingBitcoin = $state(false)
-	let addingBitcoin = $state(false)
-	let bitcoinError = $state<string | null>(null)
-
-	/** Shows a snapshot of the sale, unless it is older than the one shown. */
-	function show(next: Sale) {
-		const kept = rememberSale(next)
-		if (acceptSale(sale, kept, id)) sale = kept
-	}
-
-	// Long-poll while the screen is open, also once the sale is paid: a
-	// paid sale still gets its rail label, and its address counts extra
-	// payments for 7 days. Each request returns when the state changes or
-	// after the server's wait limit.
-	$effect(() => {
-		const abort = new AbortController()
-		async function run() {
-			if (!untrack(() => sale)) {
-				try {
-					show(await client().sale(id))
-				} catch (e) {
-					if (e instanceof ApiError && e.status === 404) {
-						notFound = true
-						return
-					}
-				}
-			}
-			while (!abort.signal.aborted) {
-				try {
-					const current = untrack(() => sale)
-					const next = current ? await client().waitSale(id, current.state, abort.signal) : await client().sale(id)
-					if (abort.signal.aborted) return
-					offline = false
-					show(next)
-				} catch (e) {
-					if (abort.signal.aborted) return
-					if (e instanceof ApiError && e.status === 404) {
-						notFound = true
-						return
-					}
-					offline = e instanceof ApiError && e.status === 0
-					await new Promise((r) => setTimeout(r, RETRY_MS))
-				}
-			}
-		}
-		void run()
-		return () => abort.abort()
-	})
 
 	$effect(() => {
 		const timer = setInterval(() => (nowMs = Date.now()), 1000)
@@ -88,8 +34,9 @@
 	})
 
 	// An expired sale returns to the keypad on its own, as in bullnym.
+	const returnAfterExpiry = $derived(sale?.state === 'expired' && !sale.late_payment)
 	$effect(() => {
-		if (sale?.state !== 'expired') return
+		if (!returnAfterExpiry) return
 		const t = setTimeout(newSale, 1800)
 		return () => clearTimeout(t)
 	})
@@ -99,35 +46,32 @@
 	const progress = $derived(sale ? progressText(sale) : null)
 	const notice = $derived(sale ? noticeText(sale) : null)
 	const missing = $derived(sale ? missingSats(sale) : 0)
-	const onchainMin = $derived(session.checkout?.store.onchain_min_sat ?? null)
-	const bitcoinAllowed = $derived(sale !== null && onchainMin !== null && sale.amount_sat >= onchainMin)
-	// The confirmation closes, and asks for nothing, once the sale is paid,
-	// in progress or ended while it is open.
-	$effect(() => {
-		if (confirmingBitcoin && !canAddBitcoin(sale, onchainMin)) confirmingBitcoin = false
-	})
-	const qrValue = $derived(
-		sale ? (shown === 'bitcoin' && sale.onchain_request ? sale.onchain_request : sale.lightning_request) : null,
-	)
 
-	/** Adds Bitcoin to the sale, after the merchant confirmed. */
-	async function addBitcoin() {
-		if (!sale || addingBitcoin) return
-		if (!canAddBitcoin(sale, onchainMin)) {
-			confirmingBitcoin = false
-			return
+	let selected = $state<'lightning' | 'bitcoin'>('lightning')
+	let option = $state<'idle' | 'confirm' | 'requesting' | 'failed'>('idle')
+	const eligible = $derived(!!sale && !!session.checkout && sale.amount_sat >= session.checkout.store.onchain_min_sat)
+	const qrValue = $derived(selected === 'bitcoin' && sale?.onchain_request ? sale.onchain_request : sale?.lightning_request)
+
+	$effect(() => {
+		if (sale?.state !== 'open') option = 'idle'
+	})
+
+	function chooseBitcoin() {
+		if (sale?.onchain_request) selected = 'bitcoin'
+		else if (eligible && sale?.state === 'open') {
+			option = 'confirm'
 		}
-		addingBitcoin = true
-		bitcoinError = null
+	}
+	async function addBitcoin() {
+		if (option !== 'confirm' || sale?.state !== 'open') return
+		option = 'requesting'
 		try {
-			show(await client().addOnchain(sale.id))
-			shown = 'bitcoin'
-		} catch (e) {
-			if (e instanceof ApiError && e.status === 503) bitcoinError = 'Bitcoin is not available right now. Try again in a moment.'
-			else bitcoinError = e instanceof Error ? e.message : 'Could not add Bitcoin'
-		} finally {
-			addingBitcoin = false
-			confirmingBitcoin = false
+			const next = await client().addOnchain(id)
+			if (reader.accept(next) && next.onchain_request) selected = 'bitcoin'
+			option = 'idle'
+		} catch {
+			option = 'failed'
+			reader.refresh()
 		}
 	}
 
@@ -136,19 +80,14 @@
 	}
 
 	async function cancel() {
-		if (!sale || sale.state !== 'open') {
-			newSale()
-			return
-		}
-		canceling = true
+		if (sale?.state !== 'open' || cancelState === 'sending') return
+		cancelState = 'sending'
 		try {
-			show(await client().cancelSale(sale.id))
-			newSale()
+			const next = await client().cancelSale(sale.id)
+			if (reader.accept(next) && next.state === 'canceled') newSale()
 		} catch (e) {
-			// A payment arrived first; the long-poll shows it.
-			if (!(e instanceof ApiError && (e.status === 409 || e.status === 503))) newSale()
-		} finally {
-			canceling = false
+			cancelState = e instanceof ApiError && e.status === 409 ? 'conflict' : 'failed'
+			reader.refresh()
 		}
 	}
 </script>
@@ -160,15 +99,21 @@
 				<button
 					type="button"
 					class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold disabled:opacity-50"
-					onclick={cancel}
-					disabled={canceling || sale?.state === 'in-progress'}
+					onclick={sale?.state === 'open' ? cancel : newSale}
+					disabled={sale?.state === 'open' && cancelState === 'sending'}
 				>
-					← {sale?.state === 'open' || !sale ? 'Cancel sale' : 'New sale'}
+					← {sale?.state === 'open' ? 'Cancel sale' : 'New sale'}
 				</button>
 				<HeaderLinks />
 			</header>
 
-			{#if notFound}
+			{#if offline}
+				<p role="status" class="mb-3 text-center">Reconnecting…</p>
+			{/if}
+			{#if sale?.state === 'open' && (cancelState === 'failed' || cancelState === 'conflict')}
+				<p role="alert" class="mb-3 text-center">{cancelState === 'conflict' ? 'Cancellation refused. Checking the payment.' : 'Could not cancel the sale. Check its status and try again.'}</p>
+			{/if}
+			{#if reader.kind === 'missing'}
 				<TerminalPanel icon="×" tone="err" title="Not found" detail="This sale could not be found." actionLabel="Back" onaction={newSale} />
 			{:else if !sale}
 				<div class="grid min-h-[60vh] place-items-center">
@@ -178,7 +123,7 @@
 				<div class="flex flex-col items-center gap-3">
 					<SuccessScreen
 						{amountLabel}
-						rail={railLabel(sale.paid_rail)}
+						rail={sale.paid_rail ? railLabel(sale.paid_rail) : null}
 						actionLabel="New Sale"
 						onaction={newSale}
 						secondaryLabel="Receipt"
@@ -190,12 +135,12 @@
 						</p>
 					{/if}
 				</div>
-			{:else if sale.state === 'expired' && sale.late_payment}
+			{:else if (sale.state === 'expired' || sale.state === 'canceled') && sale.late_payment}
 				<TerminalPanel
 					icon="!"
 					tone="warn"
 					title="Late payment"
-					detail="A payment arrived after this sale expired. It is not attached to another sale; the owner sees it in the history."
+					detail="A payment arrived after this sale closed. The owner sees it in the history."
 					actionLabel="New Sale"
 					onaction={newSale}
 				/>
@@ -225,7 +170,7 @@
 						{/if}
 						<p class="inline-flex items-center gap-1.5 text-xs font-semibold text-[#725315] dark:text-[#f0d38a]">
 							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-							{offline ? 'Reconnecting…' : 'Waiting for payment'}{remaining ? ` · ${remaining}` : ''}
+							Waiting for payment{remaining ? ` · ${remaining}` : ''}
 						</p>
 						{#if sale.memo}
 							<p class="text-center text-sm text-[#776b5a] dark:text-[#b9aa91]">{sale.memo}</p>
@@ -249,13 +194,13 @@
 								<button
 									type="button"
 									role="tab"
-									aria-selected={shown === value}
+									aria-selected={selected === value}
 									class={`min-h-9 rounded-md px-4 font-semibold transition ${
-										shown === value
+										selected === value
 											? 'bg-[#fffaf0] text-[#1f513a] shadow-sm dark:bg-[#161512] dark:text-[#8bc8a4]'
 											: 'text-[#5f5547] dark:text-[#c9bca7]'
 									}`}
-									onclick={() => (shown = value as 'lightning' | 'bitcoin')}
+									onclick={() => (selected = value as 'lightning' | 'bitcoin')}
 								>
 									{label}
 								</button>
@@ -266,26 +211,26 @@
 					{#if qrValue}
 						<QrCard
 							value={qrValue}
-							label={shown === 'bitcoin' && sale.onchain_request ? 'Bitcoin payment code' : 'Lightning payment code'}
+							label={selected === 'bitcoin' && sale.onchain_request ? 'Bitcoin payment code' : 'Lightning payment code'}
 						/>
 					{/if}
 
 					<div class="flex w-full flex-col gap-2">
-						{#if shown === 'bitcoin' && sale.onchain_address}
+						{#if selected === 'bitcoin' && sale.onchain_address}
 							<CopyRow label="Bitcoin address" value={sale.onchain_address} />
 						{:else if sale.lightning_invoice}
 							<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
 						{/if}
 					</div>
-					{#if bitcoinError}
-						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{bitcoinError}</p>
+					{#if option === 'failed'}
+						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">Could not add Bitcoin. Check the sale and try again.</p>
 					{/if}
 					{#if !sale.onchain_request && sale.state === 'open'}
-						{#if bitcoinAllowed}
-							<Button variant="secondary" onclick={() => (confirmingBitcoin = true)}>Bitcoin</Button>
-						{:else if onchainMin !== null}
+						{#if eligible}
+							<Button variant="secondary" onclick={chooseBitcoin}>Bitcoin</Button>
+						{:else if session.checkout}
 							<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
-								Bitcoin on-chain is offered from {formatSats(onchainMin)}.
+								Bitcoin on-chain is offered from {formatSats(session.checkout.store.onchain_min_sat)}.
 							</p>
 						{/if}
 					{/if}
@@ -293,13 +238,13 @@
 			{/if}
 		</section>
 	</div>
-	{#if confirmingBitcoin && canAddBitcoin(sale, onchainMin)}
+	{#if sale?.state === 'open' && (option === 'confirm' || option === 'requesting')}
 		<ConfirmDialog
 			title="Bitcoin on-chain"
 			text="On-chain Bitcoin payments can take up to 60 minutes to confirm. Don't consider the payment complete until it is confirmed."
-			busy={addingBitcoin}
+			busy={option === 'requesting'}
 			onconfirm={addBitcoin}
-			oncancel={() => (confirmingBitcoin = false)}
+			oncancel={() => (option = 'idle')}
 		/>
 	{/if}
 </main>

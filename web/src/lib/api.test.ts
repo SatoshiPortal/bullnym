@@ -86,6 +86,13 @@ describe('PosClient', () => {
 		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ pin: '2468' })
 	})
 
+	it('requires affirmative service confirmation before unlocking', async () => {
+		const { fetch } = fakeFetch([json({ ok: false }), new Response('store loading')])
+		const client = new PosClient({ fetch, link: PUBLIC })
+		await expect(client.checkPin('2468')).rejects.toHaveProperty('status', 502)
+		await expect(client.checkPin('2468')).rejects.toHaveProperty('status', 502)
+	})
+
 	it('reads how long a refused PIN locks checks', async () => {
 		const { fetch } = fakeFetch([json({ error: 'wrong PIN', retry_after: 4 }, 401)])
 		const err = await new PosClient({ fetch, link: PUBLIC }).checkPin('0000').catch((e) => e)

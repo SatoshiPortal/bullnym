@@ -17,7 +17,7 @@ export function pinRefusal(e: unknown): string {
 	if (e instanceof ApiError) {
 		const wait = e.retryAfter > 0 ? ` Try again in ${waitText(e.retryAfter)}.` : ''
 		if (e.status === 401) return `Wrong PIN.${wait}`
-		if (e.status === 429) return `Too many wrong PINs.${wait || ' Try again later.'}`
+		if (e.status === 429) return `Too many PIN checks.${wait || ' Try again later.'}`
 		if (e.status === 404) return 'The owner has not set a cashier PIN.'
 		if (e.status === 0) return 'The server is not reachable'
 	}

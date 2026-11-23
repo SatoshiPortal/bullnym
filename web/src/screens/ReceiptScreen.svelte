@@ -4,51 +4,31 @@
 	// print at 80 mm.
 	import { untrack } from 'svelte'
 	import { Printer, RotateCw, Share2 } from 'lucide-svelte'
-	import { ApiError, type Sale } from '$lib/api'
+	import BullSpinner from '$lib/components/BullSpinner.svelte'
 	import { formatFiat, formatSats, shortId } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { acceptSale, railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
-	import { cachedSale, rememberSale } from '$lib/sale-cache'
-	import { client, session } from '$lib/session.svelte'
+	import { railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
+	import { followSale } from '$lib/follow-sale.svelte'
+	import { session } from '$lib/session.svelte'
 	import Button from '$lib/components/Button.svelte'
 	import ReceiptView from '$lib/components/ReceiptView.svelte'
 
 	let { id }: { id: string } = $props()
 
-	let sale = $state<Sale | null>(untrack(() => cachedSale(id) ?? null))
-	let notFound = $state(false)
-
-	// Follows the sale while the receipt is open: its rail label can come
-	// after it is paid, and extra or late payments after that.
-	$effect(() => {
-		const abort = new AbortController()
-		async function run() {
-			while (!abort.signal.aborted) {
-				try {
-					const current = untrack(() => sale)
-					const next = current ? await client().waitSale(id, current.state, abort.signal) : await client().sale(id)
-					if (abort.signal.aborted) return
-					const kept = rememberSale(next)
-					if (acceptSale(untrack(() => sale), kept, id)) sale = kept
-				} catch (e) {
-					if (abort.signal.aborted) return
-					if (e instanceof ApiError && e.status === 404) {
-						notFound = true
-						return
-					}
-					await new Promise((r) => setTimeout(r, 2_000))
-				}
-			}
-		}
-		void run()
-		return () => abort.abort()
-	})
-
+	const reader = untrack(() => followSale(id))
+	const sale = $derived(reader.sale)
+	const canShare = typeof navigator.share === 'function'
+	let shareError = $state('')
 	const isPaid = $derived(sale?.state === 'paid')
 	const dateLabel = $derived(sale ? new Date(sale.paid_at ?? sale.created_at).toLocaleString() : '—')
 
 	async function share() {
-		await navigator.share?.({ title: 'Receipt', url: location.href })
+		shareError = ''
+		try {
+			await navigator.share({ title: 'Receipt', url: location.href })
+		} catch (e) {
+			if (!(e instanceof DOMException && e.name === 'AbortError')) shareError = 'Could not share the receipt.'
+		}
 	}
 
 	$effect(() => {
@@ -65,19 +45,23 @@
 
 <main class="min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
 	<div class="no-print mx-auto mb-5 flex max-w-xl items-center justify-between">
-		<button class="inline-flex min-h-12 items-center gap-2 rounded-md font-bold" onclick={() => history.back()}>← Back</button>
+		<button class="inline-flex min-h-12 items-center gap-2 rounded-md font-bold" onclick={() => history.state?.receiptParent ? history.back() : router.go('/')}>← Back</button>
 		<div class="flex gap-2">
 			{#if isPaid}
 				<Button variant="secondary" onclick={() => window.print()}><Printer size={18} />Print</Button>
-				<Button variant="ghost" onclick={share}><Share2 size={18} />Share</Button>
+				{#if canShare}<Button variant="ghost" onclick={share}><Share2 size={18} />Share</Button>{/if}
 			{:else}
 				<Button variant="secondary" onclick={() => router.go('/')}><RotateCw size={18} />New sale</Button>
 			{/if}
 		</div>
 	</div>
 
-	{#if notFound}
+	 {#if shareError}<p role="alert">{shareError}</p>{/if}
+	{#if reader.kind === 'retrying'}<p role="status" class="text-center">Reconnecting…</p>{/if}
+	{#if reader.kind === 'missing'}
 		<p class="py-20 text-center">Receipt not found.</p>
+	{:else if reader.kind === 'loading'}
+		<div class="grid min-h-[50vh] place-items-center"><BullSpinner label="Loading receipt" /></div>
 	{:else if sale}
 		<ReceiptView
 			merchantName={session.checkout?.store.name ?? ''}

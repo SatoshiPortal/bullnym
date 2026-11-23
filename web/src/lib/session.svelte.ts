@@ -15,36 +15,14 @@ function linkKey(what: string): string | null {
 	return `bullnym:${link.nym}:${what}`
 }
 
-function readLocal(key: string | null): string | null {
-	try {
-		return key ? localStorage.getItem(key) : null
-	} catch {
-		return null
-	}
-}
-
-function writeLocal(key: string | null, value: string): void {
-	try {
-		if (key) localStorage.setItem(key, value)
-	} catch {
-		/* storage unavailable: it lasts for this page only */
-	}
-}
-
-const state = $state<{ checkout: Checkout | null }>({
-	checkout: null,
-})
+type StoreLoad = { kind: 'loading' } | { kind: 'ready'; checkout: Checkout } | { kind: 'error'; message: string }
+let store = $state<StoreLoad>({ kind: 'loading' })
 
 export const session = {
-	get link(): Link | null {
-		return link
-	},
-	get checkout(): Checkout | null {
-		return state.checkout
-	},
-	set checkout(value: Checkout | null) {
-		state.checkout = value
-	},
+	get link() { return link },
+	get store() { return store },
+	set store(value: StoreLoad) { store = value },
+	get checkout() { return store.kind === 'ready' ? store.checkout : null },
 }
 
 /** A client for this page's link. */
@@ -59,15 +37,37 @@ const LOCAL_SALES_MAX = 50
  * convenience of the screen, never the record: the owner's history, through
  * the owner API, is.
  */
-export function localSaleIds(): string[] {
+const prefix = linkKey('sale:') ?? ''
+const fallback = new Map<string, number>()
+
+function storedSales(): string[] {
+	const entries = new Map(fallback)
 	try {
-		const ids = JSON.parse(readLocal(linkKey('sales')) ?? '[]')
-		return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : []
-	} catch {
-		return []
-	}
+		// Keep the previous list and its order for installations updated
+		// in place. New sales each have a key, so two tabs can append safely.
+		let legacy: unknown = []
+		try { legacy = JSON.parse(localStorage.getItem(linkKey('sales')!) ?? '[]') } catch { /* corrupt old list */ }
+		if (Array.isArray(legacy)) legacy.forEach((id, i) => {
+			if (typeof id === 'string' && !entries.has(id)) entries.set(id, -i)
+		})
+		for (let i = 0; i < localStorage.length; i++) {
+			const key = localStorage.key(i)
+			if (key?.startsWith(prefix)) entries.set(key.slice(prefix.length), Number(localStorage.getItem(key)))
+		}
+	} catch { /* The current page still remembers its own sales. */ }
+	return [...entries.keys()].sort((a, b) => entries.get(b)! - entries.get(a)! || a.localeCompare(b))
+}
+
+export function localSaleIds(): string[] {
+	return storedSales().slice(0, LOCAL_SALES_MAX)
 }
 
 export function rememberLocalSale(id: string): void {
-	writeLocal(linkKey('sales'), JSON.stringify([id, ...localSaleIds().filter((x) => x !== id)].slice(0, LOCAL_SALES_MAX)))
+	const now = Date.now()
+	fallback.set(id, now)
+	try { localStorage.setItem(prefix + id, String(now)) } catch { /* memory only */ }
+	for (const old of storedSales().slice(LOCAL_SALES_MAX)) {
+		fallback.delete(old)
+		try { localStorage.removeItem(prefix + old) } catch { /* memory only */ }
+	}
 }

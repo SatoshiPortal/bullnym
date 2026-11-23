@@ -1,6 +1,7 @@
 <script lang="ts">
 	// Terminal shell. The store's link ("/<nym>") opens the terminal on any
 	// device, with no pairing; the app is hash-routed like bullnym's POS.
+	import { untrack } from 'svelte'
 	import { ApiError } from '$lib/api'
 	import { router } from '$lib/router.svelte'
 	import { client, session } from '$lib/session.svelte'
@@ -12,24 +13,33 @@
 	import SettingsScreen from './screens/SettingsScreen.svelte'
 	import UnpairedScreen from './screens/UnpairedScreen.svelte'
 
-	let loadError = $state<string | null>(null)
-
 	$effect(() => {
 		if (!session.link) return
-		let current = true
-		loadError = null
-		client()
-			.checkout()
-			.then((c) => {
-				if (current) session.checkout = c
-			})
-			.catch((e) => {
-				if (!current) return
-				if (e instanceof ApiError && e.status === 404) loadError = 'There is no store at this link.'
-				else loadError = e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the store.'
-			})
+		let generation = 0
+		async function load() {
+			const attempt = ++generation
+			try {
+				const checkout = await client().checkout()
+				if (attempt === generation) session.store = { kind: 'ready', checkout }
+			} catch (e) {
+				if (attempt !== generation) return
+				const missing = e instanceof ApiError && e.status === 404
+				if (!missing && session.checkout) return
+				const message = missing ? 'There is no store at this link.' :
+					e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the store.'
+				session.store = { kind: 'error', message }
+			}
+		}
+		const visible = () => { if (!document.hidden) void load() }
+		untrack(load)
+		window.addEventListener('focus', load)
+		window.addEventListener('online', load)
+		document.addEventListener('visibilitychange', visible)
 		return () => {
-			current = false
+			generation++
+			window.removeEventListener('focus', load)
+			window.removeEventListener('online', load)
+			document.removeEventListener('visibilitychange', visible)
 		}
 	})
 
@@ -41,9 +51,9 @@
 	<UnpairedScreen />
 {:else if !session.checkout}
 	<main class="grid min-h-screen place-items-center bg-[#f5f0e8] px-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
-		{#if loadError}
+		{#if session.store.kind === 'error'}
 			<div class="text-center">
-				<p class="font-semibold">{loadError}</p>
+				<p class="font-semibold">{session.store.message}</p>
 				<button class="mt-4 min-h-12 rounded-md bg-[#eadfce] px-5 font-semibold dark:bg-[#2c2922]" onclick={() => location.reload()}>
 					Try again
 				</button>
