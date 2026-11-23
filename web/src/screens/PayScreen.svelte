@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { fitAmount } from '$lib/fit-amount'
 	// After bullnym's PayScreen and PayFlow: the amount, one QR code for the
 	// selected rail, and the payment state, kept current with the service's long-poll.
 	// A payment seen but not counted yet shows an amber "in progress" panel
@@ -154,7 +155,7 @@
 				<TerminalPanel icon="×" tone="err" title="Canceled" detail="This sale was canceled." actionLabel="Back" onaction={newSale} />
 			{:else if sale.state === 'in-progress'}
 				<div class="mx-auto flex max-w-md flex-col items-center gap-5 py-6 text-center">
-					<h1 class="payment-amount font-display tabular-nums tracking-display leading-none">{amountLabel}</h1>
+					<h1 use:fitAmount={amountLabel} class="w-full [contain:inline-size] whitespace-nowrap text-center text-7xl font-display tabular-nums tracking-display leading-none">{amountLabel}</h1>
 					<BullSpinner size={72} label="Payment in progress" />
 					<div class="rounded-md bg-[#fff0c7] px-5 py-4 text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]" role="status">
 						<p class="font-semibold">{progress?.title}. It is not paid yet.</p>
@@ -168,7 +169,7 @@
 			{:else}
 				<div class="mx-auto flex w-full max-w-md flex-col items-center gap-5">
 					<div class="flex w-full flex-col items-center gap-1">
-						<h1 class="payment-amount font-display tabular-nums tracking-display leading-none">{amountLabel}</h1>
+						<h1 use:fitAmount={amountLabel} class="w-full [contain:inline-size] whitespace-nowrap text-center text-7xl font-display tabular-nums tracking-display leading-none">{amountLabel}</h1>
 						{#if sale.fiat_amount !== null}
 							<p class="text-sm tabular-nums text-[#776b5a] dark:text-[#b9aa91]">{formatSats(sale.amount_sat)}</p>
 						{/if}
