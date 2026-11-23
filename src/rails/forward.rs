@@ -106,6 +106,20 @@ impl ForwardStatus {
 	}
 }
 
+#[derive(Deserialize)]
+struct MissingReceive {
+	resources: Vec<String>,
+	message: String,
+}
+
+impl MissingReceive {
+	fn identifies(&self, hash: &str) -> bool {
+		self.resources.as_slice() == [hash] && self.message == format!(
+			"not found [resources={hash}]: Lightning receive not found: no pending lightning receive found for this payment hash"
+		)
+	}
+}
+
 impl Forwarder {
 	pub fn new(cfg: &config::Barkd) -> anyhow::Result<Forwarder> {
 		let mut headers = HeaderMap::new();
@@ -152,8 +166,11 @@ impl Forwarder {
 	pub async fn status(&self, payment_hash: &str) -> anyhow::Result<ForwardStatus> {
 		let resp = self.http.get(self.url(&format!("/{}", payment_hash))).send().await
 			.context("barkd is not reachable")?;
-		// barkd answers 404 for a receive that ended unsettled.
+		// Older barkd versions use 404 for lookup errors as well as absence.
+		// Only the explicit missing-receive response can end observation.
 		if resp.status() == StatusCode::NOT_FOUND {
+			let missing = resp.json::<MissingReceive>().await.context("barkd returned an unrecognized lookup failure")?;
+			anyhow::ensure!(missing.identifies(payment_hash), "barkd could not verify the receive");
 			return Ok(ForwardStatus::Gone);
 		}
 		let resp = check(resp).await.context("barkd status check failed")?;
@@ -192,6 +209,19 @@ async fn check(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[test]
+	fn missing_receive_requires_the_actual_lookup_outcome() {
+		let hash = "ab".repeat(32);
+		let mut result = MissingReceive {
+			resources: vec![hash.clone()],
+			message: format!("not found [resources={hash}]: Lightning receive not found: no pending lightning receive found for this payment hash"),
+		};
+		assert!(result.identifies(&hash));
+		assert!(!result.identifies(&"cd".repeat(32)));
+		result.message = "database temporarily unavailable".into();
+		assert!(!result.identifies(&hash));
+	}
 
 	#[test]
 	fn reads_receive_states() {
