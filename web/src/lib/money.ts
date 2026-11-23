@@ -56,12 +56,20 @@ export function formatRate(btcPrice: string, currency: string): string {
 	return `${formatFiat(btcPrice, currency, currencyPrecision(currency))}/BTC`
 }
 
-/** Sats for a fiat amount at a BTC price, rounded to the nearest sat. */
+function decimalParts(text: string) {
+	if (!/^\d{1,20}(?:\.\d{0,18})?$/.test(text)) return null
+	const [whole, fraction = ''] = text.split('.')
+	return { units: BigInt(whole + fraction), scale: 10n ** BigInt(fraction.length) }
+}
+
+/** Use the service's decimal half-up rounding, including exact half-sat quotes. */
 export function fiatToSats(fiatAmount: string, btcPrice: string): number {
-	const fiat = Number(fiatAmount)
-	const price = Number(btcPrice)
-	if (!Number.isFinite(fiat) || !Number.isFinite(price) || fiat <= 0 || price <= 0) return 0
-	return Math.round((fiat / price) * 1e8)
+	const fiat = decimalParts(fiatAmount)
+	const price = decimalParts(btcPrice)
+	if (!fiat || !price?.units) return 0
+	const numerator = fiat.units * 100000000n * price.scale
+	const denominator = fiat.scale * price.units
+	return Number((numerator + denominator / 2n) / denominator)
 }
 
 /**

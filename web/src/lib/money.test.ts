@@ -22,6 +22,12 @@ describe('fiatToSats', () => {
 		expect(fiatToSats('1', '3')).toBe(33333333)
 	})
 
+	it('rounds exact half-sats up and preserves nearby values', () => {
+		expect(fiatToSats('0.15', '80000.00')).toBe(188)
+		expect(fiatToSats('0.15', '80000.000000000001')).toBe(187)
+		expect(fiatToSats('0.03', '48000')).toBe(63)
+	})
+
 	it('returns 0 for an empty amount or a missing price', () => {
 		expect(fiatToSats('', '62500')).toBe(0)
 		expect(fiatToSats('10', '0')).toBe(0)

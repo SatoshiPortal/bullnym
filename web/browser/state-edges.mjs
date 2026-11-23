@@ -17,6 +17,23 @@ async function history(page, fixture, ids) {
 }
 
 export const stateEdges = {
+	async QUOTE_HALF_SAT({ page, fixture }) {
+		fixture.intercept = (call) => {
+			if (call.path.endsWith('/rate')) return { json: { currency: 'USD', btc_price: '80000.00', fetched_at: new Date().toISOString() } }
+			if (call.method === 'POST' && call.path.endsWith('/sales')) {
+				assert.equal(call.body.fiat_amount, '0.15')
+				const row = sale('half-sat', { fiat_amount: '0.15', currency: 'USD', btc_price: '80000.00', amount_sat: 188 })
+				fixture.sales.set(row.id, row)
+				return { json: row }
+			}
+		}
+		await open(page)
+		await page.getByText(/\/BTC/).waitFor()
+		for (const label of ['Add cents', 'Add 1', 'Add 5']) await button(page, label).click()
+		assert.match(await page.locator('main').innerText(), /≈ 188 sats/)
+		await button(page, 'Charge').click()
+		await page.getByText('188 sats', { exact: true }).waitFor()
+	},
 	async CREATE_RESPONSE_LOST({ page, fixture }) {
 		await open(page)
 		await page.getByRole('tab', { name: 'Sats' }).click()
