@@ -44,7 +44,7 @@ for (const engine of (process.env.ENGINES ?? 'chromium,firefox').split(',')) {
 					await ctx.addInitScript(() => {
 						Object.defineProperty(window, 'AudioContext', { value: undefined })
 					})
-					await fixture.attach(ctx)
+					if (id !== 'PWA_REOPEN') await fixture.attach(ctx)
 					await ctx.tracing.start({ screenshots: true, snapshots: true })
 					return ctx
 				}
