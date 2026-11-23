@@ -36,14 +36,14 @@
 	const errorMsg = $derived(submission.kind === 'error' ? submission.message : null)
 	type Quote = { kind: 'loading' } | { kind: 'current'; rate: Rate } | { kind: 'unavailable'; last: Rate | null }
 	let quote = $state<Quote>({ kind: 'loading' })
-	let quoteRequest = 0
+	let reloadQuote: (() => void) | undefined
 	const rate = $derived(quote.kind === 'current' ? quote.rate : quote.kind === 'unavailable' ? quote.last : null)
 	const rateError = $derived(quote.kind === 'unavailable')
 
 	const precision = $derived(unit === 'sat' ? 0 : currencyPrecision(currency))
 
 	$effect(() => {
-		const expected = store?.currency ?? 'USD'
+		const expected = currency
 		quote = { kind: 'loading' }
 		// A fiat draft belongs to the denomination on which it was entered.
 		if (untrack(() => unit === 'fiat' && amount !== '' && draftCurrency !== expected)) {
@@ -51,12 +51,13 @@
 			denominationNotice = 'The store currency changed. Enter the amount in ' + expected + '.'
 		}
 		let stopped = false
+		let generation = 0
 		let last: Rate | null = null
 		async function load() {
-			const request = ++quoteRequest
+			const request = ++generation
 			try {
 				const next = await client().rate()
-				if (stopped || request !== quoteRequest) return
+				if (stopped || request !== generation) return
 				if (next.currency !== expected) {
 					last = null
 					quote = { kind: 'unavailable', last }
@@ -66,8 +67,13 @@
 				last = next
 				quote = { kind: 'current', rate: next }
 			} catch {
-				if (!stopped && request === quoteRequest) quote = { kind: 'unavailable', last }
+				if (!stopped && request === generation) quote = { kind: 'unavailable', last }
 			}
+		}
+		reloadQuote = () => {
+			last = null
+			quote = { kind: 'loading' }
+			void load()
 		}
 		void load()
 		window.addEventListener('online', load)
@@ -124,11 +130,10 @@
 		} catch (e) {
 			if (!active) return
 			if (unit === 'fiat' && e instanceof ApiError && e.status === 409) {
-				++quoteRequest
 				amount = ''
-				quote = { kind: 'loading' }
 				submission = { kind: 'editing' }
 				denominationNotice = e.message
+				reloadQuote?.()
 				refreshCheckout()
 				return
 			}
