@@ -10,6 +10,8 @@
 //! history and CSV behind the owner login.
 
 mod common;
+#[path = "integration/claim_codes.rs"]
+mod claim_codes;
 
 use std::collections::HashMap;
 use std::str::FromStr;

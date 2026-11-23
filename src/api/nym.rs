@@ -16,19 +16,17 @@ use crate::protect::{Caller, Surface};
 use crate::database::{NYM_COLUMNS, Nym};
 use crate::error::{ApiResult, bad_request, conflict};
 use crate::registration::NymRegistration;
-use crate::{nym, silent_payment};
+use crate::{claim_codes, nym, silent_payment};
 
 
 /// The longest display name.
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
-/// The advisory lock under which the nym cap is counted and a nym inserted.
-const NYM_CAP_LOCK: &str = "bullnym:nym-cap";
-
 #[derive(Deserialize)]
 pub struct RegisterRequest {
 	registration: NymRegistration,
 	signature: String,
+	claim_code: Option<String>,
 }
 
 /// How a nym looks to its owner.
@@ -68,6 +66,7 @@ pub async fn register(
 	// The cheap per-source limit comes before the signature check, so a
 	// flood cannot spend the service's CPU.
 	app.protect.check(&caller, Surface::Register)?;
+	let code_hash = req.claim_code.map(|code| claim_codes::digest(&code));
 	let reg = req.registration;
 	let signature = parse_signature(&req.signature)?;
 	nym::check(&reg.nym, &app.cfg.nyms.reserved).map_err(|e| bad_request(e.to_string()))?;
@@ -83,7 +82,7 @@ pub async fn register(
 	// lock, so simultaneous registrations cannot pass the cap together.
 	let mut conn = app.public.db.conn().await?;
 	let tx = conn.transaction().await?;
-	tx.execute("SELECT pg_advisory_xact_lock(hashtext($1)::BIGINT)", &[&NYM_CAP_LOCK]).await?;
+	claim_codes::lock_registration(&tx).await?;
 	let nyms: i64 = tx.query_one("SELECT count(*) FROM nym", &[]).await?.get(0);
 	if nyms as u64 >= app.protect.limits.max_nyms {
 		return Err(conflict("the service is not taking new registrations"));
@@ -111,6 +110,7 @@ pub async fn register(
 			}));
 		},
 	};
+	claim_codes::redeem(&tx, nym.id, &nym.name, app.cfg.registration.require_claim_code, code_hash.as_deref()).await?;
 	tx.commit().await?;
 	tracing::info!("registered nym {}", nym.name);
 	Ok(Json(json!({ "nym": NymView::new(&app, &nym, None) })))

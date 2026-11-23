@@ -17,6 +17,10 @@ pub enum ApiError {
 	BadRequest(String),
 	#[error("the token is missing, not valid, or revoked")]
 	Unauthorized,
+	#[error("a claim code is required to register this nym")]
+	ClaimCodeRequired,
+	#[error("the claim code is invalid")]
+	ClaimCodeInvalid,
 	#[error("{0}")]
 	NotFound(String),
 	#[error("{0}")]
@@ -63,9 +67,18 @@ impl From<bb8::RunError<tokio_postgres::Error>> for ApiError {
 
 impl IntoResponse for ApiError {
 	fn into_response(self) -> Response {
+		let mut body = json!({ "error": self.to_string() });
 		let status = match &self {
 			ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
 			ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+			ApiError::ClaimCodeRequired => {
+				body["code"] = json!("ClaimCodeRequired");
+				StatusCode::FORBIDDEN
+			},
+			ApiError::ClaimCodeInvalid => {
+				body["code"] = json!("ClaimCodeInvalid");
+				StatusCode::FORBIDDEN
+			},
 			ApiError::NotFound(_) => StatusCode::NOT_FOUND,
 			ApiError::Conflict(_) => StatusCode::CONFLICT,
 			ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
@@ -79,6 +92,6 @@ impl IntoResponse for ApiError {
 				StatusCode::INTERNAL_SERVER_ERROR
 			},
 		};
-		(status, Json(json!({ "error": self.to_string() }))).into_response()
+		(status, Json(body)).into_response()
 	}
 }
