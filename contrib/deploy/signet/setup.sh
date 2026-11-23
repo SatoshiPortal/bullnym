@@ -426,6 +426,9 @@ public_url = "$PUBLIC_URL"
 
 $(pg_section bullnym "$PG_BULLNYM_PASS" bullnym)
 
+[limits]
+trusted_proxies = ["127.0.0.1", "::1"]
+
 [barkd]
 url = "http://127.0.0.1:3000"
 token = "$BARKD_TOKEN"
