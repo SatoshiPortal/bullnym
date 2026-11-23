@@ -166,13 +166,19 @@ async fn store_bitcoin_minimum_uses_usd_and_preserves_issued_addresses() {
 	let (expired, ()) = tokio::join!(svc.call(Method::POST, &expires_url, None, None), expire);
 	assert_eq!(expired.0, StatusCode::CONFLICT);
 
+	// Keep a real USD request open until the CRC endpoint responds. This checks
+	// independent price lookups without treating normal checkout latency as a lock.
 	let local_rate = async {
 		entered.notified().await;
 		let rate = svc.ok(Method::GET, "/api/v1/checkout/cafe/rate", None, None);
-		assert_eq!(tokio::time::timeout(Duration::from_secs(2), rate).await.unwrap()["currency"], "CRC");
+		assert_eq!(tokio::time::timeout(Duration::from_secs(8), rate).await
+			.expect("CRC must be served while the USD oracle is still waiting")["currency"], "CRC");
+		release.notify_one();
 	};
-	let (first, second, ()) = tokio::time::timeout(Duration::from_secs(6), async {
-		tokio::join!(svc.ok(Method::GET, checkout, None, None), svc.ok(Method::GET, checkout, None, None), local_rate)
+	let (held, ()) = tokio::join!(svc.app.price.quote("USD"), local_rate);
+	assert_eq!(held.unwrap().currency, "USD");
+	let (first, second) = tokio::time::timeout(Duration::from_secs(8), async {
+		tokio::join!(svc.ok(Method::GET, checkout, None, None), svc.ok(Method::GET, checkout, None, None))
 	}).await.expect("both checkouts must display Lightning during a slow USD outage");
 	for view in [first, second] { assert!(view["store"]["onchain_min_sat"].is_null()); }
 	release.notify_waiters();
