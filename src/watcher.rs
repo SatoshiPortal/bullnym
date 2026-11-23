@@ -550,16 +550,13 @@ pub async fn sale_ended(b: &Backends, sale_id: i64) {
 /// stays open for its payment.
 async fn expire_sales(app: &App) -> anyhow::Result<bool> {
 	let rows = {
-		let conn = app.watch.db.conn().await?;
-		// A sale reserved but never issued, because the process stopped
-		// before its invoice was stored, was never seen: delete it.
-		conn.execute("
-			DELETE FROM sale_payment WHERE sale_id IN (SELECT id FROM sale
-				WHERE issued_at IS NULL AND expires_at < NOW() - make_interval(secs => $1))
+		let mut conn = app.watch.db.conn().await?;
+		let expired = conn.query("
+			SELECT id FROM sale WHERE issued_at IS NULL AND expires_at < NOW() - make_interval(secs => $1)
 		", &[&DELIVERY_GRACE_SECS]).await?;
-		conn.execute("
-			DELETE FROM sale WHERE issued_at IS NULL AND expires_at < NOW() - make_interval(secs => $1)
-		", &[&DELIVERY_GRACE_SECS]).await?;
+		for row in expired {
+			crate::sales::discard_reservation(&mut conn, row.get("id")).await?;
+		}
 		conn.query("
 			SELECT s.id, s.public_id, p.id AS payment_id, p.payment_hash,
 				s.expires_at < NOW() - make_interval(secs => $1) AS past_grace,

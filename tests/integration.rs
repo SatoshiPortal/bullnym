@@ -780,6 +780,13 @@ async fn reserved_sales_stay_private_and_seen_payments_never_expire() {
 	let store = store_setup_with(&ctx, |cfg| cfg.sales.default_onchain_min_sat = 1000).await;
 	let svc = &store.svc;
 	let owner = Some(store.owner.token.as_str());
+	// Model an invoice slot removed before its backend call returns. The
+	// public API must refuse issuance if the slot cannot be filled.
+	svc.sql("CREATE RULE unavailable_slot AS ON UPDATE TO sale_payment WHERE OLD.payment_hash IS NULL DO INSTEAD NOTHING").await.unwrap();
+	let (status, _) = svc.call(Method::POST, &format!("/api/v1/checkout/{}/sales", store.nym), None,
+		Some(json!({ "amount_sat": 2000 }))).await;
+	svc.sql("DROP RULE unavailable_slot ON sale_payment").await.unwrap();
+	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 	store.forwarder.stop().await.unwrap();
 
 	// A sale reserved under the caps, whose invoice is not stored yet: nobody
