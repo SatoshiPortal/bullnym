@@ -25,6 +25,8 @@ export interface Sale {
 	onchain_address: string | null
 	paid_at: string | null
 	paid_rail: PaidRail | null
+	/** When the sale last changed: the newer of two snapshots wins. */
+	updated_at: string
 	/** Counted payments only: delivered invoices and confirmed outputs. */
 	received_sat: number
 	/** Unconfirmed on-chain payments: shown, never counted. */

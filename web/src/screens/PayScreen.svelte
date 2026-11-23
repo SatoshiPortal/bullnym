@@ -10,7 +10,7 @@
 	import { ApiError, type Sale } from '$lib/api'
 	import { formatFiat, formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { countdown, isLive, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
+	import { acceptSale, canAddBitcoin, countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
 	import { cachedSale, rememberSale } from '$lib/sale-cache'
 	import { client, session } from '$lib/session.svelte'
 	import BullSpinner from '$lib/components/BullSpinner.svelte'
@@ -37,17 +37,22 @@
 	let addingBitcoin = $state(false)
 	let bitcoinError = $state<string | null>(null)
 
-	// Long-poll until the sale leaves its live states. Each request returns
-	// when the state changes or after the server's wait limit.
+	/** Shows a snapshot of the sale, unless it is older than the one shown. */
+	function show(next: Sale) {
+		const kept = rememberSale(next)
+		if (acceptSale(sale, kept, id)) sale = kept
+	}
+
+	// Long-poll while the screen is open, also once the sale is paid: a
+	// paid sale still gets its rail label, and its address counts extra
+	// payments for 7 days. Each request returns when the state changes or
+	// after the server's wait limit.
 	$effect(() => {
 		const abort = new AbortController()
 		async function run() {
-			let current = untrack(() => sale)
-			if (!current) {
+			if (!untrack(() => sale)) {
 				try {
-					current = await client().sale(id)
-					sale = current
-					rememberSale(current)
+					show(await client().sale(id))
 				} catch (e) {
 					if (e instanceof ApiError && e.status === 404) {
 						notFound = true
@@ -56,13 +61,12 @@
 				}
 			}
 			while (!abort.signal.aborted) {
-				if (current && !isLive(current.state)) return
 				try {
+					const current = untrack(() => sale)
 					const next = current ? await client().waitSale(id, current.state, abort.signal) : await client().sale(id)
+					if (abort.signal.aborted) return
 					offline = false
-					current = next
-					sale = next
-					rememberSale(next)
+					show(next)
 				} catch (e) {
 					if (abort.signal.aborted) return
 					if (e instanceof ApiError && e.status === 404) {
@@ -97,6 +101,11 @@
 	const missing = $derived(sale ? missingSats(sale) : 0)
 	const onchainMin = $derived(session.checkout?.store.onchain_min_sat ?? null)
 	const bitcoinAllowed = $derived(sale !== null && onchainMin !== null && sale.amount_sat >= onchainMin)
+	// The confirmation closes, and asks for nothing, once the sale is paid,
+	// in progress or ended while it is open.
+	$effect(() => {
+		if (confirmingBitcoin && !canAddBitcoin(sale, onchainMin)) confirmingBitcoin = false
+	})
 	const qrValue = $derived(
 		sale ? (shown === 'bitcoin' && sale.onchain_request ? sale.onchain_request : sale.lightning_request) : null,
 	)
@@ -104,12 +113,14 @@
 	/** Adds Bitcoin to the sale, after the merchant confirmed. */
 	async function addBitcoin() {
 		if (!sale || addingBitcoin) return
+		if (!canAddBitcoin(sale, onchainMin)) {
+			confirmingBitcoin = false
+			return
+		}
 		addingBitcoin = true
 		bitcoinError = null
 		try {
-			const next = await client().addOnchain(sale.id)
-			rememberSale(next)
-			sale = next
+			show(await client().addOnchain(sale.id))
 			shown = 'bitcoin'
 		} catch (e) {
 			if (e instanceof ApiError && e.status === 503) bitcoinError = 'Bitcoin is not available right now. Try again in a moment.'
@@ -131,9 +142,7 @@
 		}
 		canceling = true
 		try {
-			const next = await client().cancelSale(sale.id)
-			rememberSale(next)
-			sale = next
+			show(await client().cancelSale(sale.id))
 			newSale()
 		} catch (e) {
 			// A payment arrived first; the long-poll shows it.
@@ -284,7 +293,7 @@
 			{/if}
 		</section>
 	</div>
-	{#if confirmingBitcoin}
+	{#if confirmingBitcoin && canAddBitcoin(sale, onchainMin)}
 		<ConfirmDialog
 			title="Bitcoin on-chain"
 			text="On-chain Bitcoin payments can take up to 60 minutes to confirm. Don't consider the payment complete until it is confirmed."

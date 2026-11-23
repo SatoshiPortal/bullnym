@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { Sale } from './api'
 import {
 	NOT_GUARANTEED,
+	acceptSale,
+	canAddBitcoin,
 	countdown,
 	isLive,
 	missingSats,
@@ -36,6 +38,7 @@ function sale(overrides: Partial<Sale> = {}): Sale {
 		progress: null,
 		warnings: [],
 		notice: null,
+		updated_at: '2026-11-22T10:00:00Z',
 		late_payment: false,
 		...overrides,
 	}
@@ -102,5 +105,40 @@ describe('sale presentation', () => {
 		const expires = Date.parse('2026-11-20T15:14:05Z')
 		expect(countdown('2026-11-20T15:14:05Z', expires - 125_000)).toBe('2:05')
 		expect(countdown('2026-11-20T15:14:05Z', expires)).toBeNull()
+	})
+})
+
+describe('following a sale', () => {
+	const id = sale().id
+	const at = (t: string) => `2026-11-22T10:00:${t}Z`
+
+	it('never goes back on a late or reordered response', () => {
+		const open = sale({ updated_at: at('00') })
+		const progress = sale({ state: 'in-progress', progress: 'onchain', updated_at: at('05') })
+		expect(acceptSale(null, open, id)).toBe(true)
+		expect(acceptSale(open, progress, id)).toBe(true)
+		// A delayed snapshot of the open state, older than the one shown.
+		expect(acceptSale(progress, open, id)).toBe(false)
+		// A payment replaced: back to open, but newer, so shown.
+		expect(acceptSale(progress, sale({ notice: 'payment-replaced', updated_at: at('09') }), id)).toBe(true)
+		// An ended sale never shows live again, whatever the response.
+		const paid = sale({ state: 'paid', updated_at: at('10') })
+		expect(acceptSale(paid, sale({ updated_at: at('11') }), id)).toBe(false)
+		// A later snapshot of the paid sale, with its rail or more credit, is.
+		expect(acceptSale(paid, sale({ state: 'paid', paid_rail: 'ark', updated_at: at('12') }), id)).toBe(true)
+		// Another sale's response, for a screen that moved on.
+		expect(acceptSale(open, sale({ id: 'another', updated_at: at('20') }), id)).toBe(false)
+	})
+
+	it('offers Bitcoin only while the sale is open, above the minimum, without an address', () => {
+		expect(canAddBitcoin(sale({ amount_sat: 50_000 }), 50_000)).toBe(true)
+		expect(canAddBitcoin(sale({ amount_sat: 49_999 }), 50_000)).toBe(false)
+		expect(canAddBitcoin(sale({ amount_sat: 60_000, onchain_request: 'bitcoin:x?amount=1' }), 50_000)).toBe(false)
+		// The sale settled while the confirmation was open: it closes.
+		for (const state of ['in-progress', 'paid', 'expired', 'canceled'] as const) {
+			expect(canAddBitcoin(sale({ amount_sat: 60_000, state }), 50_000)).toBe(false)
+		}
+		expect(canAddBitcoin(null, 50_000)).toBe(false)
+		expect(canAddBitcoin(sale({ amount_sat: 60_000 }), null)).toBe(false)
 	})
 })

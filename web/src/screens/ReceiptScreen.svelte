@@ -7,7 +7,7 @@
 	import { ApiError, type Sale } from '$lib/api'
 	import { formatFiat, formatSats, shortId } from '$lib/money'
 	import { router } from '$lib/router.svelte'
-	import { railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
+	import { acceptSale, railLabel, receiptNumber, saleAmountLabel, stageLabel } from '$lib/sale'
 	import { cachedSale, rememberSale } from '$lib/sale-cache'
 	import { client, session } from '$lib/session.svelte'
 	import Button from '$lib/components/Button.svelte'
@@ -18,16 +18,30 @@
 	let sale = $state<Sale | null>(untrack(() => cachedSale(id) ?? null))
 	let notFound = $state(false)
 
+	// Follows the sale while the receipt is open: its rail label can come
+	// after it is paid, and extra or late payments after that.
 	$effect(() => {
-		client()
-			.sale(id)
-			.then((s) => {
-				rememberSale(s)
-				sale = s
-			})
-			.catch((e) => {
-				if (e instanceof ApiError && e.status === 404) notFound = true
-			})
+		const abort = new AbortController()
+		async function run() {
+			while (!abort.signal.aborted) {
+				try {
+					const current = untrack(() => sale)
+					const next = current ? await client().waitSale(id, current.state, abort.signal) : await client().sale(id)
+					if (abort.signal.aborted) return
+					const kept = rememberSale(next)
+					if (acceptSale(untrack(() => sale), kept, id)) sale = kept
+				} catch (e) {
+					if (abort.signal.aborted) return
+					if (e instanceof ApiError && e.status === 404) {
+						notFound = true
+						return
+					}
+					await new Promise((r) => setTimeout(r, 2_000))
+				}
+			}
+		}
+		void run()
+		return () => abort.abort()
 	})
 
 	const isPaid = $derived(sale?.state === 'paid')
