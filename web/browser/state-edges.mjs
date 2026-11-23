@@ -155,6 +155,45 @@ export const stateEdges = {
 		assert.equal(fixture.sales.get('sale-1').currency, 'CRC')
 		assert.equal(fixture.sales.get('sale-1').fiat_amount, '2')
 	},
+	async CURRENCY_CHANGED_AT_CHARGE({ page, fixture }) {
+		await page.clock.install()
+		await open(page)
+		await page.getByText(/\/BTC/).waitFor()
+		await button(page, 'Add 5').click()
+
+		const delayed = Promise.withResolvers()
+		let hold = true
+		fixture.intercept = async (call) => {
+			if (hold && call.path.endsWith('/rate')) {
+				hold = false
+				await delayed.promise
+				return { json: { currency: 'USD', btc_price: '100000', fetched_at: new Date().toISOString() } }
+			}
+		}
+		const polling = page.waitForRequest((r) => r.url().endsWith('/rate'))
+		await page.clock.fastForward(60001)
+		await polling
+		try {
+			fixture.store.currency = 'CRC'
+			const rejected = page.waitForResponse((r) => r.url().endsWith('/sales') && r.status() === 409)
+			await button(page, 'Charge').click()
+			await rejected
+			await page.getByRole('tab', { name: 'CRC' }).waitFor()
+			await page.getByText(/store currency changed/i).waitFor()
+			assert.equal(fixture.sales.size, 0)
+			assert(await button(page, 'Charge').isDisabled())
+		} finally { delayed.resolve() }
+		await button(page, 'Add 2').click()
+		await button(page, 'Charge').click()
+		await page.getByText(/Waiting for payment/).waitFor()
+		const requests = fixture.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/sales'))
+		assert.deepEqual(requests.map((c) => c.body), [
+			{ fiat_amount: '5.00', expected_currency: 'USD' },
+			{ fiat_amount: '2', expected_currency: 'CRC' },
+		])
+		assert.equal(fixture.sales.size, 1)
+		assert.equal(fixture.sales.get('sale-1').currency, 'CRC')
+	},
 	async STORE_REFRESH_RETRY({ page, fixture }) {
 		await open(page, '#/settings')
 		await page.getByText('Coffee shop').waitFor()

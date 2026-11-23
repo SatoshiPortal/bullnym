@@ -62,7 +62,7 @@ export interface Rate {
 	fetched_at: string
 }
 
-export type NewSale = ({ fiat_amount: string } | { amount_sat: number }) & { memo?: string }
+export type NewSale = ({ fiat_amount: string; expected_currency: string } | { amount_sat: number }) & { memo?: string }
 
 export class ApiError extends Error {
 	constructor(

@@ -218,12 +218,17 @@ token and no login. The same page is the public checkout. Its API prefix is
 |---|---|---|
 | `GET <prefix>` | | `{"store": Store}`. Viewing allocates nothing |
 | `GET <prefix>/rate` | | `{"currency", "btc_price", "fetched_at"}` |
-| `POST <prefix>/sales` | `{"fiat_amount": "12.50"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) | `Sale` |
+| `POST <prefix>/sales` | `{"fiat_amount": "12.50", "expected_currency": "USD"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) | `Sale` |
 | `GET /api/v1/sales/<id>` | | `Sale` |
 | `GET /api/v1/sales/<id>?wait=<state>` | | `Sale`, when the state is not `<state>` or after 25 s |
 | `POST /api/v1/sales/<id>/onchain` | | `Sale` with a Bitcoin address; see below |
 | `POST /api/v1/sales/<id>/cancel` | | `Sale`; `409` unless the sale is open and no payment is arriving |
 | `POST <prefix>/pin` | `{"pin": "…"}` | `{"ok": true}` when it is the cashier PIN |
+
+For a fiat sale, send the currency displayed when the cashier entered the amount.
+If the store currency changed, the service returns HTTP 409 before creating an
+invoice. Refresh the store and ask the cashier to enter a new amount. Clients
+that omit `expected_currency` use the current store currency.
 
 The link cannot list the store's sales, export them or see other sales.
 Holding a sale's unguessable id is what lets a cashier follow it, add

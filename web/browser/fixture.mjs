@@ -109,6 +109,8 @@ export class Fixture {
 				: { status: 401, json: { error: 'wrong PIN', retry_after: 0 } }
 		}
 		if (path.endsWith('/checkout/cafe/sales') && method === 'POST') {
+			if (body.expected_currency && body.expected_currency !== this.store.currency)
+				return { status: 409, json: { error: 'The store currency changed. Enter the amount again.' } }
 			const id = 'sale-' + (this.sales.size + 1)
 			const next = sale(id, {
 				amount_sat: body.amount_sat ?? Math.round(Number(body.fiat_amount) * 1000),

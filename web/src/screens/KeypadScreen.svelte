@@ -25,6 +25,7 @@
 
 	let unit = $state<'fiat' | 'sat'>('fiat')
 	let amount = $state('')
+	let draftCurrency = $state('')
 	let memo = $state('')
 	let denominationNotice = $state('')
 	let active = true
@@ -35,27 +36,27 @@
 	const errorMsg = $derived(submission.kind === 'error' ? submission.message : null)
 	type Quote = { kind: 'loading' } | { kind: 'current'; rate: Rate } | { kind: 'unavailable'; last: Rate | null }
 	let quote = $state<Quote>({ kind: 'loading' })
+	let quoteRequest = 0
 	const rate = $derived(quote.kind === 'current' ? quote.rate : quote.kind === 'unavailable' ? quote.last : null)
 	const rateError = $derived(quote.kind === 'unavailable')
 
 	const precision = $derived(unit === 'sat' ? 0 : currencyPrecision(currency))
 
 	$effect(() => {
-		const expected = currency
+		const expected = store?.currency ?? 'USD'
 		quote = { kind: 'loading' }
 		// A fiat draft belongs to the denomination on which it was entered.
-		if (untrack(() => unit === 'fiat' && amount !== '')) {
+		if (untrack(() => unit === 'fiat' && amount !== '' && draftCurrency !== expected)) {
 			amount = ''
 			denominationNotice = 'The store currency changed. Enter the amount in ' + expected + '.'
 		}
 		let stopped = false
-		let generation = 0
 		let last: Rate | null = null
 		async function load() {
-			const request = ++generation
+			const request = ++quoteRequest
 			try {
 				const next = await client().rate()
-				if (stopped || request !== generation) return
+				if (stopped || request !== quoteRequest) return
 				if (next.currency !== expected) {
 					last = null
 					quote = { kind: 'unavailable', last }
@@ -65,7 +66,7 @@
 				last = next
 				quote = { kind: 'current', rate: next }
 			} catch {
-				if (!stopped && request === generation) quote = { kind: 'unavailable', last }
+				if (!stopped && request === quoteRequest) quote = { kind: 'unavailable', last }
 			}
 		}
 		void load()
@@ -85,7 +86,7 @@
 		const fiat = (sats / 1e8) * Number(rate.btc_price)
 		return `≈ ${formatFiat(fiat, rate.currency)}`
 	})
-	const rateReady = $derived(unit === 'sat' || rate !== null)
+	const rateReady = $derived(unit === 'sat' || (rate?.currency === currency && draftCurrency === currency))
 	const memoTooLong = $derived(Array.from(memo.trim()).length > 200)
 	const canCharge = $derived(sats > 0 && rateReady && !memoTooLong && !creating)
 
@@ -93,6 +94,7 @@
 		if (creating) return
 		denominationNotice = ''
 		submission = { kind: 'editing' }
+		if (unit === 'fiat' && !amount) draftCurrency = currency
 		amount = applyAmountInput(amount, key, precision)
 	}
 
@@ -110,7 +112,8 @@
 		const note = memo.trim() || undefined
 		try {
 			const sale = await client().createSale(
-				unit === 'sat' ? { amount_sat: sats, memo: note } : { fiat_amount: normalizeFiat(amount, precision), memo: note },
+				unit === 'sat' ? { amount_sat: sats, memo: note } :
+					{ fiat_amount: normalizeFiat(amount, precision), expected_currency: draftCurrency, memo: note },
 			)
 			rememberSale(sale)
 			rememberLocalSale(sale.id)
@@ -119,6 +122,16 @@
 			memo = ''
 			router.go(`/pay/${sale.id}`)
 		} catch (e) {
+			if (!active) return
+			if (unit === 'fiat' && e instanceof ApiError && e.status === 409) {
+				++quoteRequest
+				amount = ''
+				quote = { kind: 'loading' }
+				submission = { kind: 'editing' }
+				denominationNotice = e.message
+				refreshCheckout()
+				return
+			}
 			let message = e instanceof Error ? e.message : 'Something went wrong'
 			if (e instanceof ApiError && (e.status === 0 || e.status === 502)) {
 				message = e.message + '. We could not confirm whether the sale was created. Check the owner’s sales before trying again.'

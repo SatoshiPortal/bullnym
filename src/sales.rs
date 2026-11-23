@@ -12,13 +12,14 @@ use tokio_postgres::GenericClient;
 
 use crate::App;
 use crate::database::{Rail, SALE_SELECT, STORE_COLUMNS, Sale, SaleState, Store};
-use crate::error::{ApiError, ApiResult, bad_request, not_found};
+use crate::error::{ApiError, ApiResult, bad_request, conflict, not_found};
 use crate::money::{Decimal, MAX_FIAT_INTEGER, MAX_SAT, currency_decimals};
 use crate::rails::onchain::StoreDescriptor;
 use crate::token;
 
 
 pub const MAX_MEMO_CHARS: usize = 200;
+pub(crate) const CURRENCY_CHANGED: &str = "The store currency changed. Enter the amount again.";
 
 /// The amount a sale is created for.
 #[derive(Debug, Clone)]
@@ -219,6 +220,13 @@ async fn reserve_sale(
 ) -> ApiResult<i64> {
 	let mut conn = app.public.db.conn().await?;
 	let tx = conn.transaction().await?;
+	// Keep the quoted currency valid until the fiat sale is reserved, including
+	// when the owner changes the store while the price request is in flight.
+	if fiat.is_some() && tx.query_opt(
+		"SELECT id FROM store WHERE id = $1 AND currency = $2 FOR SHARE", &[&store.id, &store.currency],
+	).await?.is_none() {
+		return Err(conflict(CURRENCY_CHANGED));
+	}
 	lock_caps(&tx).await?;
 	let open_sales: i64 = tx.query_one(
 		"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&store.id],

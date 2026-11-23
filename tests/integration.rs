@@ -55,6 +55,53 @@ async fn owner_csv(store: &Store) -> String {
 }
 
 #[tokio::test]
+async fn fiat_sale_keeps_the_cashiers_currency() {
+	let ctx = TestContext::new("bullnym/fiat_sale_keeps_the_cashiers_currency").await;
+	let store = store_setup(&ctx).await;
+	let svc = &store.svc;
+	let owner = Some(store.owner.token.as_str());
+	let checkout = "/api/v1/checkout/cafe/sales";
+	let usd = json!({ "fiat_amount": "5.00", "expected_currency": "USD" });
+	svc.ok(Method::PATCH, "/api/v1/owner/store", owner, Some(json!({ "currency": "USD" }))).await;
+
+	// The cashier can still read USD while the owner's change is uncommitted.
+	// Commit that edit once the sale is waiting to reserve the quoted amount.
+	let mut conn = svc.app.public.db.conn().await.unwrap();
+	let tx = conn.transaction().await.unwrap();
+	tx.execute("UPDATE store SET currency = 'CRC' WHERE nym_id = (SELECT id FROM nym WHERE name = 'cafe')",
+		&[]).await.unwrap();
+	let editor: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+	let edit = async {
+		let probe = svc.app.public.db.conn().await.unwrap();
+		tokio::time::timeout(Duration::from_secs(20), async {
+			loop {
+				let waiting: bool = probe.query_one(
+					"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+					&[&editor],
+				).await.unwrap().get(0);
+				if waiting { break; }
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}).await.expect("the fiat reservation waited for the owner edit");
+		tx.commit().await.unwrap();
+	};
+	let ((status, _), ()) = tokio::join!(svc.call(Method::POST, checkout, None, Some(usd.clone())), edit);
+	assert_eq!(status, StatusCode::CONFLICT);
+	// A draft submitted after the edit also conflicts, before checking CRC precision.
+	assert_eq!(svc.call(Method::POST, checkout, None, Some(usd)).await.0, StatusCode::CONFLICT);
+	let counts = conn.query_one("SELECT (SELECT count(*) FROM sale), (SELECT count(*) FROM sale_payment)", &[])
+		.await.unwrap();
+	assert_eq!((counts.get::<_, i64>(0), counts.get::<_, i64>(1)), (0, 0));
+
+	let sale = store.new_sale(json!({ "fiat_amount": "12500", "expected_currency": "CRC" })).await;
+	assert_eq!(sale["currency"], "CRC");
+	assert!(sale["lightning_invoice"].is_string());
+	let history = svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await;
+	assert_eq!(history["sales"].as_array().unwrap().len(), 1);
+	assert_eq!(history["sales"][0]["id"], sale["id"]);
+}
+
+#[tokio::test]
 async fn sale_paid_by_lightning() {
 	let ctx = TestContext::new("bullnym/sale_paid_by_lightning").await;
 	let store = store_setup(&ctx).await;

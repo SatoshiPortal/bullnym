@@ -46,6 +46,7 @@ async fn store_of(app: &App, nym: &str) -> ApiResult<Store> {
 #[derive(Deserialize)]
 pub struct CreateSale {
 	fiat_amount: Option<String>,
+	expected_currency: Option<String>,
 	amount_sat: Option<u64>,
 	memo: Option<String>,
 }
@@ -90,8 +91,12 @@ pub async fn create_sale(
 	check_lookup_name(&app, &caller, &nym).await?;
 	let store = store_of(&app, &nym).await?;
 	let amount = match (req.fiat_amount, req.amount_sat) {
-		(Some(fiat), None) => SaleAmount::Fiat(fiat.parse::<Decimal>()
-			.map_err(|e| bad_request(e.to_string()))?),
+		(Some(fiat), None) => {
+			if req.expected_currency.as_ref().is_some_and(|expected| expected != &store.currency) {
+				return Err(conflict(sales::CURRENCY_CHANGED));
+			}
+			SaleAmount::Fiat(fiat.parse::<Decimal>().map_err(|e| bad_request(e.to_string()))?)
+		},
 		(None, Some(sat)) => SaleAmount::Sat(bitcoin::Amount::from_sat(sat)),
 		_ => return Err(bad_request("give exactly one of fiat_amount and amount_sat")),
 	};
