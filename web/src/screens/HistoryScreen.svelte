@@ -6,7 +6,8 @@
 	// The list shows only after the service accepted the owner's cashier PIN,
 	// typed on the POS keypad, and only while this screen stays open. Without
 	// a PIN it stays hidden.
-	import type { Sale } from '$lib/api'
+	import { onDestroy } from 'svelte'
+	import { ApiError, type Sale } from '$lib/api'
 	import { applyPinInput, MIN_PIN_DIGITS, pinRefusal } from '$lib/pin'
 	import { client, localSaleIds, session } from '$lib/session.svelte'
 	import BullFooter from '$lib/components/BullFooter.svelte'
@@ -18,38 +19,73 @@
 	const pinSet = $derived(session.checkout?.store.cashier_pin_set ?? false)
 
 	let pin = $state('')
-	let unlocked = $state(false)
-	let checking = $state(false)
-	let pinError = $state<string | null>(null)
+	type Gate = { kind: 'locked' | 'checking' | 'unlocked' } | { kind: 'refused'; message: string } | { kind: 'waiting'; message: string; until: number }
+	let gate = $state<Gate>({ kind: 'locked' })
+	type List = { kind: 'loading' } | { kind: 'loaded' | 'incomplete'; rows: Sale[] }
+	let list = $state<List>({ kind: 'loading' })
+	let generation = 0
+	let active = true
+	onDestroy(() => { active = false; generation++ })
 
-	let rows = $state<Sale[]>([])
-	let loading = $state(true)
-	let errorMsg = $state<string | null>(null)
+	function lock() {
+		generation++
+		gate = { kind: 'locked' }
+		pin = ''
+		list = { kind: 'loading' }
+	}
+	$effect(() => { if (!pinSet) lock() })
+	$effect(() => {
+		if (gate.kind !== 'waiting') return
+		const timer = setTimeout(lock, Math.max(0, gate.until - Date.now()))
+		return () => clearTimeout(timer)
+	})
+	$effect(() => {
+		if (gate.kind !== 'unlocked') return
+		void load()
+		const storage = (event: StorageEvent) => {
+			if (!event.key || event.key.startsWith('bullnym:' + session.link?.nym + ':')) void load()
+		}
+		window.addEventListener('storage', storage)
+		window.addEventListener('online', load)
+		window.addEventListener('focus', load)
+		window.addEventListener('pagehide', lock)
+		return () => {
+			window.removeEventListener('storage', storage)
+			window.removeEventListener('online', load)
+			window.removeEventListener('focus', load)
+			window.removeEventListener('pagehide', lock)
+		}
+	})
 
 	async function load() {
-		loading = true
-		errorMsg = null
-		const results = await Promise.allSettled(localSaleIds().map((id) => client().sale(id)))
-		rows = results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []))
-		if (rows.length === 0 && results.some((r) => r.status === 'rejected')) errorMsg = 'Could not load sales'
-		loading = false
+		const request = ++generation
+		const ids = localSaleIds()
+		const results = await Promise.allSettled(ids.map((id) => client().sale(id)))
+		if (!active || request !== generation) return
+		const rows = results.flatMap((r, i) => r.status === 'fulfilled' && r.value.id === ids[i] ? [r.value] : [])
+		list = { kind: rows.length === ids.length ? 'loaded' : 'incomplete', rows }
 	}
 
 	async function unlock() {
-		if (checking || pin.length < MIN_PIN_DIGITS) return
-		checking = true
-		pinError = null
+		if (gate.kind === 'checking' || gate.kind === 'waiting' || pin.length < MIN_PIN_DIGITS) return
+		const request = ++generation
+		gate = { kind: 'checking' }
 		try {
 			await client().checkPin(pin)
-			unlocked = true
-			void load()
+			if (active && request === generation) gate = { kind: 'unlocked' }
 		} catch (e) {
-			pinError = pinRefusal(e)
+			if (!active || request !== generation) return
+			if (e instanceof ApiError && e.status === 404 && session.checkout) {
+				session.store = { kind: 'ready', checkout: { store: { ...session.checkout.store, cashier_pin_set: false } } }
+			}
+			gate = e instanceof ApiError && e.retryAfter > 0
+				? { kind: 'waiting', message: pinRefusal(e), until: Date.now() + e.retryAfter * 1000 }
+				: { kind: 'refused', message: pinRefusal(e) }
 		} finally {
-			pin = ''
-			checking = false
+			if (request === generation) pin = ''
 		}
 	}
+
 </script>
 
 <main class="min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
@@ -70,7 +106,7 @@
 			<p class="rounded-lg border border-[#d7c8b4] bg-[#fffaf0] px-4 py-12 text-center text-sm text-[#776b5a] dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]">
 				The owner has not set a cashier PIN, so the sales of this device are not shown.
 			</p>
-		{:else if !unlocked}
+		{:else if gate.kind !== 'unlocked'}
 			<div class="mx-auto flex max-w-sm flex-col gap-4">
 				<div class="text-right">
 					<div class="font-display text-xs uppercase tracking-[0.18em] text-[#776b5a] dark:text-[#b9aa91]">Cashier PIN</div>
@@ -81,21 +117,23 @@
 						{'•'.repeat(pin.length) || '—'}
 					</div>
 				</div>
-				<Keypad precision={null} onInput={(key) => (pin = applyPinInput(pin, key))} />
-				{#if pinError}
-					<p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{pinError}</p>
+				<Keypad disabled={gate.kind === 'checking' || gate.kind === 'waiting'} precision={null} onInput={(key) => (pin = applyPinInput(pin, key))} />
+				{#if gate.kind === 'refused' || gate.kind === 'waiting'}
+					<p class="rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{gate.message}</p>
 				{/if}
-				<Button disabled={checking || pin.length < MIN_PIN_DIGITS} onclick={unlock}>
-					{checking ? 'Checking' : 'Show sales'}
+				<Button disabled={gate.kind === 'checking' || gate.kind === 'waiting' || pin.length < MIN_PIN_DIGITS} onclick={unlock}>
+					{gate.kind === 'checking' ? 'Checking' : 'Show sales'}
 				</Button>
 			</div>
 		{:else}
-			{#if errorMsg}
-				<p class="mb-4 rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]">{errorMsg}</p>
-			{/if}
-
-			{#if !loading}
-				<TransactionSheet {rows} />
+			{#if list.kind === 'loading'}
+				<p role="status">Loading sales…</p>
+			{:else}
+				{#if list.kind === 'incomplete'}
+					<p role="alert">Could not load all sales on this device.</p>
+					<Button variant="secondary" onclick={load}>Try again</Button>
+				{/if}
+				{#if list.rows.length || list.kind === 'loaded'}<TransactionSheet rows={list.rows} />{/if}
 			{/if}
 		{/if}
 

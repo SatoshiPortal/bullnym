@@ -18,6 +18,7 @@ import {
 
 function sale(overrides: Partial<Sale> = {}): Sale {
 	return {
+		store_nym: 'cafe',
 		id: '4f1c9a2e-0000-4000-8000-1234567890ab',
 		created_at: '2026-11-20T15:04:05Z',
 		expires_at: '2026-11-20T15:14:05Z',
@@ -128,6 +129,10 @@ describe('following a sale', () => {
 		expect(acceptSale(paid, sale({ state: 'paid', paid_rail: 'ark', updated_at: at('12') }), id)).toBe(true)
 		// Another sale's response, for a screen that moved on.
 		expect(acceptSale(open, sale({ id: 'another', updated_at: at('20') }), id)).toBe(false)
+		const allocated = sale({ onchain_address: 'addr', updated_at: '2026-11-20T15:04:05.123456Z' })
+		expect(acceptSale(allocated, sale({ updated_at: allocated.updated_at }), id)).toBe(false)
+		expect(acceptSale(allocated, { ...allocated, updated_at: '2026-11-20T15:04:05.123455Z' }, id)).toBe(false)
+		expect(acceptSale(allocated, { ...allocated, updated_at: '2026-11-20T15:04:05.123457Z' }, id)).toBe(true)
 	})
 
 	it('offers Bitcoin only while the sale is open, above the minimum, without an address', () => {

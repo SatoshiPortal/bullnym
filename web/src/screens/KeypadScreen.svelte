@@ -2,6 +2,7 @@
 	// Ported from bullnym's KeypadScreen (nostr-pos's Keypad layout): header
 	// with the store name and History/Settings buttons, a big amount, the
 	// keypad, a memo, and the Charge button pinned at the bottom.
+	import { onDestroy } from 'svelte'
 	import { ApiError, type Rate } from '$lib/api'
 	import { applyAmountInput } from '$lib/amount-input'
 	import { currencyPrecision, fiatToSats, formatFiat, formatRate, formatSats, normalizeFiat } from '$lib/money'
@@ -22,31 +23,42 @@
 	let unit = $state<'fiat' | 'sat'>('fiat')
 	let amount = $state('')
 	let memo = $state('')
-	let creating = $state(false)
-	let errorMsg = $state<string | null>(null)
-	let rate = $state<Rate | null>(null)
-	let rateError = $state(false)
+	let active = true
+	onDestroy(() => { active = false })
+	type Submission = { kind: 'editing' | 'creating' } | { kind: 'error'; message: string }
+	let submission = $state<Submission>({ kind: 'editing' })
+	const creating = $derived(submission.kind === 'creating')
+	const errorMsg = $derived(submission.kind === 'error' ? submission.message : null)
+	type Quote = { kind: 'loading' } | { kind: 'current'; rate: Rate } | { kind: 'unavailable'; last: Rate | null }
+	let quote = $state<Quote>({ kind: 'loading' })
+	const rate = $derived(quote.kind === 'current' ? quote.rate : quote.kind === 'unavailable' ? quote.last : null)
+	const rateError = $derived(quote.kind === 'unavailable')
 
 	const precision = $derived(unit === 'sat' ? 0 : currencyPrecision(currency))
 
 	$effect(() => {
 		let stopped = false
+		let generation = 0
+		let last: Rate | null = null
 		async function load() {
+			const request = ++generation
 			try {
 				const next = await client().rate()
-				if (!stopped) {
-					rate = next
-					rateError = false
+				if (!stopped && request === generation) {
+					last = next
+					quote = { kind: 'current', rate: next }
 				}
 			} catch {
-				if (!stopped) rateError = true
+				if (!stopped && request === generation) quote = { kind: 'unavailable', last }
 			}
 		}
 		void load()
+		window.addEventListener('online', load)
 		const timer = setInterval(load, RATE_REFRESH_MS)
 		return () => {
 			stopped = true
 			clearInterval(timer)
+			window.removeEventListener('online', load)
 		}
 	})
 
@@ -61,19 +73,21 @@
 	const canCharge = $derived(sats > 0 && rateReady && !creating)
 
 	function applyInput(key: string) {
+		if (creating) return
+		submission = { kind: 'editing' }
 		amount = applyAmountInput(amount, key, precision)
 	}
 
 	function setUnit(next: 'fiat' | 'sat') {
-		if (unit === next) return
+		if (creating || unit === next) return
+		submission = { kind: 'editing' }
 		unit = next
 		amount = ''
 	}
 
 	async function charge() {
 		if (!canCharge) return
-		creating = true
-		errorMsg = null
+		submission = { kind: 'creating' }
 		const note = memo.trim() || undefined
 		try {
 			const sale = await client().createSale(
@@ -81,16 +95,15 @@
 			)
 			rememberSale(sale)
 			rememberLocalSale(sale.id)
+			if (!active) return
 			amount = ''
 			memo = ''
 			router.go(`/pay/${sale.id}`)
 		} catch (e) {
-			if (e instanceof ApiError && e.status === 0) errorMsg = 'The server is not reachable'
-			else if (e instanceof ApiError && e.status === 503) errorMsg = 'Payments are not available right now. Try again in a moment.'
-			else if (e instanceof ApiError && e.status === 429) errorMsg = 'Too many sales at once. Try again in a moment.'
-			else errorMsg = e instanceof Error ? e.message : 'Something went wrong'
-		} finally {
-			creating = false
+			let message = e instanceof Error ? e.message : 'Something went wrong'
+			if (e instanceof ApiError && e.status === 0) message = 'The server is not reachable'
+			if (e instanceof ApiError && e.status === 429) message = 'Too many sales at once. Try again in a moment.'
+			submission = { kind: 'error', message }
 		}
 	}
 </script>
@@ -113,6 +126,7 @@
 								<button
 									type="button"
 									role="tab"
+									disabled={creating}
 									aria-selected={unit === value}
 									class={`min-h-9 rounded-md px-4 font-semibold transition ${
 										unit === value
@@ -127,11 +141,12 @@
 						</div>
 					</div>
 					<AmountDisplay amount={amount || '0'} unit={unit === 'sat' ? 'sat' : currency} {precision} {hint} />
-					<Keypad {precision} onInput={applyInput} />
+					<Keypad disabled={creating} {precision} onInput={applyInput} />
 					<label class="flex shrink-0 flex-col gap-1.5">
 						<span class="text-xs font-medium uppercase tracking-[0.12em] text-[#776b5a] dark:text-[#b9aa91]">Memo</span>
 						<textarea
 							class="min-h-12 rounded-lg border border-[#d7c8b4] bg-[#fffaf0] px-4 py-3 text-base outline-none focus:ring-2 focus:ring-[#B7000B] dark:border-[#3a342a] dark:bg-[#211f1a]"
+							disabled={creating}
 							bind:value={memo}
 							placeholder="Add a memo for this sale"
 							maxlength="200"

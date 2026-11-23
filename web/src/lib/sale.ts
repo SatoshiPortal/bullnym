@@ -69,7 +69,7 @@ export function progressText(sale: Sale): { title: string; lines: string[] } {
 	if (sale.progress === 'ark') {
 		return {
 			title: 'The Ark payment is being delivered',
-			lines: ['The Ark server accepted it and is delivering it to the wallet. The sale is paid once it is delivered.'],
+			lines: ['Waiting for the wallet service to confirm delivery.'],
 		}
 	}
 	const lines = sale.warnings.map(warningText)
@@ -123,7 +123,12 @@ export function acceptSale(current: Sale | null, next: Sale, id: string): boolea
 	if (next.id !== id) return false
 	if (!current) return true
 	if (!isLive(current.state) && next.state !== current.state) return false
-	return Date.parse(next.updated_at) >= Date.parse(current.updated_at)
+	if (current.onchain_address && !next.onchain_address) return false
+	if (!current.updated_at) return true
+	if (!next.updated_at) return false
+	// The service emits UTC timestamps. Removing Z orders fractional seconds
+	// at their full PostgreSQL precision, including submillisecond updates.
+	return next.updated_at.replace(/Z$/, '') > current.updated_at.replace(/Z$/, '')
 }
 
 /** Whether Bitcoin can be added to the sale now: open, without an address, and at the store's minimum. */

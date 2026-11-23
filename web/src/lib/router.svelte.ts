@@ -8,7 +8,11 @@ function parseHash(): string {
 
 const state = $state({ path: parseHash() })
 
-window.addEventListener('hashchange', () => {
+window.addEventListener('hashchange', (event) => {
+	const from = new URL(event.oldURL).hash
+	if (parseHash().startsWith('/receipt/') && (from === '#/history' || from.startsWith('#/pay/'))) {
+		history.replaceState({ ...history.state, receiptParent: true }, '')
+	}
 	state.path = parseHash()
 })
 
@@ -27,7 +31,13 @@ export const router = {
 		const params: Record<string, string> = {}
 		for (let i = 0; i < p.length; i++) {
 			const seg = p[i]!
-			if (seg.startsWith(':')) params[seg.slice(1)] = decodeURIComponent(a[i]!)
+			if (seg.startsWith(':')) {
+				try {
+					params[seg.slice(1)] = decodeURIComponent(a[i]!)
+				} catch {
+					return null
+				}
+			}
 			else if (seg !== a[i]) return null
 		}
 		return params
