@@ -17,7 +17,10 @@ const visible = async (page, text) => {
 	await page.getByText(text, { exact: false }).first().waitFor()
 	await checkpoint(page, String(text))
 }
-const click = (page, name) => button(page, name).click()
+const click = async (page, name) => {
+	await button(page, name).click()
+	await checkpoint(page, 'click ' + name)
+}
 const open = (page, hash = '') => page.goto(url(hash))
 const digits = async (page, number) => {
 	for (const n of number) await click(page, 'Add ' + n)
@@ -641,7 +644,10 @@ export const journeys = {
 		await click(page, 'Copy')
 		assert.equal(await page.getByLabel('Copy this payment request manually').inputValue(), row.lightning_request)
 		await click(page, 'Copy Lightning invoice')
-		assert.equal(await page.getByLabel('Copy Lightning invoice manually').inputValue(), row.lightning_invoice)
+		const manual = page.getByLabel('Copy Lightning invoice manually')
+		assert.equal(await manual.inputValue(), row.lightning_invoice)
+		await manual.focus()
+		assert.deepEqual(await manual.evaluate((input) => [input.selectionStart, input.selectionEnd]), [0, row.lightning_invoice.length])
 		Object.assign(row, paid())
 		await click(page, 'Receipt')
 		await click(page, 'Share')
