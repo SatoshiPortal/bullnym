@@ -46,16 +46,14 @@ export const uxJourneys = {
 		await screenStates(options, (state) => layout(options.page, state, errors))
 		finish(errors)
 	},
-	async PWA_REOPEN({ page, context, fixture }) {
-		await open(page, '')
+	async PWA_REOPEN({ page, context }) {
+		await page.goto(origin + '/pwa-test')
 		await page.getByText(/\/BTC/).waitFor()
 		await page.waitForFunction(() => !!navigator.serviceWorker.controller, undefined, { timeout: 30000 })
 		await context.setOffline(true)
-		fixture.intercept = () => ({ abort: true })
 		await page.reload({ waitUntil: 'domcontentloaded' })
 		await page.getByText('The server is not reachable.').waitFor()
 		await checkpoint(page, 'offline-shell', true)
-		fixture.intercept = undefined
 		await context.setOffline(false)
 		await page.getByRole('tab', { name: 'Sats' }).waitFor()
 	},
@@ -88,6 +86,30 @@ export const uxJourneys = {
 		await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })))
 		await page.getByRole('button', { name: 'Show sales' }).waitFor()
 		assert(await page.getByRole('button', { name: 'Show sales' }).isDisabled())
+	},
+	async DARK_CONTROLS({ page, fixture }) {
+		const errors = []
+		await page.emulateMedia({ colorScheme: 'dark' })
+		fixture.sales.set('dark', sale('dark'))
+		await open(page, '#/pay/dark')
+		const copy = page.getByRole('button', { name: 'Copy', exact: true })
+		await copy.hover()
+		const background = await copy.evaluate(async (el) => {
+			await Promise.all(el.getAnimations().map((animation) => animation.finished))
+			return getComputedStyle(el).backgroundColor
+		})
+		if (Number(background.match(/\d+/)?.[0]) > 140) errors.push('Dark hover turned the Copy background pale')
+		fixture.store.cashier_pin_set = true
+		fixture.intercept = (c) => c.path.endsWith('/pin') ? { status: 401, json: { error: 'wrong PIN', retry_after: 120 } } : null
+		await open(page, '#/history')
+		await page.reload()
+		for (const n of '1234') await key(page, n)
+		await page.getByRole('button', { name: 'Show sales' }).click()
+		await page.getByText('Wrong PIN.', { exact: false }).waitFor()
+		const digit = page.getByRole('button', { name: 'Add 1', exact: true })
+		assert(await digit.isDisabled())
+		if (await digit.evaluate((el) => Number(getComputedStyle(el).opacity)) >= 1) errors.push('Locked keypad still looks enabled')
+		finish(errors)
 	},
 	async KEYPAD_TYPE({ page }) {
 		await open(page, '')

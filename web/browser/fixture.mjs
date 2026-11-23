@@ -68,7 +68,7 @@ export class Fixture {
 	pinChecks = []
 	time = Date.now()
 	async attach(context) {
-		await context.route(origin + '/**', async (route) => {
+		await context.route(origin + (process.env.APP_ORIGIN ? '/api/**' : '/**'), async (route) => {
 			const req = route.request()
 			const url = new URL(req.url())
 			const path = url.pathname
