@@ -172,6 +172,8 @@ export class PosClient {
 			opts.signal?.throwIfAborted()
 			const res = await this.fetchFn(`${this.baseUrl}${path}`, {
 				method,
+				// Firefox can replay an earlier checkout or sale response on offline reload.
+				cache: 'no-store',
 				headers,
 				body: body === undefined ? undefined : JSON.stringify(body),
 				signal: timeout.signal,
