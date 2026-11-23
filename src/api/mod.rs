@@ -66,6 +66,11 @@ pub fn router(app: Arc<App>) -> Router {
 /// source per hour.
 pub async fn check_lookup(app: &App, caller: &Caller, name: &str) -> ApiResult<()> {
 	app.protect.check(caller, Surface::Lookup)?;
+	check_lookup_name(app, caller, name).await
+}
+
+/// Counts distinct names on endpoints that have their own request limit.
+pub async fn check_lookup_name(app: &App, caller: &Caller, name: &str) -> ApiResult<()> {
 	if caller.bypass {
 		return Ok(());
 	}

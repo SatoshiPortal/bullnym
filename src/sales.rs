@@ -12,13 +12,14 @@ use tokio_postgres::GenericClient;
 
 use crate::App;
 use crate::database::{Rail, SALE_SELECT, STORE_COLUMNS, Sale, SaleState, Store};
-use crate::error::{ApiError, ApiResult, bad_request, not_found};
+use crate::error::{ApiError, ApiResult, bad_request, conflict, not_found};
 use crate::money::{Decimal, MAX_FIAT_INTEGER, MAX_SAT, currency_decimals};
 use crate::rails::onchain::StoreDescriptor;
 use crate::token;
 
 
 pub const MAX_MEMO_CHARS: usize = 200;
+pub(crate) const CURRENCY_CHANGED: &str = "The store currency changed. Enter the amount again.";
 
 /// The amount a sale is created for.
 #[derive(Debug, Clone)]
@@ -38,6 +39,7 @@ pub struct NewSale {
 #[derive(Debug, Clone, Serialize)]
 pub struct SaleView {
 	pub id: String,
+	pub store_nym: String,
 	pub created_at: DateTime<Utc>,
 	pub expires_at: DateTime<Utc>,
 	pub state: SaleState,
@@ -81,6 +83,7 @@ impl From<Sale> for SaleView {
 		let amount = Amount::from_sat(s.amount_sat as u64);
 		SaleView {
 			id: s.public_id,
+			store_nym: s.store_nym,
 			created_at: s.created_at,
 			expires_at: s.expires_at,
 			state: s.state,
@@ -204,13 +207,6 @@ pub async fn lock_caps(tx: &tokio_postgres::Transaction<'_>) -> Result<(), tokio
 	Ok(())
 }
 
-/// A new sale, reserved under the caps before any backend call: the sale
-/// row, and the slot of its invoice when it may have one.
-struct Reservation {
-	sale_id: i64,
-	invoice_slot: Option<i64>,
-}
-
 /// Reserves a sale in one transaction with the count of the caps: the
 /// store's open sales, and whether the sale may have an invoice (barkd and
 /// the Ark server healthy, the cap on open invoices not reached, room in
@@ -221,9 +217,16 @@ async fn reserve_sale(
 	memo: &Option<String>,
 	amount_sat: Amount,
 	fiat: &Option<(Decimal, Decimal)>,
-) -> ApiResult<Reservation> {
+) -> ApiResult<i64> {
 	let mut conn = app.public.db.conn().await?;
 	let tx = conn.transaction().await?;
+	// Keep the quoted currency valid until the fiat sale is reserved, including
+	// when the owner changes the store while the price request is in flight.
+	if fiat.is_some() && tx.query_opt(
+		"SELECT id FROM store WHERE id = $1 AND currency = $2 FOR SHARE", &[&store.id, &store.currency],
+	).await?.is_none() {
+		return Err(conflict(CURRENCY_CHANGED));
+	}
 	lock_caps(&tx).await?;
 	let open_sales: i64 = tx.query_one(
 		"SELECT count(*) FROM sale WHERE store_id = $1 AND state = 'open'", &[&store.id],
@@ -245,6 +248,10 @@ async fn reserve_sale(
 		true
 	};
 
+	if !invoice_ok {
+		return Err(ApiError::Upstream(anyhow::anyhow!("cannot reserve a sale invoice")));
+	}
+
 	let public_id = token::random_hex(16);
 	let sale_id: i64 = tx.query_one("
 		INSERT INTO sale (public_id, store_id, amount_sat, fiat_amount, currency, btc_price, memo,
@@ -259,15 +266,9 @@ async fn reserve_sale(
 		memo, &(app.cfg.sales.expiry().as_secs() as f64),
 	]).await?.get("id");
 	// The invoice slot counts against the cap on open invoices from now on.
-	let invoice_slot = if invoice_ok {
-		Some(tx.query_one("
-			INSERT INTO sale_payment (sale_id, rail) VALUES ($1, 'lightning') RETURNING id
-		", &[&sale_id]).await?.get::<_, i64>("id"))
-	} else {
-		None
-	};
+	tx.execute("INSERT INTO sale_payment (sale_id, rail) VALUES ($1, 'lightning')", &[&sale_id]).await?;
 	tx.commit().await?;
-	Ok(Reservation { sale_id, invoice_slot })
+	Ok(sale_id)
 }
 
 /// The most addresses one sale skips because another store issued them.
@@ -319,6 +320,12 @@ async fn next_address(
 	anyhow::bail!("{} addresses in a row of store {} belong to other sales", MAX_ADDRESS_SKIPS + 1, store.id)
 }
 
+fn invoice_description(text: &str) -> &str {
+	let mut end = text.len().min(639);
+	while !text.is_char_boundary(end) { end -= 1; }
+	&text[..end]
+}
+
 /// Creates a sale with its one invoice, for Lightning and Ark payers. A
 /// sale never gets a Bitcoin address by default: the merchant adds one with
 /// [add_onchain]. Without an invoice the sale is refused with the fixed
@@ -334,61 +341,66 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 	let ark_address = ark::Address::from_str(&store.ark_address)
 		.context("store has an invalid Ark address")?;
 	let expiry = app.cfg.sales.expiry();
-	let description = Some(memo.clone().unwrap_or_else(|| store.name.clone()));
+	// BOLT11 descriptions fit in 639 bytes. Keep the complete memo on the receipt.
+	let text = memo.as_deref().unwrap_or(&store.name);
+	let description = Some(invoice_description(text).to_owned());
 
 	// The sale and its invoice slot are reserved first, under the caps.
 	// Each backend step then fills or releases its part.
-	let res = reserve_sale(app, store, &memo, amount_sat, &fiat).await?;
-
-	// The invoice names the owner's address as its Ark hint (S1), so one
-	// invoice serves Lightning and Ark payers.
-	let invoice = match res.invoice_slot {
-		Some(slot) => match app.public.forwarder.create_invoice(
-			amount_sat, &ark_address, description, expiry, true,
-		).await {
-			Ok(invoice) => {
-				let hash = invoice.payment_hash().to_string();
-				match check_invoice_hint(&invoice, &ark_address) {
-					Ok(()) => {},
-					Err(HintError::Missing) if app.overrides.accept_unhinted_invoices => {
-						tracing::warn!("test override: sale invoice {} has no Ark hint", hash);
-					},
-					Err(e) => {
-						tracing::error!("sale refused: {} (invoice {})", e, hash);
-						if let Err(e) = app.public.forwarder.cancel(&hash).await {
-							tracing::warn!("failed to cancel invoice {}: {:#}", hash, e);
-						}
-						release_sale(app, res.sale_id).await?;
-						return Err(ApiError::Misconfigured(e.to_string()));
-					},
-				}
-				// The invoice is stored and the sale issued together: only
-				// then can anyone see the sale.
-				let mut conn = app.public.db.conn().await?;
-				let tx = conn.transaction().await?;
-				tx.execute("
-					UPDATE sale_payment SET payment_hash = $2, invoice = $3 WHERE id = $1
-				", &[&slot, &hash, &invoice.to_string()]).await?;
-				tx.execute("UPDATE sale SET issued_at = NOW() WHERE id = $1", &[&res.sale_id]).await?;
-				tx.commit().await?;
-				true
-			},
-			Err(e) => {
-				tracing::warn!("sale without an invoice: {:#}", e);
-				let conn = app.public.db.conn().await?;
-				conn.execute("DELETE FROM sale_payment WHERE id = $1", &[&slot]).await?;
-				false
-			},
+	let sale_id = reserve_sale(app, store, &memo, amount_sat, &fiat).await?;
+	let invoice = match app.public.forwarder.create_invoice(amount_sat, &ark_address, description, expiry, true).await {
+		Ok(invoice) => invoice,
+		Err(e) => {
+			let mut conn = app.public.db.conn().await?;
+			discard_reservation(&mut conn, sale_id).await?;
+			return Err(ApiError::Upstream(e));
 		},
-		None => false,
 	};
-
-	if !invoice {
-		release_sale(app, res.sale_id).await?;
-		return Err(ApiError::Upstream(anyhow::anyhow!("no payment rail is available for the sale")));
+	let hash = invoice.payment_hash().to_string();
+	let refusal = match check_invoice_hint(&invoice, &ark_address) {
+		Err(HintError::Missing) if app.overrides.accept_unhinted_invoices => {
+			tracing::warn!("test override: sale invoice {} has no Ark hint", hash);
+			None
+		},
+		Err(e) => Some(ApiError::Misconfigured(e.to_string())),
+		Ok(()) => None,
+	};
+	let mut conn = app.public.db.conn().await?;
+	let error = match refusal {
+		Some(error) => error,
+		None => {
+			if let Some(sale) = publish_invoice(&mut conn, sale_id, &hash, &invoice.to_string()).await? {
+				return Ok(sale);
+			}
+			ApiError::Upstream(anyhow::anyhow!("the sale invoice reservation expired"))
+		},
+	};
+	discard_reservation(&mut conn, sale_id).await?;
+	drop(conn);
+	if let Err(e) = app.public.forwarder.cancel(&hash).await {
+		tracing::warn!("failed to cancel unpublished invoice {}: {:#}", hash, e);
 	}
-	let conn = app.public.db.conn().await?;
-	Ok(get_sale_by_id(&*conn, res.sale_id).await?)
+	Err(error)
+}
+
+/// Publication and cleanup both lock the sale before touching its invoice slot.
+async fn publish_invoice(conn: &mut tokio_postgres::Client, sale_id: i64, hash: &str, invoice: &str) -> anyhow::Result<Option<Sale>> {
+	let tx = conn.transaction().await?;
+	let reserved = tx.execute("UPDATE sale SET issued_at = NOW() WHERE id = $1 AND issued_at IS NULL AND expires_at > clock_timestamp()", &[&sale_id]).await?;
+	if reserved == 0 {
+		return Ok(None);
+	}
+	let filled = tx.execute("
+		UPDATE sale_payment SET payment_hash = $2, invoice = $3
+		WHERE sale_id = $1 AND rail = 'lightning' AND payment_hash IS NULL
+	", &[&sale_id, &hash, &invoice]).await?;
+	if filled == 0 {
+		tx.rollback().await?;
+		return Ok(None);
+	}
+	let sale = get_sale_by_id(&tx, sale_id).await?;
+	tx.commit().await?;
+	Ok(Some(sale))
 }
 
 /// Adds a Bitcoin address to an open sale, when the merchant asks for it:
@@ -443,18 +455,24 @@ pub async fn add_onchain(app: &App, public_id: &str) -> ApiResult<Sale> {
 			VALUES ($1, 'onchain', $2, $3)
 		", &[&sale_id, &index, &address.to_string()]).await
 			.map_err(|e| ApiError::Upstream(anyhow::Error::from(e).context("the address is taken")))?;
+		tx.execute("UPDATE sale SET updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1", &[&sale_id]).await?;
 		tracing::info!("sale {} takes on-chain index {} of store {}", public_id, index, store.id);
 	}
 	let sale = get_sale_by_id(&tx, sale_id).await?;
 	tx.commit().await?;
+	if !has_address { app.notify_sale_change(sale_id); }
 	Ok(sale)
 }
 
-/// Deletes a reserved sale that nobody saw, with its rails.
-async fn release_sale(app: &App, sale_id: i64) -> ApiResult<()> {
-	let conn = app.public.db.conn().await?;
-	conn.execute("DELETE FROM sale_payment WHERE sale_id = $1", &[&sale_id]).await?;
-	conn.execute("DELETE FROM sale WHERE id = $1", &[&sale_id]).await?;
+/// Discards an unpublished reservation, including its invoice slot. An invoice
+/// that finished before cleanup acquired the lock belongs to a published sale.
+pub(crate) async fn discard_reservation(conn: &mut tokio_postgres::Client, sale_id: i64) -> anyhow::Result<()> {
+	let tx = conn.transaction().await?;
+	if tx.query_opt("SELECT id FROM sale WHERE id = $1 AND issued_at IS NULL FOR UPDATE", &[&sale_id]).await?.is_some() {
+		tx.execute("DELETE FROM sale_payment WHERE sale_id = $1", &[&sale_id]).await?;
+		tx.execute("DELETE FROM sale WHERE id = $1", &[&sale_id]).await?;
+	}
+	tx.commit().await?;
 	Ok(())
 }
 
@@ -607,6 +625,13 @@ mod test {
 		assert!(HintError::Missing.to_string().contains("must allow Ark address hints"));
 		// Another address, such as barkd's own: an Ark payer would pay it.
 		assert_eq!(check_invoice_hint(&invoice(Some(&address(6))), &store), Err(HintError::Other));
+	}
+
+	#[test]
+	fn unicode_invoice_descriptions_fit_the_bolt11_field() {
+		let memo = "🪙".repeat(200);
+		assert_eq!(invoice_description(&memo), "🪙".repeat(159));
+		assert_eq!(invoice_description("coffee"), "coffee");
 	}
 
 	#[test]

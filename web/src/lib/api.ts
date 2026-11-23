@@ -9,6 +9,8 @@ export type Warning = 'not-guaranteed' | 'low-fee' | 'unconfirmed-parents' | 're
 
 export interface Sale {
 	id: string
+	store_nym: string
+	updated_at: string
 	created_at: string
 	expires_at: string
 	state: SaleState
@@ -25,8 +27,6 @@ export interface Sale {
 	onchain_address: string | null
 	paid_at: string | null
 	paid_rail: PaidRail | null
-	/** When the sale last changed: the newer of two snapshots wins. */
-	updated_at: string
 	/** Counted payments only: delivered invoices and confirmed outputs. */
 	received_sat: number
 	/** Unconfirmed on-chain payments: shown, never counted. */
@@ -62,7 +62,7 @@ export interface Rate {
 	fetched_at: string
 }
 
-export type NewSale = ({ fiat_amount: string } | { amount_sat: number }) & { memo?: string }
+export type NewSale = ({ fiat_amount: string; expected_currency: string } | { amount_sat: number }) & { memo?: string }
 
 export class ApiError extends Error {
 	constructor(
@@ -123,13 +123,15 @@ export class PosClient {
 		return this.json('POST', `${this.linkPath()}/sales`, sale)
 	}
 
-	sale(id: string): Promise<Sale> {
-		return this.json('GET', `/api/v1/sales/${encodeURIComponent(id)}`)
+	sale(id: string, signal?: AbortSignal): Promise<Sale> {
+		return this.json('GET', `/api/v1/sales/${encodeURIComponent(id)}`, undefined, { signal })
 	}
 
 	/** Returns when the sale is no longer in `state`, or after the server's wait limit. */
-	waitSale(id: string, state: SaleState, signal?: AbortSignal): Promise<Sale> {
-		const path = `/api/v1/sales/${encodeURIComponent(id)}?wait=${encodeURIComponent(state)}`
+	waitSale(id: string, state: SaleState, signal?: AbortSignal, since?: string): Promise<Sale> {
+		const query = new URLSearchParams({ wait: state })
+		if (since) query.set('since', since)
+		const path = `/api/v1/sales/${encodeURIComponent(id)}?${query}`
 		return this.json('GET', path, undefined, { timeoutMs: WAIT_TIMEOUT_MS, signal })
 	}
 
@@ -148,7 +150,8 @@ export class PosClient {
 	 * `retryAfter` says how long checks are locked.
 	 */
 	async checkPin(pin: string): Promise<void> {
-		await this.request('POST', `${this.linkPath()}/pin`, { pin })
+		const result = await this.json<{ ok?: boolean }>('POST', `${this.linkPath()}/pin`, { pin })
+		if (result?.ok !== true) throw new ApiError(502, 'Could not verify the PIN response')
 	}
 
 	private async json<T>(
@@ -157,16 +160,6 @@ export class PosClient {
 		body?: unknown,
 		opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 	): Promise<T> {
-		const res = await this.request(method, path, body, opts)
-		return (await res.json()) as T
-	}
-
-	private async request(
-		method: string,
-		path: string,
-		body?: unknown,
-		opts: { timeoutMs?: number; signal?: AbortSignal } = {},
-	): Promise<Response> {
 		const headers: Record<string, string> = { Accept: 'application/json' }
 		if (body !== undefined) headers['Content-Type'] = 'application/json'
 
@@ -175,27 +168,29 @@ export class PosClient {
 		const onAbort = () => timeout.abort()
 		opts.signal?.addEventListener('abort', onAbort)
 
-		let res: Response
 		try {
-			res = await this.fetchFn(`${this.baseUrl}${path}`, {
+			opts.signal?.throwIfAborted()
+			const res = await this.fetchFn(`${this.baseUrl}${path}`, {
 				method,
+				// Firefox can replay an earlier checkout or sale response on offline reload.
+				cache: 'no-store',
 				headers,
 				body: body === undefined ? undefined : JSON.stringify(body),
 				signal: timeout.signal,
 			})
+			if (!res.ok) {
+				const { message, retryAfter } = await errorDetails(res)
+				throw new ApiError(res.status, message, retryAfter)
+			}
+			return await res.json() as T
 		} catch (e) {
-			if (opts.signal?.aborted) throw e
+			if (opts.signal?.aborted || e instanceof ApiError) throw e
+			if (e instanceof SyntaxError) throw new ApiError(502, 'Invalid response from the server')
 			throw new ApiError(0, 'The server is not reachable')
 		} finally {
 			clearTimeout(timer)
 			opts.signal?.removeEventListener('abort', onAbort)
 		}
-
-		if (!res.ok) {
-			const { message, retryAfter } = await errorDetails(res)
-			throw new ApiError(res.status, message, retryAfter)
-		}
-		return res
 	}
 }
 

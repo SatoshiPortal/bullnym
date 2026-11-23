@@ -1,3 +1,5 @@
+/// <reference lib="es2023.intl" />
+
 // Currency formatting, ported from bullnym (pwa/lib/money.ts). posd sends
 // fiat amounts and prices as decimal strings in major units.
 
@@ -5,7 +7,7 @@
  * Minor-unit digits typed and shown for a currency. The colón has cents in
  * ISO 4217, but nobody prices in them, so it is entered as whole colones.
  */
-const PRECISION_OVERRIDES: Record<string, number> = { CRC: 0 }
+const PRECISION_OVERRIDES: Record<string, number> = { CRC: 0, COP: 0 }
 
 export function currencyPrecision(currency: string): number {
 	const override = PRECISION_OVERRIDES[currency.toUpperCase()]
@@ -19,7 +21,8 @@ export function currencyPrecision(currency: string): number {
 
 /** Format a major-unit fiat amount, for example ("8500", "CRC") → "₡8,500". */
 export function formatFiat(amount: string | number, currency: string, precision = currencyPrecision(currency)): string {
-	const value = typeof amount === 'string' ? Number(amount) : amount
+	// Intl accepts decimal strings directly, preserving cents on large receipts.
+	const value = amount as number | `${number}`
 	try {
 		return new Intl.NumberFormat(undefined, {
 			style: 'currency',
@@ -53,12 +56,20 @@ export function formatRate(btcPrice: string, currency: string): string {
 	return `${formatFiat(btcPrice, currency, currencyPrecision(currency))}/BTC`
 }
 
-/** Sats for a fiat amount at a BTC price, rounded to the nearest sat. */
+function decimalParts(text: string) {
+	if (!/^\d{1,20}(?:\.\d{0,18})?$/.test(text)) return null
+	const [whole, fraction = ''] = text.split('.')
+	return { units: BigInt(whole + fraction), scale: 10n ** BigInt(fraction.length) }
+}
+
+/** Use the service's decimal half-up rounding, including exact half-sat quotes. */
 export function fiatToSats(fiatAmount: string, btcPrice: string): number {
-	const fiat = Number(fiatAmount)
-	const price = Number(btcPrice)
-	if (!Number.isFinite(fiat) || !Number.isFinite(price) || fiat <= 0 || price <= 0) return 0
-	return Math.round((fiat / price) * 1e8)
+	const fiat = decimalParts(fiatAmount)
+	const price = decimalParts(btcPrice)
+	if (!fiat || !price?.units) return 0
+	const numerator = fiat.units * 100000000n * price.scale
+	const denominator = fiat.scale * price.units
+	return Number((numerator + denominator / 2n) / denominator)
 }
 
 /**

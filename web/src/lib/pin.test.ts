@@ -16,8 +16,8 @@ describe('cashier PIN', () => {
 	it('explains a refusal and its wait', () => {
 		expect(pinRefusal(new ApiError(401, 'wrong PIN'))).toBe('Wrong PIN.')
 		expect(pinRefusal(new ApiError(401, 'wrong PIN', 2))).toBe('Wrong PIN. Try again in 2 s.')
-		expect(pinRefusal(new ApiError(429, 'too many', 900))).toBe('Too many wrong PINs. Try again in 15 min.')
-		expect(pinRefusal(new ApiError(429, 'too many requests'))).toBe('Too many wrong PINs. Try again later.')
+		expect(pinRefusal(new ApiError(429, 'too many', 900))).toBe('Too many PIN checks. Try again in 15 min.')
+		expect(pinRefusal(new ApiError(429, 'too many requests'))).toBe('Too many PIN checks. Try again later.')
 		expect(pinRefusal(new ApiError(404, 'not set'))).toBe('The owner has not set a cashier PIN.')
 		expect(pinRefusal(new Error('x'))).toBe('Could not check the PIN')
 	})

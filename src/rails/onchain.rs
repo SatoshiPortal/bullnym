@@ -174,6 +174,20 @@ impl Chain {
 		Ok(TxObservation { txid: txid.to_string(), amount, confirmations, mempool, foreign_conflicts })
 	}
 
+	/// Absence is meaningful only after Core has loaded the mempool and the
+	/// watch-only wallet has processed the current chain tip.
+	pub async fn ready_for_absence(&self) -> anyhow::Result<bool> {
+		let (chain, mempool, wallet) = tokio::try_join!(
+			self.call(None, "getblockchaininfo", json!([])),
+			self.call(None, "getmempoolinfo", json!([])),
+			self.call(Some(&self.cfg.wallet), "getwalletinfo", json!([])),
+		)?;
+		let tip = chain["bestblockhash"].as_str();
+		Ok(mempool["loaded"] == true && chain["initialblockdownload"] == false
+			&& chain["blocks"].as_u64().is_some() && chain["blocks"] == chain["headers"]
+			&& wallet["scanning"] == false && tip.is_some() && wallet["lastprocessedblock"]["hash"].as_str() == tip)
+	}
+
 	/// The mempool entry of `txid`. Only bitcoind's own answer that the
 	/// transaction is not in its mempool counts as [Mempool::NotIn]; any
 	/// other failure is [Mempool::Unknown].
@@ -191,7 +205,7 @@ impl Chain {
 					_ => Mempool::Unknown,
 				}
 			},
-			Ok(Err(RPC_INVALID_ADDRESS_OR_KEY)) => Mempool::NotIn,
+			Ok(Err(RPC_INVALID_ADDRESS_OR_KEY)) if self.ready_for_absence().await.unwrap_or(false) => Mempool::NotIn,
 			Ok(Err(_)) | Err(_) => Mempool::Unknown,
 		}
 	}

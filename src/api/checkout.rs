@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::api::{StoreView, check_lookup};
+use crate::api::{StoreView, check_lookup, check_lookup_name};
 use crate::pin;
 use crate::protect::{Caller, Surface};
 use crate::database::{STORE_COLUMNS, SaleState, Store};
@@ -46,6 +46,7 @@ async fn store_of(app: &App, nym: &str) -> ApiResult<Store> {
 #[derive(Deserialize)]
 pub struct CreateSale {
 	fiat_amount: Option<String>,
+	expected_currency: Option<String>,
 	amount_sat: Option<u64>,
 	memo: Option<String>,
 }
@@ -69,6 +70,7 @@ pub async fn rate(
 	Path(nym): Path<String>,
 ) -> ApiResult<Json<Value>> {
 	app.protect.check(&caller, Surface::StatusRead)?;
+	check_lookup_name(&app, &caller, &nym).await?;
 	let store = store_of(&app, &nym).await?;
 	let quote = app.price.quote(&store.currency).await.map_err(ApiError::Upstream)?;
 	Ok(Json(json!({
@@ -86,10 +88,15 @@ pub async fn create_sale(
 	Json(req): Json<CreateSale>,
 ) -> ApiResult<Json<SaleView>> {
 	app.protect.check(&caller, Surface::SaleCreate)?;
+	check_lookup_name(&app, &caller, &nym).await?;
 	let store = store_of(&app, &nym).await?;
 	let amount = match (req.fiat_amount, req.amount_sat) {
-		(Some(fiat), None) => SaleAmount::Fiat(fiat.parse::<Decimal>()
-			.map_err(|e| bad_request(e.to_string()))?),
+		(Some(fiat), None) => {
+			if req.expected_currency.as_ref().is_some_and(|expected| expected != &store.currency) {
+				return Err(conflict(sales::CURRENCY_CHANGED));
+			}
+			SaleAmount::Fiat(fiat.parse::<Decimal>().map_err(|e| bad_request(e.to_string()))?)
+		},
 		(None, Some(sat)) => SaleAmount::Sat(bitcoin::Amount::from_sat(sat)),
 		_ => return Err(bad_request("give exactly one of fiat_amount and amount_sat")),
 	};
@@ -156,6 +163,7 @@ pub async fn check_pin(
 	Json(req): Json<CheckPin>,
 ) -> Result<Json<Value>, PinRefusal> {
 	app.protect.check(&caller, Surface::PinCheck)?;
+	check_lookup_name(&app, &caller, &nym).await?;
 	let store = store_of(&app, &nym).await?;
 	if req.pin.len() > pin::MAX_PIN_DIGITS * 4 {
 		return Err(bad_request("the PIN is too long").into());
@@ -192,6 +200,7 @@ pub async fn check_pin(
 #[derive(Deserialize)]
 pub struct WaitQuery {
 	wait: Option<String>,
+	since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `GET /api/v1/sales/<id>`: one sale, for whoever holds its id. With
@@ -207,23 +216,21 @@ pub async fn get_sale(
 	let wait = q.wait.map(|w| w.parse::<SaleState>().map_err(|e| bad_request(e.to_string())))
 		.transpose()?;
 	let deadline = tokio::time::Instant::now() + LONG_POLL;
+	let mut changes = app.sale_changes.subscribe();
 	loop {
-		// Subscribe before reading, so a change between the read and the
-		// wait is not missed.
-		let mut changes = app.sale_changes.subscribe();
 		let sale = {
 			let conn = app.public.db.conn().await?;
 			sales::get_sale(&*conn, &id).await?
 		};
-		let done = match wait {
-			Some(state) => sale.state != state,
-			None => true,
-		};
-		let now = tokio::time::Instant::now();
-		if done || now >= deadline {
+		if wait != Some(sale.state) || q.since.is_some_and(|since| since != sale.updated_at)
+			|| tokio::time::Instant::now() >= deadline {
 			return Ok(Json(sale.into()));
 		}
-		let _ = tokio::time::timeout(deadline - now, changes.changed()).await;
+		// A notification can precede this wait. Subscribe before the first
+		// read and only query again for this sale, a missed event, or timeout.
+		while let Ok(Ok(changed)) = tokio::time::timeout_at(deadline, changes.recv()).await {
+			if changed == sale.id { break; }
+		}
 	}
 }
 
@@ -259,25 +266,31 @@ pub async fn cancel_sale(
 	if let Some(hash) = watcher::invoice_hash(&app.public, sale.id).await? {
 		match watcher::cancel_invoice(&app.public, &hash).await {
 			Ok(()) => {},
-			Err(watcher::CancelError::PaymentArriving(_) | watcher::CancelError::UnknownState) => {
+			Err(watcher::CancelError::PaymentArriving(status)) => {
+				watcher::record_invoice_status(&app, sale.id, crate::database::Rail::Lightning, status).await?;
+				return Err(conflict("a payment is arriving for this sale"));
+			},
+			Err(watcher::CancelError::UnknownState) => {
 				return Err(conflict("a payment is arriving for this sale"));
 			},
 			Err(watcher::CancelError::Unavailable(e)) => return Err(ApiError::Upstream(e)),
 		}
 	}
 	let sale = {
-		let conn = app.public.db.conn().await?;
-		let n = conn.execute("
-			UPDATE sale SET state = 'canceled', updated_at = NOW()
+		let mut conn = app.public.db.conn().await?;
+		let tx = conn.transaction().await?;
+		let n = tx.execute("
+			UPDATE sale SET state = 'canceled', updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond')
 			WHERE public_id = $1 AND state = 'open'
 		", &[&id]).await?;
-		let sale = sales::get_sale(&*conn, &id).await?;
+		let sale = sales::get_sale(&tx, &id).await?;
 		if n == 0 {
 			return Err(conflict(format!("the sale is {}", sale.state)));
 		}
+		tx.execute("UPDATE sale_payment SET settled_at = NOW() WHERE sale_id = $1 AND rail = 'lightning' AND settled_at IS NULL", &[&sale.id]).await?;
+		tx.commit().await?;
 		sale
 	};
-	watcher::sale_ended(&app.public, sale.id).await;
-	app.notify_sale_change();
+	app.notify_sale_change(sale.id);
 	Ok(Json(sale.into()))
 }

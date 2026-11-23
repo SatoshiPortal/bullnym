@@ -41,9 +41,9 @@ describe('PosClient', () => {
 
 	it('creates a fiat sale with the contract body', async () => {
 		const { fetch, calls } = fakeFetch([json({ id: 's1' })])
-		await new PosClient({ fetch, link: PUBLIC }).createSale({ fiat_amount: '12.50', memo: 'coffee' })
+		await new PosClient({ fetch, link: PUBLIC }).createSale({ fiat_amount: '12.50', expected_currency: 'USD', memo: 'coffee' })
 		expect(calls[0]!.url).toBe('/api/v1/checkout/cafe/sales')
-		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ fiat_amount: '12.50', memo: 'coffee' })
+		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ fiat_amount: '12.50', expected_currency: 'USD', memo: 'coffee' })
 	})
 
 	it('long-polls with the known state', async () => {
@@ -84,6 +84,13 @@ describe('PosClient', () => {
 		expect(calls[0]!.url).toBe('/api/v1/checkout/cafe/pin')
 		expect(calls[0]!.init.method).toBe('POST')
 		expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ pin: '2468' })
+	})
+
+	it('requires affirmative service confirmation before unlocking', async () => {
+		const { fetch } = fakeFetch([json({ ok: false }), new Response('store loading')])
+		const client = new PosClient({ fetch, link: PUBLIC })
+		await expect(client.checkPin('2468')).rejects.toHaveProperty('status', 502)
+		await expect(client.checkPin('2468')).rejects.toHaveProperty('status', 502)
 	})
 
 	it('reads how long a refused PIN locks checks', async () => {

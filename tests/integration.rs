@@ -55,6 +55,53 @@ async fn owner_csv(store: &Store) -> String {
 }
 
 #[tokio::test]
+async fn fiat_sale_keeps_the_cashiers_currency() {
+	let ctx = TestContext::new("bullnym/fiat_sale_keeps_the_cashiers_currency").await;
+	let store = store_setup(&ctx).await;
+	let svc = &store.svc;
+	let owner = Some(store.owner.token.as_str());
+	let checkout = "/api/v1/checkout/cafe/sales";
+	let usd = json!({ "fiat_amount": "5.00", "expected_currency": "USD" });
+	svc.ok(Method::PATCH, "/api/v1/owner/store", owner, Some(json!({ "currency": "USD" }))).await;
+
+	// The cashier can still read USD while the owner's change is uncommitted.
+	// Commit that edit once the sale is waiting to reserve the quoted amount.
+	let mut conn = svc.app.public.db.conn().await.unwrap();
+	let tx = conn.transaction().await.unwrap();
+	tx.execute("UPDATE store SET currency = 'CRC' WHERE nym_id = (SELECT id FROM nym WHERE name = 'cafe')",
+		&[]).await.unwrap();
+	let editor: i32 = tx.query_one("SELECT pg_backend_pid()", &[]).await.unwrap().get(0);
+	let edit = async {
+		let probe = svc.app.public.db.conn().await.unwrap();
+		tokio::time::timeout(Duration::from_secs(20), async {
+			loop {
+				let waiting: bool = probe.query_one(
+					"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+					&[&editor],
+				).await.unwrap().get(0);
+				if waiting { break; }
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}).await.expect("the fiat reservation waited for the owner edit");
+		tx.commit().await.unwrap();
+	};
+	let ((status, _), ()) = tokio::join!(svc.call(Method::POST, checkout, None, Some(usd.clone())), edit);
+	assert_eq!(status, StatusCode::CONFLICT);
+	// A draft submitted after the edit also conflicts, before checking CRC precision.
+	assert_eq!(svc.call(Method::POST, checkout, None, Some(usd)).await.0, StatusCode::CONFLICT);
+	let counts = conn.query_one("SELECT (SELECT count(*) FROM sale), (SELECT count(*) FROM sale_payment)", &[])
+		.await.unwrap();
+	assert_eq!((counts.get::<_, i64>(0), counts.get::<_, i64>(1)), (0, 0));
+
+	let sale = store.new_sale(json!({ "fiat_amount": "12500", "expected_currency": "CRC" })).await;
+	assert_eq!(sale["currency"], "CRC");
+	assert!(sale["lightning_invoice"].is_string());
+	let history = svc.ok(Method::GET, "/api/v1/owner/sales", owner, None).await;
+	assert_eq!(history["sales"].as_array().unwrap().len(), 1);
+	assert_eq!(history["sales"][0]["id"], sale["id"]);
+}
+
+#[tokio::test]
 async fn sale_paid_by_lightning() {
 	let ctx = TestContext::new("bullnym/sale_paid_by_lightning").await;
 	let store = store_setup(&ctx).await;
@@ -194,8 +241,17 @@ async fn sale_paid_onchain_through_its_stages() {
 	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	let id = sale["id"].as_str().unwrap();
 	assert_eq!(sale["onchain_address"], Value::Null);
+	assert_eq!(sale["store_nym"], store.nym);
 	let with_btc = store.add_onchain(&sale).await;
 	let address = with_btc["onchain_address"].as_str().expect("an on-chain address").to_string();
+	// Address allocation changes the cashier's view even while the sale stays open.
+	let before: chrono::DateTime<chrono::Utc> = sale["updated_at"].as_str().unwrap().parse().unwrap();
+	let after: chrono::DateTime<chrono::Utc> = with_btc["updated_at"].as_str().unwrap().parse().unwrap();
+	assert!(after > before);
+	let changes = format!("/api/v1/sales/{}?wait=open&since={}", id, sale["updated_at"].as_str().unwrap());
+	let updated = tokio::time::timeout(Duration::from_secs(3), store.svc.ok(Method::GET, &changes, None, None))
+		.await.expect("changed address should satisfy the long poll");
+	assert_eq!(updated["onchain_address"], address);
 	// Two QRs, never one with both.
 	assert_eq!(with_btc["onchain_request"], format!("bitcoin:{}?amount=0.0006", address));
 	assert_eq!(with_btc["lightning_request"], sale["lightning_request"], "the invoice stays");
@@ -236,10 +292,8 @@ async fn sale_paid_onchain_through_its_stages() {
 	let node = &store.svc.bitcoind;
 	let tip = rpc(node, None, "getbestblockhash", json!([])).await;
 	rpc(node, None, "invalidateblock", json!([tip])).await;
-	tokio::time::sleep(Duration::from_secs(6)).await;
-	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
+	let after = store.svc.wait_sale(id, SALE_TIMEOUT, |s| s["received_sat"] == 0, "confirmation lost").await;
 	assert_eq!(after["state"], "paid", "{}", after);
-	assert_eq!(after["received_sat"], 60_000, "a confirmed output stays credited: {}", after);
 	rpc(node, None, "reconsiderblock", json!([tip])).await;
 
 	// As in posd, the address stays watched for 7 days: an extra payment
@@ -780,6 +834,13 @@ async fn reserved_sales_stay_private_and_seen_payments_never_expire() {
 	let store = store_setup_with(&ctx, |cfg| cfg.sales.default_onchain_min_sat = 1000).await;
 	let svc = &store.svc;
 	let owner = Some(store.owner.token.as_str());
+	// Model an invoice slot removed before its backend call returns. The
+	// public API must refuse issuance if the slot cannot be filled.
+	svc.sql("CREATE RULE unavailable_slot AS ON UPDATE TO sale_payment WHERE OLD.payment_hash IS NULL DO INSTEAD NOTHING").await.unwrap();
+	let (status, _) = svc.call(Method::POST, &format!("/api/v1/checkout/{}/sales", store.nym), None,
+		Some(json!({ "amount_sat": 2000 }))).await;
+	svc.sql("DROP RULE unavailable_slot ON sale_payment").await.unwrap();
+	assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 	store.forwarder.stop().await.unwrap();
 
 	// A sale reserved under the caps, whose invoice is not stored yet: nobody

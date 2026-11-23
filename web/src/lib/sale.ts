@@ -3,6 +3,7 @@
 // A payment the service has seen but cannot count yet is "in progress":
 // amber, with plain words that it is not guaranteed. Only a paid sale is
 // green.
+import { currencyPrecision, formatFiat } from './money'
 import type { PaidRail, Sale, SaleState, Warning } from './api'
 
 export function railLabel(rail: PaidRail | null): string {
@@ -69,7 +70,7 @@ export function progressText(sale: Sale): { title: string; lines: string[] } {
 	if (sale.progress === 'ark') {
 		return {
 			title: 'The Ark payment is being delivered',
-			lines: ['The Ark server accepted it and is delivering it to the wallet. The sale is paid once it is delivered.'],
+			lines: ['Waiting for the wallet service to confirm delivery.'],
 		}
 	}
 	const lines = sale.warnings.map(warningText)
@@ -123,7 +124,12 @@ export function acceptSale(current: Sale | null, next: Sale, id: string): boolea
 	if (next.id !== id) return false
 	if (!current) return true
 	if (!isLive(current.state) && next.state !== current.state) return false
-	return Date.parse(next.updated_at) >= Date.parse(current.updated_at)
+	if (current.onchain_address && !next.onchain_address) return false
+	if (!current.updated_at) return true
+	if (!next.updated_at) return false
+	// The service emits UTC timestamps. Removing Z orders fractional seconds
+	// at their full PostgreSQL precision, including submillisecond updates.
+	return next.updated_at.replace(/Z$/, '') > current.updated_at.replace(/Z$/, '')
 }
 
 /** Whether Bitcoin can be added to the sale now: open, without an address, and at the store's minimum. */
@@ -139,8 +145,12 @@ export function receiptNumber(id: string): string {
 }
 
 /** The headline amount: fiat when the sale was keyed in fiat, else sats. */
-export function saleAmountLabel(sale: Sale, format: (amount: string, currency: string) => string): string {
-	if (sale.fiat_amount !== null && sale.currency) return format(sale.fiat_amount, sale.currency)
+export function saleAmountLabel(sale: Sale): string {
+	if (sale.fiat_amount !== null && sale.currency) {
+		const fraction = sale.fiat_amount.split('.')[1] ?? ''
+		const places = Math.max(currencyPrecision(sale.currency), /[1-9]/.test(fraction) ? fraction.length : 0)
+		return formatFiat(sale.fiat_amount, sale.currency, places)
+	}
 	return `${new Intl.NumberFormat().format(sale.amount_sat)} sats`
 }
 

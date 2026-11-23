@@ -218,12 +218,17 @@ token and no login. The same page is the public checkout. Its API prefix is
 |---|---|---|
 | `GET <prefix>` | | `{"store": Store}`. Viewing allocates nothing |
 | `GET <prefix>/rate` | | `{"currency", "btc_price", "fetched_at"}` |
-| `POST <prefix>/sales` | `{"fiat_amount": "12.50"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) | `Sale` |
+| `POST <prefix>/sales` | `{"fiat_amount": "12.50", "expected_currency": "USD"}` or `{"amount_sat": 35000}`, with optional `memo` (200 characters) | `Sale` |
 | `GET /api/v1/sales/<id>` | | `Sale` |
 | `GET /api/v1/sales/<id>?wait=<state>` | | `Sale`, when the state is not `<state>` or after 25 s |
 | `POST /api/v1/sales/<id>/onchain` | | `Sale` with a Bitcoin address; see below |
 | `POST /api/v1/sales/<id>/cancel` | | `Sale`; `409` unless the sale is open and no payment is arriving |
 | `POST <prefix>/pin` | `{"pin": "…"}` | `{"ok": true}` when it is the cashier PIN |
+
+For a fiat sale, send the currency displayed when the cashier entered the amount.
+If the store currency changed, the service returns HTTP 409 before creating an
+invoice. Refresh the store and ask the cashier to enter a new amount. Clients
+that omit `expected_currency` use the current store currency.
 
 The link cannot list the store's sales, export them or see other sales.
 Holding a sale's unguessable id is what lets a cashier follow it, add
@@ -308,7 +313,10 @@ can read the remembered sale ids, and a sale id alone opens its sale.
   refused with the fixed `503`. Until its invoice is stored a sale is only
   reserved: no route shows it, nor the owner's history or CSV, and nothing
   of it remains when the invoice fails.
-- `updated_at` is when the sale last changed. A client keeps the newer of
+- `store_nym` identifies the merchant whose checkout issued the sale.
+- `updated_at` is when the sale last changed. A cashier can include it as `since`
+  alongside `wait` to receive same-state updates, including an added Bitcoin
+  address, a changed amount or a newly available payment method. A client keeps the newer of
   two snapshots, and never shows an ended sale as live again.
 - As in posd, each sale checks that its invoice names the store's Ark
   address as its hint. An invoice without it refuses the sale with `503`
@@ -332,8 +340,8 @@ can read the remembered sale ids, and a sale id alone opens its sale.
     paid state is recorded first, and the Ark server labels the rail after,
     `lightning` if it granted HTLCs, `ark` if not. `paid_rail` is `null`
     until then, and the label is retried for 7 days when the server cannot
-    be read. Paid is final, as in posd: the sale stays paid, and an output
-    that confirmed stays credited, whatever its address shows later.
+    be read. A sale stays paid after its first confirmation. During its
+    observation window, the receipt shows the currently confirmed amount.
   - `expired` or `canceled`. A payment after that is a late payment
     (`late_payment`): it shows on this sale and never pays another one,
     because no address is handed out twice. An open sale past its expiry
