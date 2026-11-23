@@ -10,6 +10,7 @@
 	import { ApiError, type Sale } from '$lib/api'
 	import { applyPinInput, MIN_PIN_DIGITS, pinRefusal } from '$lib/pin'
 	import { client, localSaleIds, session } from '$lib/session.svelte'
+	import { cachedSale, rememberSale } from '$lib/sale-cache'
 	import { router } from '$lib/router.svelte'
 	import BullFooter from '$lib/components/BullFooter.svelte'
 	import Button from '$lib/components/Button.svelte'
@@ -22,7 +23,7 @@
 	let pin = $state('')
 	type Gate = { kind: 'locked' | 'checking' | 'unlocked' } | { kind: 'refused'; message: string } | { kind: 'waiting'; message: string; until: number }
 	let gate = $state<Gate>({ kind: 'locked' })
-	type List = { kind: 'loading' } | { kind: 'loaded' | 'incomplete'; rows: Sale[] }
+	type List = { kind: 'loading' } | { kind: 'loaded' | 'incomplete'; rows: Sale[]; unavailable: number }
 	let list = $state<List>({ kind: 'loading' })
 	let generation = 0
 	let active = true
@@ -46,10 +47,13 @@
 		const storage = (event: StorageEvent) => {
 			if (!event.key || event.key.startsWith('bullnym:' + session.link?.nym + ':')) void load()
 		}
+		const refreshVisible = () => { if (!document.hidden) void load() }
+		const timer = setInterval(refreshVisible, 60000)
 		window.addEventListener('storage', storage)
 		window.addEventListener('online', load)
 		window.addEventListener('focus', load)
 		return () => {
+			clearInterval(timer)
 			window.removeEventListener('storage', storage)
 			window.removeEventListener('online', load)
 			window.removeEventListener('focus', load)
@@ -68,8 +72,23 @@
 		const ids = localSaleIds()
 		const results = await Promise.allSettled(ids.map((id) => client().sale(id)))
 		if (!active || request !== generation) return
-		const rows = results.flatMap((r, i) => r.status === 'fulfilled' && r.value.id === ids[i] ? [r.value] : [])
-		list = { kind: rows.length === ids.length ? 'loaded' : 'incomplete', rows }
+		const rows: Sale[] = []
+		let complete = true
+		let unavailable = 0
+		for (const [i, result] of results.entries()) {
+			const id = ids[i]!
+			if (result.status === 'fulfilled' && result.value.id === id) {
+				if (result.value.store_nym === session.link?.nym) rows.push(rememberSale(result.value))
+				else unavailable++
+			} else if (result.status === 'rejected' && result.reason instanceof ApiError && result.reason.status === 404) {
+				unavailable++
+			} else {
+				complete = false
+				const cached = cachedSale(id)
+				if (cached && cached.store_nym === session.link?.nym) rows.push(cached)
+			}
+		}
+		list = { kind: complete ? 'loaded' : 'incomplete', rows, unavailable }
 	}
 
 	async function unlock() {
@@ -137,10 +156,13 @@
 				<p role="status">Loading sales…</p>
 			{:else}
 				{#if list.kind === 'incomplete'}
-					<p role="alert">Could not load all sales on this device.</p>
+					<p role="alert">Could not load all sales on this device. Some statuses may be out of date.</p>
 					<Button variant="secondary" onclick={load}>Try again</Button>
 				{/if}
-				{#if list.rows.length || list.kind === 'loaded'}<TransactionSheet rows={list.rows} />{/if}
+				{#if list.unavailable}
+					<p role="status">{list.unavailable === 1 ? '1 saved sale is' : list.unavailable + ' saved sales are'} unavailable.</p>
+				{/if}
+				{#if list.rows.length || (list.kind === 'loaded' && !list.unavailable)}<TransactionSheet rows={list.rows} />{/if}
 			{/if}
 		{/if}
 

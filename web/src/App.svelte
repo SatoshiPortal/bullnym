@@ -13,42 +13,44 @@
 	import SettingsScreen from './screens/SettingsScreen.svelte'
 	import UnpairedScreen from './screens/UnpairedScreen.svelte'
 
-	$effect(() => {
-		if (!session.link) return
-		let generation = 0
-		let retry: ReturnType<typeof setTimeout>
-		let retryMs = 2000
-		async function load() {
-			clearTimeout(retry)
-			const attempt = ++generation
-			try {
-				const checkout = await client().checkout()
-				if (attempt !== generation) return
-				retryMs = 2000
-				session.store = { kind: 'ready', checkout }
-			} catch (e) {
-				if (attempt !== generation) return
-				const missing = e instanceof ApiError && e.status === 404
-				if (!missing && session.checkout) return
+	let generation = 0
+	let retry: ReturnType<typeof setTimeout>
+	let retryMs = 2000
+	async function loadCheckout() {
+		clearTimeout(retry)
+		const attempt = ++generation
+		try {
+			const checkout = await client().checkout()
+			if (attempt !== generation) return
+			retryMs = 2000
+			session.store = { kind: 'ready', checkout }
+		} catch (e) {
+			if (attempt !== generation) return
+			const missing = e instanceof ApiError && e.status === 404
+			if (missing || !session.checkout) {
 				const message = missing ? 'There is no store at this link.' :
 					e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the store.'
 				session.store = { kind: 'error', message }
-				if (!missing) {
-					retry = setTimeout(load, retryMs)
-					retryMs = Math.min(retryMs * 2, 30000)
-				}
+			}
+			if (!missing) {
+				retry = setTimeout(loadCheckout, retryMs)
+				retryMs = Math.min(retryMs * 2, 30000)
 			}
 		}
-		const visible = () => { if (!document.hidden) void load() }
-		untrack(load)
-		window.addEventListener('focus', load)
-		window.addEventListener('online', load)
+	}
+
+	$effect(() => {
+		if (!session.link) return
+		const visible = () => { if (!document.hidden) void loadCheckout() }
+		untrack(loadCheckout)
+		window.addEventListener('focus', loadCheckout)
+		window.addEventListener('online', loadCheckout)
 		document.addEventListener('visibilitychange', visible)
 		return () => {
 			generation++
 			clearTimeout(retry)
-			window.removeEventListener('focus', load)
-			window.removeEventListener('online', load)
+			window.removeEventListener('focus', loadCheckout)
+			window.removeEventListener('online', loadCheckout)
 			document.removeEventListener('visibilitychange', visible)
 		}
 	})
@@ -105,5 +107,5 @@
 {:else if router.path === '/settings'}
 	<SettingsScreen />
 {:else}
-	<KeypadScreen />
+	<KeypadScreen refreshCheckout={loadCheckout} />
 {/if}

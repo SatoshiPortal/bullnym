@@ -8,6 +8,7 @@
 		methodLabel,
 		statusLabel,
 		receivedLabel,
+		unconfirmedLabel,
 		overpaidLabel,
 		expectedSatsLabel,
 		amountFiatLabel,
@@ -22,6 +23,7 @@
 		methodLabel: string | null
 		statusLabel: string
 		receivedLabel: string
+		unconfirmedLabel: string | null
 		overpaidLabel: string | null
 		expectedSatsLabel: string | null
 		amountFiatLabel: string
@@ -54,6 +56,9 @@
 			<dt>Received</dt>
 			<dd>{receivedLabel}</dd>
 		</div>
+		{#if unconfirmedLabel}
+			<div class="flex justify-between gap-4"><dt>Unconfirmed</dt><dd>{unconfirmedLabel}</dd></div>
+		{/if}
 		{#if overpaidLabel}
 			<div class="flex justify-between gap-4"><dt>Overpaid by</dt><dd>{overpaidLabel}</dd></div>
 		{/if}

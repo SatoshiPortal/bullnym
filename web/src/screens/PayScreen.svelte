@@ -7,7 +7,7 @@
 	// green.
 	import { untrack } from 'svelte'
 	import { ApiError } from '$lib/api'
-	import { formatFiat, formatSats } from '$lib/money'
+	import { formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
 	import { canAddBitcoin, countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
 	import { followSale } from '$lib/follow-sale.svelte'
@@ -43,15 +43,21 @@
 		return () => clearTimeout(t)
 	})
 
-	const amountLabel = $derived(sale ? saleAmountLabel(sale, (a, c) => formatFiat(a, c)) : '')
+	const amountLabel = $derived(sale ? saleAmountLabel(sale) : '')
 	const remaining = $derived(sale ? countdown(sale.expires_at, nowMs) : null)
 	const progress = $derived(sale ? progressText(sale) : null)
 	const notice = $derived(sale ? noticeText(sale) : null)
 	const missing = $derived(sale ? missingSats(sale) : 0)
+	const funds = $derived.by(() => {
+		if (!sale) return ''
+		const received = formatSats(sale.received_sat) + ' received.'
+		return sale.seen_sat ? received + ' ' + formatSats(sale.seen_sat) + ' unconfirmed.' : received
+	})
 
 	let selected = $state<'lightning' | 'bitcoin'>('lightning')
 	let option = $state<'idle' | 'confirm' | 'requesting' | 'failed'>('idle')
-	const eligible = $derived(canAddBitcoin(sale, session.checkout?.store.onchain_min_sat ?? null))
+	const beforeDeadline = $derived(remaining !== null)
+	const eligible = $derived(beforeDeadline && canAddBitcoin(sale, session.checkout?.store.onchain_min_sat ?? null))
 	const qrValue = $derived(selected === 'bitcoin' && sale?.onchain_request ? sale.onchain_request : sale?.lightning_request)
 
 	$effect(() => {
@@ -72,7 +78,7 @@
 			if (reader.accept(next) && next.onchain_request) selected = 'bitcoin'
 			option = 'idle'
 		} catch {
-			option = 'failed'
+			if (eligible && option === 'requesting') option = 'failed'
 			reader.refresh()
 		}
 	}
@@ -86,7 +92,8 @@
 		cancelState = 'sending'
 		try {
 			const next = await client().cancelSale(sale.id)
-			if (reader.accept(next) && next.state === 'canceled') newSale()
+			if (reader.accept(next) && reader.sale?.state === 'canceled' && !reader.sale.late_payment) newSale()
+			cancelState = 'idle'
 		} catch (e) {
 			cancelState = e instanceof ApiError && e.status === 409 ? 'conflict' : 'failed'
 			reader.refresh()
@@ -135,6 +142,8 @@
 						<p class="max-w-sm rounded-md bg-[#fff0c7] px-4 py-3 text-center text-sm font-semibold text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]">
 							Paid more than the sale: received {formatSats(sale.received_sat)}, expected {formatSats(sale.amount_sat)}.
 						</p>
+					{:else if sale.received_sat < sale.amount_sat}
+						<p class="text-center text-sm" role="status">Currently received {formatSats(sale.received_sat)} of the {formatSats(sale.amount_sat)} sale total.</p>
 					{/if}
 				</div>
 			{:else if (sale.state === 'expired' || sale.state === 'canceled') && sale.late_payment}
@@ -142,7 +151,7 @@
 					icon="!"
 					tone="warn"
 					title="Late payment"
-					detail="A payment arrived after this sale closed. The owner sees it in the history."
+					detail={`This sale is ${sale.state}. ${funds} The owner sees the payment in the history.`}
 					actionLabel="New Sale"
 					onaction={newSale}
 				/>
@@ -162,6 +171,7 @@
 						{#each progress?.lines ?? [] as line (line)}
 							<p class="mt-1 text-sm">{line}</p>
 						{/each}
+						{#if sale.seen_sat || sale.received_sat}<p class="mt-1 text-sm">{funds}</p>{/if}
 						<p class="mt-1 text-sm">You can start a new sale. The owner can follow this payment in the wallet.</p>
 					</div>
 					<Button variant="secondary" onclick={newSale}>New Sale</Button>
@@ -175,7 +185,7 @@
 						{/if}
 						<p class="inline-flex items-center gap-1.5 text-xs font-semibold text-[#725315] dark:text-[#f0d38a]">
 							<span class="inline-block h-1.5 w-1.5 rounded-full bg-current"></span>
-							Waiting for payment{remaining ? ` · ${remaining}` : ''}
+							{remaining ? `Waiting for payment · ${remaining}` : 'Payment time elapsed. Checking the payment status.'}
 						</p>
 						{#if sale.memo}
 							<p class="w-full wrap-anywhere whitespace-pre-wrap text-center text-sm text-[#776b5a] dark:text-[#b9aa91]">{sale.memo}</p>
@@ -189,7 +199,7 @@
 					{/if}
 					{#if missing > 0}
 						<p class="w-full rounded-md bg-[#fff0c7] px-4 py-3 text-sm font-semibold text-[#725315] dark:bg-[#3a321f] dark:text-[#f0d38a]">
-							A bitcoin payment is in sight, {formatSats(missing)} short of the amount.
+							{funds} {formatSats(missing)} short of the amount.
 						</p>
 					{/if}
 
@@ -220,8 +230,8 @@
 					{/if}
 					{#if !sale.onchain_request && sale.state === 'open'}
 						{#if eligible}
-							<Button variant="secondary" onclick={chooseBitcoin}>Bitcoin</Button>
-						{:else if session.checkout}
+							<Button variant="secondary" disabled={cancelState === 'sending'} onclick={chooseBitcoin}>Bitcoin</Button>
+						{:else if session.checkout && beforeDeadline}
 							<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
 								Bitcoin on-chain is offered from {formatSats(session.checkout.store.onchain_min_sat)}.
 							</p>

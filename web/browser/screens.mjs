@@ -61,7 +61,7 @@ export async function screenStates({ page, fixture }, inspect) {
 		['settled', { state: 'paid', paid_rail: 'lightning', received_sat: 60000 }, /via Lightning/],
 		['expired', { state: 'expired' }, /Returning/],
 		['canceled', { state: 'canceled' }, /sale was canceled/],
-		['late', { state: 'expired', late_payment: true, received_sat: 60000 }, /payment arrived after/],
+		['late', { state: 'expired', late_payment: true, received_sat: 60000 }, /This sale is expired/],
 	]
 	for (const [id, data, text] of states) {
 		fixture.sales.set(id, sale(id, data))

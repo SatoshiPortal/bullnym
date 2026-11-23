@@ -16,6 +16,8 @@
 	import ChoiceTabs from '$lib/components/ChoiceTabs.svelte'
 	import Keypad from '$lib/components/Keypad.svelte'
 
+	let { refreshCheckout }: { refreshCheckout: () => void } = $props()
+
 	const RATE_REFRESH_MS = 60_000
 
 	const store = $derived(session.checkout?.store ?? null)
@@ -53,11 +55,15 @@
 			const request = ++generation
 			try {
 				const next = await client().rate()
-				if (next.currency !== expected) throw Error('Rate currency changed')
-				if (!stopped && request === generation) {
-					last = next
-					quote = { kind: 'current', rate: next }
+				if (stopped || request !== generation) return
+				if (next.currency !== expected) {
+					last = null
+					quote = { kind: 'unavailable', last }
+					refreshCheckout()
+					return
 				}
+				last = next
+				quote = { kind: 'current', rate: next }
 			} catch {
 				if (!stopped && request === generation) quote = { kind: 'unavailable', last }
 			}
@@ -80,7 +86,8 @@
 		return `≈ ${formatFiat(fiat, rate.currency)}`
 	})
 	const rateReady = $derived(unit === 'sat' || rate !== null)
-	const canCharge = $derived(sats > 0 && rateReady && !creating)
+	const memoTooLong = $derived(Array.from(memo.trim()).length > 200)
+	const canCharge = $derived(sats > 0 && rateReady && !memoTooLong && !creating)
 
 	function applyInput(key: string) {
 		if (creating) return
@@ -113,7 +120,9 @@
 			router.go(`/pay/${sale.id}`)
 		} catch (e) {
 			let message = e instanceof Error ? e.message : 'Something went wrong'
-			if (e instanceof ApiError && e.status === 0) message = 'The server is not reachable'
+			if (e instanceof ApiError && (e.status === 0 || e.status === 502)) {
+				message = e.message + '. We could not confirm whether the sale was created. Check the owner’s sales before trying again.'
+			}
 			if (e instanceof ApiError && e.status === 429) message = 'Too many sales at once. Try again in a moment.'
 			submission = { kind: 'error', message }
 		}
@@ -148,10 +157,12 @@
 							disabled={creating}
 							bind:value={memo}
 							placeholder="Add a memo for this sale"
-							maxlength="200"
+							aria-invalid={memoTooLong}
+							aria-describedby={memoTooLong ? 'memo-error' : undefined}
 							rows="1"
 						></textarea>
 					</label>
+					{#if memoTooLong}<p id="memo-error" role="alert" class="text-sm">Use 200 characters or fewer for the memo.</p>{/if}
 					<div class={`text-center text-xs ${rateError ? 'text-[#a9362f] dark:text-[#e8a49e]' : 'text-[#776b5a] dark:text-[#b9aa91]'}`}>
 						{#if rate}
 							Rate: {formatRate(rate.btc_price, rate.currency)}{rateError ? ' (not updated)' : ''}
