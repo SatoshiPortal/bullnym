@@ -32,11 +32,7 @@
 				<a
 					class={`grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border-l-4 bg-[#fbf4e8] px-4 py-3 transition hover:bg-[#f3e7d6] dark:bg-[#26231d] dark:hover:bg-[#302c24] ${stateBorderTone(row.state)}`}
 					href={`#/receipt/${row.id}`}
-					onclick={(event) => {
-						if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
-						event.preventDefault()
-						router.go('/receipt/' + row.id)
-					}}
+					onclick={router.link}
 				>
 					<div class="min-w-0">
 						<div class="flex flex-wrap items-baseline gap-2">

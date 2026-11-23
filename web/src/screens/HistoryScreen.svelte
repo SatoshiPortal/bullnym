@@ -10,6 +10,7 @@
 	import { ApiError, type Sale } from '$lib/api'
 	import { applyPinInput, MIN_PIN_DIGITS, pinRefusal } from '$lib/pin'
 	import { client, localSaleIds, session } from '$lib/session.svelte'
+	import { router } from '$lib/router.svelte'
 	import BullFooter from '$lib/components/BullFooter.svelte'
 	import Button from '$lib/components/Button.svelte'
 	import HeaderLinks from '$lib/components/HeaderLinks.svelte'
@@ -96,7 +97,7 @@
 <main class="min-h-screen bg-[#f5f0e8] px-5 py-5 text-[#211f1a] dark:bg-[#161512] dark:text-[#fff6e8]">
 	<div class="mx-auto max-w-3xl">
 		<header class="mb-8 flex items-center justify-between gap-4">
-			<a class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold" href="#/">← Back</a>
+			<a class="inline-flex min-h-12 items-center gap-2 rounded-md px-2 text-sm font-semibold" href={'#' + router.parent} onclick={router.back}>← Back</a>
 			<HeaderLinks history={false} />
 		</header>
 

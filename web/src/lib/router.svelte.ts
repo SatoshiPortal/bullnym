@@ -10,17 +10,35 @@ const state = $state({ path: parseHash() })
 
 window.addEventListener('hashchange', () => { state.path = parseHash() })
 
+function plainClick(event: MouseEvent): boolean {
+	return !event.defaultPrevented && event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey
+}
+
 export const router = {
 	get path(): string {
 		return state.path
 	},
 	go(path: string): void {
-		if (path.startsWith('/receipt/') && (state.path === '/history' || state.path.startsWith('/pay/'))) {
-			history.pushState({ receiptParent: true }, '', '#' + path)
+		if (path === '/settings' || path === '/history' || path.startsWith('/receipt/')) {
+			history.pushState({ cashierParent: state.path }, '', '#' + path)
 			state.path = path
 		} else {
 			location.hash = '#' + path
 		}
+	},
+	get parent(): string {
+		return typeof history.state?.cashierParent === 'string' ? history.state.cashierParent : '/'
+	},
+	link(event: MouseEvent): void {
+		if (!plainClick(event) || !(event.currentTarget instanceof HTMLAnchorElement)) return
+		event.preventDefault()
+		router.go(event.currentTarget.hash.slice(1))
+	},
+	back(event?: MouseEvent): void {
+		if (event && !plainClick(event)) return
+		event?.preventDefault()
+		if (history.state?.cashierParent || history.state?.receiptParent) history.back()
+		else router.go('/')
 	},
 	/** Match "/pay/:id" style patterns; returns params or null. */
 	match(pattern: string): Record<string, string> | null {
