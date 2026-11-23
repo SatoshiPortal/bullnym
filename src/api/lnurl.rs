@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::App;
-use crate::api::{check_lookup, lightning_address, open_invoices, public_url};
+use crate::api::{check_lookup, check_lookup_name, lightning_address, open_invoices, public_url};
 use crate::database::{NYM_COLUMNS, Nym};
 use crate::error::{ApiError, UNAVAILABLE_MESSAGE};
 use crate::protect::{self, Caller, Surface};
@@ -195,6 +195,9 @@ pub async fn callback(
 	if let Err(e) = app.protect.check(&caller, Surface::Callback) {
 		return e.into();
 	}
+	if let Err(e) = check_lookup_name(&app, &caller, &name).await {
+		return e.into();
+	}
 	let nym = match nym_by_name(&app, &name).await {
 		Ok(Some(n)) => n,
 		Ok(None) => return LnurlResponse::err(StatusCode::NOT_FOUND, "no such Lightning Address"),
@@ -292,12 +295,21 @@ async fn lightning_invoice(app: &App, nym: &Nym, amount: Amount) -> Result<Strin
 	};
 
 	let description = Some(format!("Payment to {}", nym.shown_name()));
+	let issued = app.public.forwarder.create_invoice(amount, &address, description, expiry, false).await;
 	let conn = app.public.db.conn().await?;
-	match app.public.forwarder.create_invoice(amount, &address, description, expiry, false).await {
+	match issued {
 		Ok(invoice) => {
-			conn.execute("
-				UPDATE lnurl_invoice SET payment_hash = $2, invoice = $3 WHERE id = $1
-			", &[&slot, &invoice.payment_hash().to_string(), &invoice.to_string()]).await?;
+			let hash = invoice.payment_hash().to_string();
+			let saved = conn.execute("
+				UPDATE lnurl_invoice SET payment_hash = $2, invoice = $3 WHERE id = $1 AND expires_at > clock_timestamp()
+			", &[&slot, &hash, &invoice.to_string()]).await?;
+			if saved == 0 {
+				drop(conn);
+				if let Err(e) = app.public.forwarder.cancel(&hash).await {
+					tracing::warn!("failed to cancel unpublished invoice {}: {:#}", hash, e);
+				}
+				return Err(ApiError::Upstream(anyhow::anyhow!("the invoice reservation expired")));
+			}
 			Ok(invoice.to_string())
 		},
 		Err(e) => {

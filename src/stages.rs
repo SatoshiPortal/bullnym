@@ -182,16 +182,6 @@ pub fn classify(prev: Option<&TxRecord>, obs: &TxObservation, fees: &FeePolicy) 
 	Some(rec)
 }
 
-/// What the service keeps about a transaction paying a paid sale: an
-/// output once confirmed stays credited, as the sale stays paid. A later
-/// answer that it has fewer confirmations, or none, changes neither.
-pub fn keep_credit(prev: Option<&TxRecord>, rec: TxRecord, paid: bool) -> TxRecord {
-	match prev {
-		Some(p) if paid && p.status == TxStatus::Confirmed && rec.status != TxStatus::Confirmed => p.clone(),
-		_ => rec,
-	}
-}
-
 /// A warning about an in-progress payment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -439,7 +429,7 @@ mod test {
 
 	#[test]
 	fn a_reorg_uncounts_a_confirmed_payment() {
-		// Only for counting toward a sale still open: a paid sale stays paid
+		// A receipt follows confirmations even after the sale is paid
 		// (see sale_stages).
 		let c = first(&obs(2, Mempool::Unknown));
 		assert_eq!(c.status, TxStatus::Confirmed);
@@ -450,20 +440,14 @@ mod test {
 	}
 
 	#[test]
-	fn a_paid_sale_keeps_its_confirmed_credit() {
+	fn paid_receipt_counts_current_confirmations() {
 		let first = TxRecord { txid: "a".into(), amount: Amount::from_sat(60_000), ..first(&obs(1, Mempool::Unknown)) };
-		// The first output reads unconfirmed again while a second one
-		// confirms: the paid sale keeps both, 70,000.
 		let again = classify(Some(&first), &obs(0, in_mempool(30.0, false)), &fees()).unwrap();
-		let kept = keep_credit(Some(&first), again.clone(), true);
-		assert_eq!(kept.status, TxStatus::Confirmed);
 		let second = TxRecord { txid: "b".into(), amount: Amount::from_sat(10_000), ..first.clone() };
-		assert_eq!(summarize(&[kept, second]).confirmed, Amount::from_sat(70_000));
-		// A sale not paid yet follows bitcoind: nothing counts unconfirmed.
-		assert_eq!(keep_credit(Some(&first), again.clone(), false).status, TxStatus::Seen);
-		// More confirmations replace the record as usual.
-		let deeper = classify(Some(&first), &obs(3, Mempool::Unknown), &fees()).unwrap();
-		assert_eq!(keep_credit(Some(&first), deeper.clone(), true), deeper);
+		let observed = summarize(&[again, second.clone()]);
+		assert_eq!(observed.confirmed, Amount::from_sat(10_000));
+		assert_eq!(next_onchain_state(Paid, first.amount, false, false, true, &observed), Transition::default());
+		assert_eq!(summarize(&[first, second]).confirmed, Amount::from_sat(70_000));
 	}
 
 	fn summary(confirmed: u64, seen: u64, replaced: bool) -> Summary {

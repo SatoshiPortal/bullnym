@@ -208,6 +208,7 @@ pub struct Sale {
 	pub id: i64,
 	pub public_id: String,
 	pub store_id: i64,
+	pub store_nym: String,
 	pub amount_sat: i64,
 	pub fiat_amount: Option<String>,
 	pub currency: Option<String>,
@@ -233,12 +234,14 @@ pub struct Sale {
 
 /// Selects a sale joined with its rails. Callers add the WHERE clause.
 pub const SALE_SELECT: &str = "
-	SELECT s.id, s.public_id, s.store_id, s.amount_sat, s.fiat_amount,
+	SELECT s.id, s.public_id, s.store_id, n.name AS store_nym, s.amount_sat, s.fiat_amount,
 		s.currency, s.btc_price, s.memo, s.state, s.progress, s.notice, s.paid_rail,
 		s.received_sat, coalesce(oc.pending_sat, 0) AS seen_sat,
 		coalesce(oc.warnings, '{}') AS warnings, s.created_at, s.expires_at, s.paid_at,
 		s.updated_at, ln.invoice AS lightning_invoice, oc.onchain_address
 	FROM sale s
+	JOIN store st ON st.id = s.store_id
+	JOIN nym n ON n.id = st.nym_id
 	LEFT JOIN sale_payment ln ON ln.sale_id = s.id AND ln.rail = 'lightning'
 	LEFT JOIN sale_payment oc ON oc.sale_id = s.id AND oc.rail = 'onchain'
 ";
@@ -249,6 +252,7 @@ impl Sale {
 			id: row.get("id"),
 			public_id: row.get("public_id"),
 			store_id: row.get("store_id"),
+			store_nym: row.get("store_nym"),
 			amount_sat: row.get("amount_sat"),
 			fiat_amount: row.get("fiat_amount"),
 			currency: row.get("currency"),

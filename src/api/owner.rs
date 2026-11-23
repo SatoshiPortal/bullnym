@@ -31,7 +31,7 @@ use crate::token;
 
 
 /// How far a registration timestamp may be from the server clock.
-const REGISTRATION_CLOCK_SKEW_SECS: i64 = 600;
+const REGISTRATION_CLOCK_SKEW_SECS: u64 = 600;
 const CHALLENGE_LIFETIME_MINS: i64 = 5;
 const SESSION_LIFETIME_HOURS: i64 = 24;
 const MAX_STORE_NAME_CHARS: usize = 64;
@@ -42,7 +42,7 @@ pub fn parse_signature(hex: &str) -> ApiResult<schnorr::Signature> {
 
 /// Refuses a registration timestamp more than 10 minutes from the clock.
 pub fn check_timestamp(timestamp: u64) -> ApiResult<()> {
-	let skew = (Utc::now().timestamp() - timestamp as i64).abs();
+	let skew = Utc::now().timestamp().unsigned_abs().abs_diff(timestamp);
 	if skew > REGISTRATION_CLOCK_SKEW_SECS {
 		return Err(bad_request("the registration timestamp is too far from the current time"));
 	}
@@ -368,5 +368,7 @@ mod test {
 		assert!(check_timestamp(now + 590).is_ok());
 		assert!(check_timestamp(now - 700).is_err());
 		assert!(check_timestamp(now + 700).is_err());
+		assert!(check_timestamp(u64::MAX).is_err());
+		assert!(check_timestamp(1_u64 << 63).is_err());
 	}
 }

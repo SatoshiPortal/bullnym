@@ -38,6 +38,7 @@ pub struct NewSale {
 #[derive(Debug, Clone, Serialize)]
 pub struct SaleView {
 	pub id: String,
+	pub store_nym: String,
 	pub created_at: DateTime<Utc>,
 	pub expires_at: DateTime<Utc>,
 	pub state: SaleState,
@@ -81,6 +82,7 @@ impl From<Sale> for SaleView {
 		let amount = Amount::from_sat(s.amount_sat as u64);
 		SaleView {
 			id: s.public_id,
+			store_nym: s.store_nym,
 			created_at: s.created_at,
 			expires_at: s.expires_at,
 			state: s.state,
@@ -310,6 +312,12 @@ async fn next_address(
 	anyhow::bail!("{} addresses in a row of store {} belong to other sales", MAX_ADDRESS_SKIPS + 1, store.id)
 }
 
+fn invoice_description(text: &str) -> &str {
+	let mut end = text.len().min(639);
+	while !text.is_char_boundary(end) { end -= 1; }
+	&text[..end]
+}
+
 /// Creates a sale with its one invoice, for Lightning and Ark payers. A
 /// sale never gets a Bitcoin address by default: the merchant adds one with
 /// [add_onchain]. Without an invoice the sale is refused with the fixed
@@ -325,7 +333,9 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 	let ark_address = ark::Address::from_str(&store.ark_address)
 		.context("store has an invalid Ark address")?;
 	let expiry = app.cfg.sales.expiry();
-	let description = Some(memo.clone().unwrap_or_else(|| store.name.clone()));
+	// BOLT11 descriptions fit in 639 bytes. Keep the complete memo on the receipt.
+	let text = memo.as_deref().unwrap_or(&store.name);
+	let description = Some(invoice_description(text).to_owned());
 
 	// The sale and its invoice slot are reserved first, under the caps.
 	// Each backend step then fills or releases its part.
@@ -368,7 +378,7 @@ pub async fn create_sale(app: &App, store: &Store, new: NewSale) -> ApiResult<Sa
 /// Publication and cleanup both lock the sale before touching its invoice slot.
 async fn publish_invoice(conn: &mut tokio_postgres::Client, sale_id: i64, hash: &str, invoice: &str) -> anyhow::Result<Option<Sale>> {
 	let tx = conn.transaction().await?;
-	let reserved = tx.execute("UPDATE sale SET issued_at = NOW() WHERE id = $1 AND issued_at IS NULL", &[&sale_id]).await?;
+	let reserved = tx.execute("UPDATE sale SET issued_at = NOW() WHERE id = $1 AND issued_at IS NULL AND expires_at > clock_timestamp()", &[&sale_id]).await?;
 	if reserved == 0 {
 		return Ok(None);
 	}
@@ -437,10 +447,12 @@ pub async fn add_onchain(app: &App, public_id: &str) -> ApiResult<Sale> {
 			VALUES ($1, 'onchain', $2, $3)
 		", &[&sale_id, &index, &address.to_string()]).await
 			.map_err(|e| ApiError::Upstream(anyhow::Error::from(e).context("the address is taken")))?;
+		tx.execute("UPDATE sale SET updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1", &[&sale_id]).await?;
 		tracing::info!("sale {} takes on-chain index {} of store {}", public_id, index, store.id);
 	}
 	let sale = get_sale_by_id(&tx, sale_id).await?;
 	tx.commit().await?;
+	if !has_address { app.notify_sale_change(sale_id); }
 	Ok(sale)
 }
 
@@ -605,6 +617,13 @@ mod test {
 		assert!(HintError::Missing.to_string().contains("must allow Ark address hints"));
 		// Another address, such as barkd's own: an Ark payer would pay it.
 		assert_eq!(check_invoice_hint(&invoice(Some(&address(6))), &store), Err(HintError::Other));
+	}
+
+	#[test]
+	fn unicode_invoice_descriptions_fit_the_bolt11_field() {
+		let memo = "🪙".repeat(200);
+		assert_eq!(invoice_description(&memo), "🪙".repeat(159));
+		assert_eq!(invoice_description("coffee"), "coffee");
 	}
 
 	#[test]

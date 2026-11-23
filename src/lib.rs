@@ -26,12 +26,13 @@ pub mod stages;
 pub mod token;
 pub mod watcher;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use tokio::sync::watch;
+use tokio::sync::broadcast;
 
 use crate::ark::ArkServer;
 use crate::config::Config;
@@ -60,8 +61,8 @@ pub struct App {
 	pub price: PriceFeed,
 	pub ark: ArkServer,
 	pub protect: Protect,
-	/// Bumped whenever a sale changes state, to wake long-polls.
-	pub sale_changes: watch::Sender<u64>,
+	/// Sale IDs whose public view changed. Lagged subscribers read the current snapshot.
+	pub sale_changes: broadcast::Sender<i64>,
 	/// Always the default outside the integration tests.
 	pub overrides: TestOverrides,
 }
@@ -118,7 +119,7 @@ impl App {
 				chain: Chain::connect(cfg.bitcoind.clone()).await.context("failed to set up bitcoind")?,
 			},
 			price: PriceFeed::new(cfg.price.clone())?,
-			sale_changes: watch::channel(0).0,
+			sale_changes: broadcast::channel(256).0,
 			protect,
 			ark,
 			cfg,
@@ -128,23 +129,24 @@ impl App {
 		Ok(Arc::new(app))
 	}
 
-	pub fn notify_sale_change(&self) {
-		self.sale_changes.send_modify(|v| *v = v.wrapping_add(1));
+	pub fn notify_sale_change(&self, id: i64) {
+		let _ = self.sale_changes.send(id);
 	}
 
 	/// Probes every backend once and records its health.
 	pub async fn probe_health(&self) {
-		let (barkd, ark, bitcoind) = tokio::join!(
-			self.public.forwarder.ping(),
-			self.ark.ping(),
-			self.public.chain.ping(),
+		tokio::join!(
+			self.probe(Backend::Barkd, self.public.forwarder.ping()),
+			self.probe(Backend::ArkServer, self.ark.ping()),
+			self.probe(Backend::Bitcoind, self.public.chain.ping()),
 		);
-		for (backend, res) in [(Backend::Barkd, barkd), (Backend::ArkServer, ark), (Backend::Bitcoind, bitcoind)] {
-			if let Err(e) = &res {
-				tracing::debug!("{:?} probe failed: {:#}", backend, e);
-			}
-			self.protect.health.record(backend, res.is_ok());
-		}
+	}
+
+	async fn probe(&self, backend: Backend, check: impl Future<Output = anyhow::Result<()>>) {
+		let result = tokio::time::timeout(Duration::from_secs(30), check).await;
+		let healthy = matches!(result, Ok(Ok(())));
+		if !healthy { tracing::debug!(?backend, ?result, "backend health check failed"); }
+		self.protect.health.record(backend, healthy);
 	}
 }
 
@@ -170,7 +172,9 @@ pub fn spawn_background(app: Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
 				let res = async {
 					let conn = app.watch.db.conn().await?;
 					protect::sweep_shared(&*conn).await?;
-					pin::sweep(&*conn).await
+					pin::sweep(&*conn).await?;
+					conn.execute("DELETE FROM owner_challenge WHERE expires_at <= NOW()", &[]).await?;
+					anyhow::Ok(())
 				}.await;
 				if let Err(e) = res {
 					tracing::warn!("sweeping the rate-limit counters failed: {:#}", e);
@@ -178,7 +182,7 @@ pub fn spawn_background(app: Arc<App>) -> Vec<tokio::task::JoinHandle<()>> {
 			}
 		})
 	};
-	vec![tokio::spawn(watcher::run(app)), health, sweep]
+	vec![tokio::spawn(watcher::run_labels(app.clone())), tokio::spawn(watcher::run(app)), health, sweep]
 }
 
 /// Serves the API on `listener`, with each caller's address available to

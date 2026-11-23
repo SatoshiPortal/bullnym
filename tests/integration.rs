@@ -194,8 +194,17 @@ async fn sale_paid_onchain_through_its_stages() {
 	let sale = store.new_sale(json!({ "amount_sat": 60_000 })).await;
 	let id = sale["id"].as_str().unwrap();
 	assert_eq!(sale["onchain_address"], Value::Null);
+	assert_eq!(sale["store_nym"], store.nym);
 	let with_btc = store.add_onchain(&sale).await;
 	let address = with_btc["onchain_address"].as_str().expect("an on-chain address").to_string();
+	// Address allocation changes the cashier's view even while the sale stays open.
+	let before: chrono::DateTime<chrono::Utc> = sale["updated_at"].as_str().unwrap().parse().unwrap();
+	let after: chrono::DateTime<chrono::Utc> = with_btc["updated_at"].as_str().unwrap().parse().unwrap();
+	assert!(after > before);
+	let changes = format!("/api/v1/sales/{}?wait=open&since={}", id, sale["updated_at"].as_str().unwrap());
+	let updated = tokio::time::timeout(Duration::from_secs(3), store.svc.ok(Method::GET, &changes, None, None))
+		.await.expect("changed address should satisfy the long poll");
+	assert_eq!(updated["onchain_address"], address);
 	// Two QRs, never one with both.
 	assert_eq!(with_btc["onchain_request"], format!("bitcoin:{}?amount=0.0006", address));
 	assert_eq!(with_btc["lightning_request"], sale["lightning_request"], "the invoice stays");
@@ -236,10 +245,8 @@ async fn sale_paid_onchain_through_its_stages() {
 	let node = &store.svc.bitcoind;
 	let tip = rpc(node, None, "getbestblockhash", json!([])).await;
 	rpc(node, None, "invalidateblock", json!([tip])).await;
-	tokio::time::sleep(Duration::from_secs(6)).await;
-	let after = store.svc.ok(Method::GET, &format!("/api/v1/sales/{}", id), None, None).await;
+	let after = store.svc.wait_sale(id, SALE_TIMEOUT, |s| s["received_sat"] == 0, "confirmation lost").await;
 	assert_eq!(after["state"], "paid", "{}", after);
-	assert_eq!(after["received_sat"], 60_000, "a confirmed output stays credited: {}", after);
 	rpc(node, None, "reconsiderblock", json!([tip])).await;
 
 	// As in posd, the address stays watched for 7 days: an extra payment
