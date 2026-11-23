@@ -159,20 +159,23 @@ pub struct StoreView {
 	/// Always the nym: a store has no Lightning address of its own.
 	pub lightning_address: String,
 	pub currency: String,
-	pub onchain_min_sat: i64,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub onchain_min_usd: Option<String>,
+	pub onchain_min_sat: Option<u64>,
 	/// Whether the owner set a cashier PIN. Without one, the cashier screen
 	/// hides its list of sales.
 	pub cashier_pin_set: bool,
 }
 
 impl StoreView {
-	pub fn new(app: &App, store: &Store) -> StoreView {
+	pub async fn new(app: &App, store: &Store) -> StoreView {
 		StoreView {
 			name: store.name.clone(),
 			nym: store.nym.clone(),
 			lightning_address: lightning_address(app, &store.nym),
 			currency: store.currency.clone(),
-			onchain_min_sat: store.onchain_min_sat,
+			onchain_min_usd: store.onchain_min_usd_cents.map(|c| crate::money::Decimal::new(c as u128, 2).to_string()),
+			onchain_min_sat: crate::sales::onchain_minimum_sat(app, store).await.ok(),
 			cashier_pin_set: store.cashier_pin_set,
 		}
 	}

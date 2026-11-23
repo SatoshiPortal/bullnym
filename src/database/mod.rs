@@ -174,6 +174,7 @@ pub struct Store {
 	pub onchain_descriptor: String,
 	pub currency: String,
 	pub onchain_min_sat: i64,
+	pub onchain_min_usd_cents: Option<i64>,
 	/// The next derivation index of an on-chain sale.
 	pub next_onchain_index: i64,
 	/// Whether the owner set a cashier PIN. The hash is never loaded here.
@@ -182,7 +183,7 @@ pub struct Store {
 
 /// The columns of a store joined with its nym as `n`.
 pub const STORE_COLUMNS: &str = "s.id, s.nym_id, n.name AS nym, s.name, s.ark_address, \
-	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.next_onchain_index, \
+	s.onchain_descriptor, s.currency, s.onchain_min_sat, s.onchain_min_usd_cents, s.next_onchain_index, \
 	s.cashier_pin_hash IS NOT NULL AS cashier_pin_set";
 
 impl Store {
@@ -196,6 +197,7 @@ impl Store {
 			onchain_descriptor: row.get("onchain_descriptor"),
 			currency: row.get("currency"),
 			onchain_min_sat: row.get("onchain_min_sat"),
+			onchain_min_usd_cents: row.get("onchain_min_usd_cents"),
 			next_onchain_index: row.get("next_onchain_index"),
 			cashier_pin_set: row.get("cashier_pin_set"),
 		}

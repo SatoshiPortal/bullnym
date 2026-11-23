@@ -8,6 +8,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use anyhow::Context;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::header;
@@ -22,7 +23,7 @@ use crate::api::{Owner, StoreView, check_registration, public_url};
 use crate::protect::{Caller, Surface};
 use crate::database::{NYM_COLUMNS, Nym, STORE_COLUMNS, Store};
 use crate::error::{ApiResult, bad_request, conflict, not_found};
-use crate::money::{MAX_SAT, currency_decimals};
+use crate::money::{MAX_SAT, currency_decimals, parse_usd_cents};
 use crate::pin;
 use crate::rails::onchain::StoreDescriptor;
 use crate::registration::StoreRegistration;
@@ -70,9 +71,9 @@ pub struct OwnerStoreView {
 }
 
 impl OwnerStoreView {
-	fn new(app: &App, store: &Store) -> OwnerStoreView {
+	async fn new(app: &App, store: &Store) -> OwnerStoreView {
 		OwnerStoreView {
-			store: StoreView::new(app, store),
+			store: StoreView::new(app, store).await,
 			checkout_url: format!("{}/{}", public_url(app), store.nym),
 			next_onchain_index: store.next_onchain_index,
 		}
@@ -119,16 +120,18 @@ pub async fn register_store(
 		return Err(bad_request("the store must use the Ark address its nym was registered with"));
 	}
 	// posd's mailbox id is kept with the signed registration, unused.
+	let minimum_usd = app.cfg.sales.default_onchain_min_usd.as_deref().map(parse_usd_cents).transpose()
+		.context("invalid configured USD minimum")?;
 	let row = tx.query_opt("
 		INSERT INTO store (nym_id, name, ark_address, mailbox_id, onchain_descriptor, currency,
-			onchain_min_sat, registration_timestamp, registration_signature)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			onchain_min_sat, registration_timestamp, registration_signature, onchain_min_usd_cents)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT DO NOTHING
 		RETURNING id
 	", &[
 		&nym.id, &name, &nym.ark_address, &mailbox_id.to_string(), &reg.onchain_descriptor,
 		&reg.currency, &(app.cfg.sales.default_onchain_min_sat as i64), &(reg.timestamp as i64),
-		&signature.to_string(),
+		&signature.to_string(), &minimum_usd,
 	]).await?;
 	if row.is_none() {
 		return Err(conflict("this nym already has a store"));
@@ -137,8 +140,9 @@ pub async fn register_store(
 		"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.nym_id = $1", STORE_COLUMNS,
 	), &[&nym.id]).await.map(|r| Store::from_row(&r))?;
 	tx.commit().await?;
+	drop(conn);
 	tracing::info!("registered the store of nym {}", nym.name);
-	Ok(Json(json!({ "store": OwnerStoreView::new(&app, &store) })))
+	Ok(Json(json!({ "store": OwnerStoreView::new(&app, &store).await })))
 }
 
 #[derive(Deserialize)]
@@ -211,7 +215,7 @@ pub async fn login(
 }
 
 pub async fn get_store(State(app): State<Arc<App>>, owner: Owner) -> ApiResult<Json<OwnerStoreView>> {
-	Ok(Json(OwnerStoreView::new(&app, owner.store()?)))
+	Ok(Json(OwnerStoreView::new(&app, owner.store()?).await))
 }
 
 /// The settings an owner can change. Nothing else about a store can.
@@ -220,6 +224,7 @@ pub struct UpdateStore {
 	name: Option<String>,
 	currency: Option<String>,
 	onchain_min_sat: Option<u64>,
+	onchain_min_usd: Option<String>,
 }
 
 pub async fn update_store(
@@ -239,20 +244,30 @@ pub async fn update_store(
 	if req.onchain_min_sat.is_some_and(|v| v > MAX_SAT) {
 		return Err(bad_request(format!("onchain_min_sat must be at most {} sats", MAX_SAT)));
 	}
+	if req.onchain_min_sat.is_some() && req.onchain_min_usd.is_some() {
+		return Err(bad_request("give one on-chain minimum"));
+	}
+	let usd = req.onchain_min_usd.as_deref().map(parse_usd_cents).transpose()
+		.map_err(|_| bad_request("onchain_min_usd must be a nonnegative USD amount with at most two decimal places"))?;
 	let conn = app.public.db.conn().await?;
-	conn.execute("
+	let changed = conn.execute("
 		UPDATE store SET
 			name = coalesce($2, name),
 			currency = coalesce($3, currency),
 			onchain_min_sat = coalesce($4, onchain_min_sat),
+			onchain_min_usd_cents = coalesce($5, onchain_min_usd_cents),
 			updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND ($4::bigint IS NULL OR onchain_min_usd_cents IS NULL)
 	", &[
 		&store.id, &req.name.map(|n| n.trim().to_string()), &req.currency,
-		&req.onchain_min_sat.map(|v| v as i64),
+		&req.onchain_min_sat.map(|v| v as i64), &usd,
 	]).await?;
+	drop(conn);
+	if changed == 0 {
+		return Err(conflict("this store sets its on-chain minimum in USD"));
+	}
 	let store = reload_store(&app, store.id).await?;
-	Ok(Json(OwnerStoreView::new(&app, &store)))
+	Ok(Json(OwnerStoreView::new(&app, &store).await))
 }
 
 #[derive(Deserialize)]
@@ -280,7 +295,7 @@ pub async fn set_cashier_pin(
 	drop(conn);
 	tracing::info!("the owner of store {} set the cashier PIN", store.id);
 	let store = reload_store(&app, store.id).await?;
-	Ok(Json(OwnerStoreView::new(&app, &store)))
+	Ok(Json(OwnerStoreView::new(&app, &store).await))
 }
 
 async fn reload_store(app: &App, store_id: i64) -> ApiResult<Store> {

@@ -403,6 +403,16 @@ async fn publish_invoice(conn: &mut tokio_postgres::Client, sale_id: i64, hash: 
 	Ok(Some(sale))
 }
 
+/// The satoshi cutoff at the USD price, or the store's legacy satoshi threshold.
+pub(crate) async fn onchain_minimum_sat(app: &App, store: &Store) -> anyhow::Result<u64> {
+	let Some(cents) = store.onchain_min_usd_cents else { return Ok(store.onchain_min_sat as u64); };
+	// An optional Bitcoin quote must leave the cashier time to display Lightning.
+	let quote = tokio::time::timeout(std::time::Duration::from_secs(3), app.price.quote("USD"))
+		.await.context("the USD minimum quote timed out")??;
+	quote.btc_price.sats_for_usd_cents(cents).filter(|sat| *sat <= MAX_SAT)
+		.context("the USD minimum cannot be quoted in sats")
+}
+
 /// Adds a Bitcoin address to an open sale, when the merchant asks for it:
 /// the sale must be open, at or above the store's on-chain minimum, and
 /// bitcoind healthy. The address is the store's next one (see
@@ -410,57 +420,67 @@ async fn publish_invoice(conn: &mut tokio_postgres::Client, sale_id: i64, hash: 
 /// takes a second index. The invoice stays payable, and either rail pays
 /// the sale.
 pub async fn add_onchain(app: &App, public_id: &str) -> ApiResult<Sale> {
+	// Read the policy and release the connection before contacting the price feed.
+	let (sale_id, store) = {
+		let conn = app.public.db.conn().await?;
+		let sale = get_sale(&*conn, public_id).await?;
+		if sale.onchain_address.is_some() { return Ok(sale); }
+		if sale.state != SaleState::Open { return Err(conflict(format!("the sale is {}", sale.state))); }
+		let row = conn.query_one(&format!(
+			"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.id = $1", STORE_COLUMNS,
+		), &[&sale.store_id]).await?;
+		(sale.id, Store::from_row(&row))
+	};
+	let quoted = onchain_minimum_sat(app, &store).await;
+
 	let mut conn = app.public.db.conn().await?;
 	let mut tx = conn.transaction().await?;
-	// Locking the sale serializes two calls for it.
-	let row = tx.query_opt("
-		SELECT id, store_id, state, amount_sat, expires_at <= NOW() AS past_expiry
-		FROM sale WHERE public_id = $1 AND issued_at IS NOT NULL FOR UPDATE
-	", &[&public_id]).await?.ok_or_else(|| not_found("no such sale"))?;
-	let sale_id: i64 = row.get("id");
-	let has_address = tx.query_opt(
-		"SELECT 1 FROM sale_payment WHERE sale_id = $1 AND rail = 'onchain'", &[&sale_id],
-	).await?.is_some();
-	if !has_address {
-		let state: SaleState = row.get("state");
-		if state != SaleState::Open || row.get::<_, bool>("past_expiry") {
-			let state = if state == SaleState::Open { SaleState::Expired } else { state };
-			return Err(crate::error::conflict(format!("the sale is {}", state)));
-		}
-		let store = tx.query_one(&format!(
-			"SELECT {} FROM store s JOIN nym n ON n.id = s.nym_id WHERE s.id = $1", STORE_COLUMNS,
-		), &[&row.get::<_, i64>("store_id")]).await.map(|r| Store::from_row(&r))?;
-		if row.get::<_, i64>("amount_sat") < store.onchain_min_sat {
-			return Err(bad_request(format!(
-				"this store takes Bitcoin from {} sats", store.onchain_min_sat,
-			)));
-		}
-		if !app.protect.health.onchain() {
-			return Err(ApiError::Upstream(anyhow::anyhow!("bitcoind is unhealthy")));
-		}
-		let (index, address) = match next_address(app, &mut tx, &store).await {
-			Ok(taken) => taken,
-			Err(e) => {
-				// Keep the indexes skipped because other sales have them.
-				if let Err(c) = tx.commit().await {
-					tracing::warn!("keeping the skipped indexes of store {} failed: {}", store.id, c);
-				}
-				return Err(ApiError::Upstream(e));
-			},
-		};
-		// The address column is unique: should another sale have the address
-		// after all, this call fails and the sale keeps its invoice only.
-		tx.execute("
-			INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
-			VALUES ($1, 'onchain', $2, $3)
-		", &[&sale_id, &index, &address.to_string()]).await
-			.map_err(|e| ApiError::Upstream(anyhow::Error::from(e).context("the address is taken")))?;
-		tx.execute("UPDATE sale SET updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1", &[&sale_id]).await?;
-		tracing::info!("sale {} takes on-chain index {} of store {}", public_id, index, store.id);
+	tx.query_one("SELECT id FROM sale WHERE id = $1 FOR UPDATE", &[&sale_id]).await?;
+	let current = get_sale_by_id(&tx, sale_id).await?;
+	if current.onchain_address.is_some() {
+		tx.commit().await?;
+		return Ok(current);
 	}
+	if current.state != SaleState::Open { return Err(conflict(format!("the sale is {}", current.state))); }
+	let policy = tx.query_one("
+		SELECT onchain_min_sat, onchain_min_usd_cents FROM store WHERE id = $1 FOR UPDATE
+	", &[&store.id]).await?;
+	let now = tx.query_one("SELECT clock_timestamp()", &[]).await?.get::<_, DateTime<Utc>>(0);
+	if current.expires_at <= now { return Err(conflict("the sale is expired")); }
+	if policy.get::<_, i64>("onchain_min_sat") != store.onchain_min_sat
+		|| policy.get::<_, Option<i64>>("onchain_min_usd_cents") != store.onchain_min_usd_cents {
+		return Err(conflict("the store's on-chain minimum changed"));
+	}
+	let minimum = quoted.map_err(ApiError::Upstream)?;
+	if (current.amount_sat as u64) < minimum {
+		return Err(bad_request(format!("this store takes Bitcoin from {} sats", minimum)));
+	}
+	if !app.protect.health.onchain() {
+		return Err(ApiError::Upstream(anyhow::anyhow!("bitcoind is unhealthy")));
+	}
+	let (index, address) = match next_address(app, &mut tx, &store).await {
+		Ok(taken) => taken,
+		Err(e) => {
+			// Keep the indexes skipped because other sales have them.
+			if let Err(c) = tx.commit().await {
+				tracing::warn!("keeping the skipped indexes of store {} failed: {}", store.id, c);
+			}
+			return Err(ApiError::Upstream(e));
+		},
+	};
+	// The address column is unique: should another sale have the address
+	// after all, this call fails and the sale keeps its invoice only.
+	let issued = tx.execute("
+		INSERT INTO sale_payment (sale_id, rail, onchain_index, onchain_address)
+		SELECT id, 'onchain', $2, $3 FROM sale WHERE id = $1 AND expires_at > clock_timestamp()
+	", &[&sale_id, &index, &address.to_string()]).await
+		.map_err(|e| ApiError::Upstream(anyhow::Error::from(e).context("the address is taken")))?;
+	if issued == 0 { return Err(conflict("the sale is expired")); }
+	tx.execute("UPDATE sale SET updated_at = GREATEST(clock_timestamp(), updated_at + INTERVAL '1 microsecond') WHERE id = $1", &[&sale_id]).await?;
+	tracing::info!("sale {} takes on-chain index {} of store {}", public_id, index, store.id);
 	let sale = get_sale_by_id(&tx, sale_id).await?;
 	tx.commit().await?;
-	if !has_address { app.notify_sale_change(sale_id); }
+	app.notify_sale_change(sale_id);
 	Ok(sale)
 }
 

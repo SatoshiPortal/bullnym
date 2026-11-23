@@ -80,10 +80,10 @@ async function verifyPayment(page, row) {
 		await page.getByText(row.memo, { exact: true }).waitFor()
 		const overdue = Date.parse(row.expires_at) <= Date.now()
 		assert.equal(await page.getByText(/Checking the payment status/).count(), Number(overdue))
-		assert.equal(await control('Bitcoin').count(), Number(!overdue && !row.onchain_request && row.amount_sat >= 50000))
+		assert(await page.getByRole('tab', { name: 'On-chain' }).isEnabled())
 		await page.getByRole('img', { name: 'Lightning payment code' }).waitFor()
 		if (row.onchain_request) {
-			await page.getByRole('tab', { name: 'Bitcoin' }).click()
+			await page.getByRole('tab', { name: 'On-chain' }).click()
 			await page.getByRole('img', { name: 'Bitcoin payment code' }).waitFor()
 			await control('Copy Bitcoin address').waitFor()
 		}

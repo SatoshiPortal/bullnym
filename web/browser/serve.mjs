@@ -10,7 +10,7 @@ const server = await preview({
 			server.middlewares.use('/api/v1/checkout/pwa-test', (req, res) => {
 				res.setHeader('Content-Type', 'application/json')
 				const store = { name: 'Offline checkout', nym: 'pwa-test', currency: 'USD', cashier_pin_set: false,
-					lightning_address: 'pwa-test@example.test', onchain_min_sat: 50000 }
+					lightning_address: 'pwa-test@example.test', onchain_min_usd: '50.00', onchain_min_sat: 50000 }
 				res.end(JSON.stringify(req.url === '/rate' ? { currency: 'USD', btc_price: '100000' } : { store }))
 			})
 		},

@@ -96,7 +96,7 @@
 	</main>
 {:else if payId}
 	{#key payId}
-		<PayScreen id={payId} />
+		<PayScreen id={payId} refreshCheckout={loadCheckout} />
 	{/key}
 {:else if receiptId}
 	{#key receiptId}

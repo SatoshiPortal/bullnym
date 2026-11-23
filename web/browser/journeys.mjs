@@ -9,8 +9,8 @@ import { origin, sale } from './fixture.mjs'
 const url = (hash = '', nym = 'cafe') => origin + '/' + nym + hash
 const button = (page, name) => {
 	const control = page.getByRole('button', { name, exact: true })
-	return ['Lightning', 'Bitcoin'].includes(name)
-		? control.or(page.getByRole('tab', { name, exact: true }))
+	return ['Lightning', 'On-chain'].includes(name)
+		? page.getByRole('tab', { name, exact: true })
 		: control
 }
 const visible = async (page, text) => {
@@ -337,37 +337,110 @@ export const journeys = {
 		await visible(page, /sales.*will appear|no sales/i)
 	},
 	async BITCOIN_OPTION({ page, fixture }) {
-		for (const amount of [250, fixture.store.onchain_min_sat]) {
+		// USD remains the policy currency even when the store prices sales in CRC.
+		fixture.store.currency = 'CRC'
+		fixture.store.onchain_min_usd = '25.99'
+		fixture.usdPriceCentsPerBtc = 5_000_000
+		const cutoff = 51980
+		for (const amount of [250, cutoff - 1, cutoff, cutoff + 1]) {
 			await open(page)
 			await page.getByRole('tab', { name: 'Sats' }).click()
 			await digits(page, String(amount))
 			await click(page, 'Charge')
 			const qr = page.getByRole('img', { name: 'Lightning payment code' })
 			await qr.waitFor()
-			const bitcoin = page.getByRole('button', { name: 'Bitcoin', exact: true })
-			const eligible = amount >= fixture.store.onchain_min_sat
-			const option = eligible ? bitcoin : page.getByText('Bitcoin on-chain is offered from 50,000 sats.')
-			await option.waitFor()
-			assert.equal(await bitcoin.count(), Number(eligible))
+			const toggle = page.getByRole('tab', { name: 'On-chain', exact: true })
 			const viewport = page.viewportSize()
 			for (const size of [viewport, { width: 320, height: 568 }]) {
 				await page.setViewportSize(size)
-				const box = await option.boundingBox()
+				const box = await toggle.boundingBox()
 				const code = await qr.boundingBox()
 				assert(box && code && box.y >= 0 && box.y + box.height <= Math.min(size.height, code.y),
-					'The Bitcoin option or minimum must be visible above the payment QR on entry')
+					'Both methods must be visible above the QR on entry')
 			}
 			await page.setViewportSize(viewport)
-			if (eligible) {
-				await bitcoin.click()
+			const allocations = () => fixture.calls.filter(c => c.path.endsWith('/onchain')).length
+			const count = allocations()
+			await toggle.click()
+			assert.equal(await toggle.getAttribute('aria-selected'), 'true')
+			assert.equal(allocations(), count)
+			if (amount < cutoff) {
+				await visible(page, '$25.99 USD')
+				await visible(page, 'high network fees')
+				await visible(page, '60 minutes')
+				assert.equal(await page.getByRole('img', { name: /payment code/ }).count(), 0)
+				assert.equal(await button(page, 'Copy Lightning invoice').count(), 0)
+				assert.equal(await page.getByRole('dialog').count(), 0)
+				await click(page, 'Lightning')
+				await qr.waitFor()
+				await toggle.click()
+				await visible(page, 'below the minimum')
+				assert.equal(allocations(), count)
+			} else {
 				await page.getByRole('dialog', { name: 'Bitcoin on-chain' }).waitFor()
-				assert.equal(fixture.calls.filter(c => c.path.endsWith('/onchain')).length, 0)
 				await click(page, 'Continue')
 				await page.getByRole('img', { name: 'Bitcoin payment code' }).waitFor()
-				assert.equal(await page.getByRole('tab', { name: 'Bitcoin' }).getAttribute('aria-selected'), 'true')
-				assert.equal(fixture.calls.filter(c => c.path.endsWith('/onchain')).length, 1)
+				assert.equal(allocations(), count + 1)
 			}
 		}
+		await open(page, '#/settings')
+		await visible(page, '$25.99 USD')
+	},
+	async ONCHAIN_QUOTE_INTERRUPTED({ page, fixture }) {
+		const row = sale('price-interrupted', { amount_sat: 60000 })
+		fixture.sales.set(row.id, row)
+		await open(page, '#/pay/' + row.id)
+		await click(page, 'On-chain')
+		await page.getByRole('dialog').waitFor()
+		fixture.usdPriceCentsPerBtc = 0
+		await click(page, 'Continue')
+		await visible(page, 'On-chain eligibility is unavailable')
+		assert.equal(row.onchain_address, null)
+		await click(page, 'Lightning')
+		await button(page, 'Copy Lightning invoice').waitFor()
+	},
+	async ONCHAIN_USD_UPDATE({ page, fixture }) {
+		fixture.store.onchain_min_usd = '49.50'
+		const row = sale('policy', { amount_sat: 50000 })
+		fixture.sales.set(row.id, row)
+		await open(page, '#/pay/' + row.id)
+		await click(page, 'On-chain')
+		await page.getByRole('dialog').waitFor()
+		// The owner raises the USD minimum after the cashier opens the dialog.
+		fixture.store.onchain_min_usd = '60.00'
+		await click(page, 'Continue')
+		await visible(page, '$60.00 USD')
+		await visible(page, 'below the minimum')
+		assert.equal(row.onchain_address, null)
+		await click(page, 'Lightning')
+		fixture.usdPriceCentsPerBtc = 0
+		await click(page, 'On-chain')
+		await visible(page, 'On-chain eligibility is unavailable')
+		await page.reload()
+		await click(page, 'On-chain')
+		await visible(page, '$60.00 USD')
+		assert.equal(await page.getByRole('img', { name: /payment code/ }).count(), 0)
+		// The same USD minimum becomes eligible at a different BTC/USD quote.
+		fixture.usdPriceCentsPerBtc = 12_000_000
+		await click(page, 'Lightning')
+		await click(page, 'On-chain')
+		await click(page, 'Request on-chain address')
+		await click(page, 'Continue')
+		await button(page, 'Copy Bitcoin address').waitFor()
+		assert.equal(fixture.calls.filter(c => c.path.endsWith('/onchain')).length, 2)
+
+		// An older service only has a sats policy. Never label that number as USD.
+		fixture.intercept = c => c.path === '/api/v1/checkout/cafe'
+			? { json: { store: { ...fixture.storeView, onchain_min_usd: undefined, onchain_min_sat: 90000 } } }
+			: undefined
+		const legacy = sale('legacy-small', { amount_sat: 1000 })
+		fixture.sales.set(legacy.id, legacy)
+		await open(page, '#/pay/' + legacy.id)
+		await page.reload()
+		await click(page, 'On-chain')
+		await visible(page, 'has not provided a USD minimum')
+		await visible(page, 'below the minimum')
+		assert.doesNotMatch(await page.getByRole('tabpanel').innerText(), /\$90,?000/)
 	},
 	async QR_SWITCH({ page, fixture }) {
 		await grantClipboard(page)
@@ -378,11 +451,11 @@ export const journeys = {
 		await click(page, 'Copy')
 		await visible(page, 'Copied')
 		assert.equal(await page.evaluate(() => window.copiedText), s.lightning_request)
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		await visible(page, /60 minutes/i)
 		await click(page, 'Cancel')
 		assert.equal(fixture.calls.filter((c) => c.path.endsWith('/onchain')).length, 0)
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		await click(page, 'Continue')
 		await visible(page, /Bitcoin address/i)
 		assert.equal(await decodeQr(page), s.onchain_request)
@@ -612,21 +685,21 @@ export const journeys = {
 		fixture.sales.set('low', low)
 		fixture.sales.set('A', s)
 		await open(page, '#/pay/low')
-		await visible(page, /not offered for this amount|offered from/)
-		assert.equal(await button(page, 'Bitcoin').count(), 0)
+		await click(page, 'On-chain')
+		await visible(page, 'below the minimum')
 		await go(page, '/pay/A')
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		await page.keyboard.press('Escape')
 		assert.equal(fixture.calls.filter((c) => c.path.endsWith('/onchain')).length, 0)
 		fixture.intercept = (c) => (c.path.endsWith('/onchain') ? { status: 503 } : null)
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		await click(page, 'Continue')
 		await visible(page, 'Could not add Bitcoin')
 		fixture.intercept = undefined
 		const other = await context.newPage()
 		await open(other, '#/pay/A')
-		await click(other, 'Bitcoin')
-		await click(page, 'Bitcoin')
+		await click(other, 'On-chain')
+		await click(page, 'On-chain')
 		const allocation = held()
 		const requested = (r) => r.method() === 'POST' && new URL(r.url()).pathname.endsWith('/onchain')
 		fixture.intercept = async (c) => {
@@ -649,12 +722,12 @@ export const journeys = {
 			assert.equal(await decodeQr(p), s.onchain_request)
 		}
 		await page.reload()
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		assert.equal(await decodeQr(page), s.onchain_request)
 		assert.equal(fixture.calls.filter((c) => c.path.endsWith('/onchain')).length, 3)
 		Object.assign(s, paid(50000))
 		await visible(page, 'via Ark')
-		assert.equal(await button(page, 'Bitcoin').count(), 0)
+		assert.equal(await button(page, 'On-chain').count(), 0)
 	},
 	async OS_ACTIONS({ page, fixture }) {
 		await page.addInitScript(() => {
@@ -752,7 +825,7 @@ export const journeys = {
 			await open(page, '#/pay/' + row.id)
 			if (action === 'cancel') await click(page, 'Cancel sale')
 			else {
-				await click(page, 'Bitcoin')
+				await click(page, 'On-chain')
 				await click(page, 'Continue')
 			}
 			await started.wait
@@ -767,7 +840,7 @@ export const journeys = {
 			await page.goBack()
 			if (action === 'cancel') await visible(page, 'This sale was canceled')
 			else {
-				await click(page, 'Bitcoin')
+				await click(page, 'On-chain')
 				assert.equal(await decodeQr(page), row.onchain_request)
 			}
 		}
@@ -794,7 +867,7 @@ export const journeys = {
 		const original = { ...row }
 		fixture.sales.set(row.id, row)
 		await open(page, '#/pay/addr')
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		await click(page, 'Continue')
 		await button(page, 'Copy Bitcoin address').waitFor()
 		const expected = row.onchain_request
@@ -839,7 +912,7 @@ export const journeys = {
 		const row = sale('dialog')
 		fixture.sales.set(row.id, row)
 		await open(page, '#/pay/dialog')
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		await page.getByRole('dialog').waitFor()
 		Object.assign(row, paid())
 		await page.getByRole('dialog').waitFor({ state: 'hidden' })
@@ -853,12 +926,12 @@ export const journeys = {
 		fixture.sales.set(row.id, row)
 		const second = await context.newPage()
 		await Promise.all([open(page, '#/pay/shared'), open(second, '#/pay/shared')])
-		await click(page, 'Bitcoin')
-		await click(second, 'Bitcoin')
+		await click(page, 'On-chain')
+		await click(second, 'On-chain')
 		await click(second, 'Continue')
 		await second.getByRole('dialog').waitFor({ state: 'hidden' })
 		await page.getByRole('dialog').waitFor({ state: 'hidden' })
-		await click(page, 'Bitcoin')
+		await click(page, 'On-chain')
 		assert.equal(await decodeQr(page), row.onchain_request)
 		assert.equal(fixture.calls.filter((c) => c.method === 'POST' && c.path.endsWith('/onchain')).length, 1)
 	},

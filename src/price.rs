@@ -1,6 +1,7 @@
 //! The bitcoin price, from the Bull Bitcoin public price API.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -20,10 +21,12 @@ pub struct Quote {
 	pub fetched_at: DateTime<Utc>,
 }
 
+type CurrencyQuote = Arc<Mutex<Option<(Instant, Quote)>>>;
+
 pub struct PriceFeed {
 	cfg: config::Price,
 	http: reqwest::Client,
-	cache: Mutex<HashMap<String, (Instant, Quote)>>,
+	cache: Mutex<HashMap<String, CurrencyQuote>>,
 }
 
 impl PriceFeed {
@@ -46,8 +49,10 @@ impl PriceFeed {
 		}
 
 		let max_age = Duration::from_secs(self.cfg.cache_secs);
-		let mut cache = self.cache.lock().await;
-		if let Some((at, quote)) = cache.get(currency) {
+		// A slow USD lookup for a Bitcoin minimum must not delay another currency's sale.
+		let currency_cache = self.cache.lock().await.entry(currency.to_owned()).or_default().clone();
+		let mut cache = currency_cache.lock().await;
+		if let Some((at, quote)) = cache.as_ref() {
 			if at.elapsed() < max_age {
 				return Ok(quote.clone());
 			}
@@ -69,7 +74,7 @@ impl PriceFeed {
 			btc_price: parse_price(&resp)?,
 			fetched_at: Utc::now(),
 		};
-		cache.insert(currency.to_string(), (Instant::now(), quote.clone()));
+		*cache = Some((Instant::now(), quote.clone()));
 		Ok(quote)
 	}
 }

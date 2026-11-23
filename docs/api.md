@@ -195,7 +195,7 @@ serves the nym and its store.
 | `GET /api/v1/owner/nym` | | `{"nym": Nym}` |
 | `PATCH /api/v1/owner/nym` | `display_name` (empty removes it) | `{"nym": Nym}` |
 | `GET /api/v1/owner/store` | | Owner store |
-| `PATCH /api/v1/owner/store` | any of `name`, `currency`, `onchain_min_sat` (at most 2,100,000,000,000,000) | Owner store |
+| `PATCH /api/v1/owner/store` | `name`, `currency`, or `onchain_min_usd` as a decimal string such as `"25.99"`. A store using its legacy satoshi threshold can still edit `onchain_min_sat`. | Owner store |
 | `PUT /api/v1/owner/store/cashier-pin` | `{"pin": "<4 to 12 digits>"}` | Owner store. Sets or changes the cashier PIN |
 | `GET /api/v1/owner/sales?before=<id>&limit=<n>` | | `{"sales": [Sale]}`, newest first, at most 100 |
 | `GET /api/v1/owner/sales.csv?from=<date>&to=<date>` | | CSV, one row per sale |
@@ -245,6 +245,11 @@ screen asks first, with a warning that an on-chain payment can take up to
 
 - The sale must be open (`409` otherwise), at or above the store's
   `onchain_min_sat` (`400`), and bitcoind healthy (`503`).
+- For a USD minimum the store response includes `onchain_min_usd` and
+  converts it at BTC/USD, rounding up to the next whole satoshi. If a
+  quote is unavailable, `onchain_min_sat` is null and adding a new
+  address returns `503`. Lightning checkout remains available. A repeat
+  request for an already assigned address returns that address.
 - The address is the store's next one, as in posd: no address is handed out
   twice, even to another store with the same descriptor.
 - A second call returns the same address: a sale never takes a second
