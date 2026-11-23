@@ -7,7 +7,7 @@
 	// green.
 	import { untrack } from 'svelte'
 	import { ApiError } from '$lib/api'
-	import { formatSats } from '$lib/money'
+	import { formatFiat, formatSats } from '$lib/money'
 	import { router } from '$lib/router.svelte'
 	import { canAddBitcoin, countdown, missingSats, noticeText, progressText, railLabel, saleAmountLabel } from '$lib/sale'
 	import { followSale } from '$lib/follow-sale.svelte'
@@ -22,7 +22,7 @@
 	import SuccessScreen from '$lib/components/SuccessScreen.svelte'
 	import TerminalPanel from '$lib/components/TerminalPanel.svelte'
 
-	let { id }: { id: string } = $props()
+	let { id, refreshCheckout }: { id: string; refreshCheckout: () => Promise<void> } = $props()
 
 	const reader = untrack(() => followSale(id))
 	const sale = $derived(reader.sale)
@@ -54,31 +54,32 @@
 		return sale.seen_sat ? received + ' ' + formatSats(sale.seen_sat) + ' unconfirmed.' : received
 	})
 
-	let selected = $state<'lightning' | 'bitcoin'>('lightning')
+	let selected = $state<'lightning' | 'onchain'>('lightning')
 	let option = $state<'idle' | 'confirm' | 'requesting' | 'failed'>('idle')
 	const beforeDeadline = $derived(remaining !== null)
 	const eligible = $derived(beforeDeadline && canAddBitcoin(sale, session.checkout?.store.onchain_min_sat ?? null))
-	const qrValue = $derived(selected === 'bitcoin' && sale?.onchain_request ? sale.onchain_request : sale?.lightning_request)
+	const minimum = $derived(session.checkout?.store.onchain_min_usd)
+	const qrValue = $derived(selected === 'onchain' ? sale?.onchain_request : sale?.lightning_request)
 
 	$effect(() => {
 		if (!eligible) option = 'idle'
 	})
 
-	function chooseBitcoin() {
-		if (sale?.onchain_request) selected = 'bitcoin'
-		else if (eligible && sale?.state === 'open') {
-			option = 'confirm'
-		}
+	function chooseRail(rail: 'lightning' | 'onchain') {
+		selected = rail
+		option = rail === 'onchain' && eligible && cancelState !== 'sending' ? 'confirm' : 'idle'
+		if (rail === 'onchain' && !sale?.onchain_request && !eligible && beforeDeadline) void refreshCheckout()
 	}
 	async function addBitcoin() {
 		if (option !== 'confirm' || !eligible) return
 		option = 'requesting'
 		try {
 			const next = await client().addOnchain(id)
-			if (reader.accept(next) && next.onchain_request) selected = 'bitcoin'
+			reader.accept(next)
 			option = 'idle'
-		} catch {
+		} catch (error) {
 			if (eligible && option === 'requesting') option = 'failed'
+			if (error instanceof ApiError && (error.status === 400 || error.status === 409)) void refreshCheckout()
 			reader.refresh()
 		}
 	}
@@ -203,36 +204,52 @@
 						</p>
 					{/if}
 
-					{#if sale.onchain_request}
-						<ChoiceTabs label="Payment code" panel="payment-code" value={selected}
-							choices={[{ value: 'lightning', label: 'Lightning' }, { value: 'bitcoin', label: 'Bitcoin' }]}
-							onchange={(value) => (selected = value)} />
-					{:else if eligible}
-						<Button variant="secondary" disabled={cancelState === 'sending'} onclick={chooseBitcoin}>Bitcoin</Button>
-					{:else if session.checkout && beforeDeadline}
-						<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
-							Bitcoin on-chain is offered from {formatSats(session.checkout.store.onchain_min_sat)}.
-						</p>
-					{/if}
-					{#if option === 'failed'}
-						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]" role="alert">Could not add Bitcoin. Check the sale and try again.</p>
-					{/if}
+					<ChoiceTabs label="Payment method" panel="payment-code" value={selected}
+						choices={[{ value: 'lightning', label: 'Lightning' }, { value: 'onchain', label: 'On-chain' }]}
+						onchange={chooseRail} />
 
-					<div class="flex w-full min-w-0 flex-col gap-5" id="payment-code" role={sale.onchain_request ? 'tabpanel' : undefined} aria-labelledby={sale.onchain_request ? 'payment-code-' + selected : undefined}>
-						{#if qrValue}
-							<QrCard
-								value={qrValue}
-								label={selected === 'bitcoin' && sale.onchain_request ? 'Bitcoin payment code' : 'Lightning payment code'}
-							/>
-						{/if}
-
-						<div class="flex w-full flex-col gap-2">
-							{#if selected === 'bitcoin' && sale.onchain_address}
-								<CopyRow label="Bitcoin address" value={sale.onchain_address} />
-							{:else if sale.lightning_invoice}
-								<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
+					<div class="flex w-full min-w-0 flex-col gap-5" id="payment-code" role="tabpanel" aria-labelledby={'payment-code-' + selected}>
+						{#if selected === 'onchain' && !sale.onchain_request}
+							{#if !beforeDeadline}
+								<p class="text-center">The payment time has elapsed. A new on-chain address is unavailable.</p>
+							{:else if cancelState === 'sending'}
+								<p class="text-center" role="status">Canceling the sale…</p>
+							{:else if eligible}
+								{#if option === 'failed'}
+									<p class="text-center" role="alert">Could not add Bitcoin. Check the sale and try again.</p>
+								{/if}
+								{#if option === 'failed' || option === 'idle'}
+									<Button variant="secondary" onclick={() => chooseRail('onchain')}>Request on-chain address</Button>
+								{/if}
+							{:else}
+								<div class="w-full rounded-lg border border-[#d7c8b4] bg-[#fffaf0] p-5 text-center dark:border-[#3a342a] dark:bg-[#211f1a]">
+									{#if minimum != null}
+										<p class="font-semibold">On-chain minimum: {formatFiat(minimum, 'USD')} USD</p>
+									{:else}
+										<p class="font-semibold">The store has not provided a USD minimum.</p>
+									{/if}
+									<p class="mt-2 text-sm">On-chain payments can have high network fees and can take up to 60 minutes to confirm.</p>
+									<p class="mt-2 text-sm">{session.checkout?.store.onchain_min_sat != null
+										? 'This sale is below the minimum. Choose Lightning to pay.'
+										: 'On-chain eligibility is unavailable. Choose Lightning to pay.'}</p>
+								</div>
 							{/if}
-						</div>
+						{:else}
+							{#if qrValue}
+								<QrCard
+									value={qrValue}
+									label={selected === 'onchain' ? 'Bitcoin payment code' : 'Lightning payment code'}
+								/>
+							{/if}
+
+							<div class="flex w-full flex-col gap-2">
+								{#if selected === 'onchain' && sale.onchain_address}
+									<CopyRow label="Bitcoin address" value={sale.onchain_address} />
+								{:else if selected === 'lightning' && sale.lightning_invoice}
+									<CopyRow label="Lightning invoice" value={sale.lightning_invoice} />
+								{/if}
+							</div>
+						{/if}
 					</div>
 				</div>
 			{/if}
@@ -244,7 +261,7 @@
 			text="On-chain Bitcoin payments can take up to 60 minutes to confirm. Don't consider the payment complete until it is confirmed."
 			busy={option === 'requesting'}
 			onconfirm={addBitcoin}
-			oncancel={() => (option = 'idle')}
+			oncancel={() => chooseRail('lightning')}
 		/>
 	{/if}
 </main>
