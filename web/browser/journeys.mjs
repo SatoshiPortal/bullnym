@@ -336,6 +336,39 @@ export const journeys = {
 		await pin(page, '2468')
 		await visible(page, /sales.*will appear|no sales/i)
 	},
+	async BITCOIN_OPTION({ page, fixture }) {
+		for (const amount of [250, fixture.store.onchain_min_sat]) {
+			await open(page)
+			await page.getByRole('tab', { name: 'Sats' }).click()
+			await digits(page, String(amount))
+			await click(page, 'Charge')
+			const qr = page.getByRole('img', { name: 'Lightning payment code' })
+			await qr.waitFor()
+			const bitcoin = page.getByRole('button', { name: 'Bitcoin', exact: true })
+			const eligible = amount >= fixture.store.onchain_min_sat
+			const option = eligible ? bitcoin : page.getByText('Bitcoin on-chain is offered from 50,000 sats.')
+			await option.waitFor()
+			assert.equal(await bitcoin.count(), Number(eligible))
+			const viewport = page.viewportSize()
+			for (const size of [viewport, { width: 320, height: 568 }]) {
+				await page.setViewportSize(size)
+				const box = await option.boundingBox()
+				const code = await qr.boundingBox()
+				assert(box && code && box.y >= 0 && box.y + box.height <= Math.min(size.height, code.y),
+					'The Bitcoin option or minimum must be visible above the payment QR on entry')
+			}
+			await page.setViewportSize(viewport)
+			if (eligible) {
+				await bitcoin.click()
+				await page.getByRole('dialog', { name: 'Bitcoin on-chain' }).waitFor()
+				assert.equal(fixture.calls.filter(c => c.path.endsWith('/onchain')).length, 0)
+				await click(page, 'Continue')
+				await page.getByRole('img', { name: 'Bitcoin payment code' }).waitFor()
+				assert.equal(await page.getByRole('tab', { name: 'Bitcoin' }).getAttribute('aria-selected'), 'true')
+				assert.equal(fixture.calls.filter(c => c.path.endsWith('/onchain')).length, 1)
+			}
+		}
+	},
 	async QR_SWITCH({ page, fixture }) {
 		await grantClipboard(page)
 		const s = sale('A')

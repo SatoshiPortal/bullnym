@@ -207,6 +207,15 @@
 						<ChoiceTabs label="Payment code" panel="payment-code" value={selected}
 							choices={[{ value: 'lightning', label: 'Lightning' }, { value: 'bitcoin', label: 'Bitcoin' }]}
 							onchange={(value) => (selected = value)} />
+					{:else if eligible}
+						<Button variant="secondary" disabled={cancelState === 'sending'} onclick={chooseBitcoin}>Bitcoin</Button>
+					{:else if session.checkout && beforeDeadline}
+						<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
+							Bitcoin on-chain is offered from {formatSats(session.checkout.store.onchain_min_sat)}.
+						</p>
+					{/if}
+					{#if option === 'failed'}
+						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]" role="alert">Could not add Bitcoin. Check the sale and try again.</p>
 					{/if}
 
 					<div class="flex w-full min-w-0 flex-col gap-5" id="payment-code" role={sale.onchain_request ? 'tabpanel' : undefined} aria-labelledby={sale.onchain_request ? 'payment-code-' + selected : undefined}>
@@ -225,18 +234,6 @@
 							{/if}
 						</div>
 					</div>
-					{#if option === 'failed'}
-						<p class="w-full rounded-md bg-[#ffe0d9] px-4 py-3 text-sm font-semibold text-[#8c2d28]" role="alert">Could not add Bitcoin. Check the sale and try again.</p>
-					{/if}
-					{#if !sale.onchain_request && sale.state === 'open'}
-						{#if eligible}
-							<Button variant="secondary" disabled={cancelState === 'sending'} onclick={chooseBitcoin}>Bitcoin</Button>
-						{:else if session.checkout && beforeDeadline}
-							<p class="text-center text-xs text-[#776b5a] dark:text-[#b9aa91]">
-								Bitcoin on-chain is offered from {formatSats(session.checkout.store.onchain_min_sat)}.
-							</p>
-						{/if}
-					{/if}
 				</div>
 			{/if}
 		</section>
