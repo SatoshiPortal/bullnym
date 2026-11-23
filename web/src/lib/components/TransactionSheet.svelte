@@ -22,7 +22,7 @@
 <section>
 	{#if rows.length === 0}
 		<p
-			class="rounded-lg border border-[#d7c8b4] bg-[#fffaf0] py-12 text-center text-sm text-[#776b5a] dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]"
+			class="rounded-lg border border-[#d7c8b4] bg-[#fffaf0] py-12 text-center text-sm text-[#675c4c] dark:border-[#3a342a] dark:bg-[#211f1a] dark:text-[#b9aa91]"
 		>
 			Sales made on this device will appear here.
 		</p>
@@ -30,7 +30,7 @@
 		<div class="space-y-1.5">
 			{#each rows as row (row.id)}
 				<a
-					class={`grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border-l-4 bg-[#fbf4e8] px-4 py-3 transition hover:bg-[#f3e7d6] dark:bg-[#26231d] ${stateBorderTone(row.state)}`}
+					class={`grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-lg border-l-4 bg-[#fbf4e8] px-4 py-3 transition hover:bg-[#f3e7d6] dark:bg-[#26231d] dark:hover:bg-[#302c24] ${stateBorderTone(row.state)}`}
 					href={`#/receipt/${row.id}`}
 					onclick={(event) => {
 						if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
@@ -41,9 +41,9 @@
 					<div class="min-w-0">
 						<div class="flex flex-wrap items-baseline gap-2">
 							<span class="font-black tabular-nums">{saleAmountLabel(row, (a, c) => formatFiat(a, c))}</span>
-							<span class="text-xs font-semibold text-[#776b5a] dark:text-[#b9aa91]">{stageLabel(row)}</span>
+							<span class="text-xs font-semibold text-[#675c4c] dark:text-[#b9aa91]">{stageLabel(row)}</span>
 						</div>
-						<div class="mt-0.5 truncate text-xs text-[#776b5a] dark:text-[#b9aa91]">
+						<div class="mt-0.5 truncate text-xs text-[#675c4c] dark:text-[#b9aa91]">
 							{when(row)}{row.paid_rail ? ' · ' + railLabel(row.paid_rail) : ''}{row.memo ? ` · ${row.memo}` : ''}
 						</div>
 						{#if row.state === 'in-progress' && row.warnings.length > 0}
