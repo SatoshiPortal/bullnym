@@ -16,11 +16,16 @@
 	$effect(() => {
 		if (!session.link) return
 		let generation = 0
+		let retry: ReturnType<typeof setTimeout>
+		let retryMs = 2000
 		async function load() {
+			clearTimeout(retry)
 			const attempt = ++generation
 			try {
 				const checkout = await client().checkout()
-				if (attempt === generation) session.store = { kind: 'ready', checkout }
+				if (attempt !== generation) return
+				retryMs = 2000
+				session.store = { kind: 'ready', checkout }
 			} catch (e) {
 				if (attempt !== generation) return
 				const missing = e instanceof ApiError && e.status === 404
@@ -28,6 +33,10 @@
 				const message = missing ? 'There is no store at this link.' :
 					e instanceof ApiError && e.status === 0 ? 'The server is not reachable.' : 'Could not load the store.'
 				session.store = { kind: 'error', message }
+				if (!missing) {
+					retry = setTimeout(load, retryMs)
+					retryMs = Math.min(retryMs * 2, 30000)
+				}
 			}
 		}
 		const visible = () => { if (!document.hidden) void load() }
@@ -37,6 +46,7 @@
 		document.addEventListener('visibilitychange', visible)
 		return () => {
 			generation++
+			clearTimeout(retry)
 			window.removeEventListener('focus', load)
 			window.removeEventListener('online', load)
 			document.removeEventListener('visibilitychange', visible)
